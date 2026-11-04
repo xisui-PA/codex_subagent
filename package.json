@@ -1,0 +1,49 @@
+{
+  "name": "codex-subagent",
+  "displayName": "Codex Subagent",
+  "description": "A VS Code extension skeleton for codex_subagent.",
+  "version": "0.0.1",
+  "publisher": "xisui",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codexSubagent.helloWorld",
+        "title": "Hello World"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "build": "webpack --mode production",
+    "build:dev": "webpack --mode development",
+    "watch": "webpack --mode development --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "package": "npm run build",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "clean": "rm -rf dist",
+    "test": "node --test \"tests/*.test.cjs\""
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^24.x",
+    "@types/vscode": "^1.100.0",
+    "eslint": "^9.39.5",
+    "eslint-plugin-import": "^2.32.0",
+    "eslint-plugin-jsdoc": "^65.3.11",
+    "globals": "^17.13.0",
+    "ts-loader": "^9.6.2",
+    "typescript": "^5.x",
+    "typescript-eslint": "^8.71.2",
+    "webpack": "^5.112.2",
+    "webpack-cli": "^7.3.1"
+  }
+}
