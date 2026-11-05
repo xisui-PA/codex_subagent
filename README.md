@@ -151,14 +151,14 @@ Portable tests use fake models, temporary stores, real stdio MCP clients and tem
 
 For live acceptance: enable your model, delegate a read-only task, send a follow-up, review a disposable edit, and reload during a task before resuming it. Use diagnostics if discovery, consent, or tool replay fails.
 
-CI (`.github/workflows/ci.yml`) runs on pushes (including tags), pull requests, and manual dispatch: it installs dependencies with `npm ci`, then runs typecheck, lint, the portable test suite, and `npm run vsix`. On tag pushes it fails unless the tag is exactly `v` plus the `package.json` version, matching the release tag policy. The resulting `codex-subagent-*.vsix` is uploaded as a 14-day artifact. CI builds and checks only; it never publishes.
+CI (`.github/workflows/ci.yml`) runs on pushes to `main` (including merged pull requests), opened/updated/reopened pull requests targeting `main`, and manual dispatch: it installs dependencies with `npm ci`, then runs typecheck, lint, the portable test suite, and `npm run vsix`. Tags alone do not auto-trigger CI; when you manually dispatch on a release tag (`gh workflow run ci.yml --ref v<version>`), the run fails unless the tag is exactly `v` plus the `package.json` version, matching the release tag policy. The resulting `codex-subagent-*.vsix` is uploaded as a 14-day artifact. CI builds and checks only; it never publishes.
 
 Publishing is manual and happens after validation:
 
 1. Update the `package.json` and `package-lock.json` versions with `npm version <version> --no-git-tag-version`.
 2. Run the local validation and host checks above, plus a live smoke test in your own VS Code window.
-3. Commit the change and create/push the matching `v<version>` tag with that commit.
-4. Wait for CI to succeed and download its VSIX artifact from the workflow run.
+3. Merge the version change into `main` (via pull request) and tag that `main` commit with `v<version>`.
+4. Wait for the successful `main` CI run for that tagged commit and download its VSIX artifact. If you need to rebuild the release artifact, manually dispatch at the tag instead (`gh workflow run ci.yml --ref v<version>`).
 5. Upload **that tested artifact** to the VS Code Marketplace at https://marketplace.visualstudio.com/manage under the publisher ID `xisui` (the account display name `xisui-PA` is not the manifest publisher).
 
 Do not bump the version after validation or rebuild a different artifact after CI; publish exactly the VSIX CI tested and uploaded.
