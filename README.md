@@ -1,2 +1,137 @@
-# codex_subagent
-Subagent MCP for Codex VS Code extension
+# Codex Subagent
+
+Persistent workers for Codex, powered by models configured in VS Code. Supports BYOK endpoints on other machines, including your configured Qwen model. **No LLM is installed, downloaded, or started locally.** Model credentials stay with VS Code's Language Model API.
+
+## Setup
+
+1. Install `codex-subagent-0.2.0.vsix` using **Extensions: Install from VSIX**, or press **F5** in this repository.
+2. Open a trusted filesystem workspace and run **Codex Subagent: Set Up Workers**.
+3. Select your model, such as `Qwen3.8-27B-oQ6e-mtp`, and approve VS Code model access if prompted. Setup tests an inert tool call and a follow-up using its result; this probe accesses no workspace files.
+4. Setup registers MCP and checks a real stdio handshake through the worker host. In **Codex chat → gear → Codex Settings → MCP Servers**, check that `codex_subagent` is configured and enabled. This page does not list individual tools; use the chat test below to check which tools Codex can access.
+5. Send the connection test below in Codex chat. If Codex cannot find the tools or the MCP call fails, run **Developer: Reload Window** from the VS Code Command Palette (**Cmd+Shift+P** on macOS, **Ctrl+Shift+P** on Windows/Linux), reopen Codex chat, and send the test again. Use a window reload to reconnect; these instructions do not rely on a separate MCP restart control.
+6. After the connection test passes, ask Codex: **“Use the codex_subagent MCP tools to spawn a read-only worker to inspect README.md. Give this conversation a unique ownerId, wait for completion, and report its findings.”** This checks actual model inference and workspace access.
+
+Copy this connection test into Codex chat (the setup/register notification offers a **Copy Connection Test** action that copies it to the clipboard):
+
+```text
+List the available `codex_subagent` MCP tools, then call `subagent_health` through MCP. Do not substitute a shell command.
+```
+
+A successful test lists all 13 tools and returns `ready: true` from `subagent_health`, with the expected workspace root and enabled model. This confirms that Codex can call the worker host; it does not perform model inference. If the test still fails after a window reload, run **Codex Subagent: Check MCP Connection**, then inspect **Codex Subagent: Show Diagnostics** and **Codex Subagent: Show Log** for the failure details.
+
+Reloading the window interrupts active workers. After reloading, inspect them in **Codex Workers** and use **Resume** explicitly to continue unfinished work.
+
+**Check MCP Connection** repeats the handshake independently. It verifies the MCP server and host, not whether an existing Codex conversation has refreshed its tools. **Show Diagnostics**, **Show Log**, and **Retry Worker Host** remain available after startup failures and in an empty window.
+
+Registration adds a managed entry to `$CODEX_HOME/config.toml` or `~/.codex/config.toml`. It preserves unrelated content and config symlinks; the backup is beside the actual config target. The relay is copied into stable extension storage and refreshed after updates. Existing managed registrations are repaired on activation; new registrations require setup. **Unregister MCP from Codex** removes the entry and retains transcripts.
+
+## Worker experience
+
+Explorer's **Codex Workers** view groups workers by parent conversation and workspace root. Click a worker for its live conversation panel: output, current activity, recent tools, errors, changed files, and recovery actions. Completion/failure notifications link back to the worker.
+
+- **New Worker** starts a task directly from VS Code.
+- **Send Follow-up** queues a message behind the active turn.
+- Panel drafts and unacknowledged follow-ups/resumptions are saved in extension state. **Retry pending request** reuses the original request key and arguments, including after reopening a panel or reloading VS Code. The draft clears only after acknowledgement. **Clear retry record** keeps the draft and does not cancel accepted work.
+- **Cancel** stops generation and suspends queued messages. The worker remains busy until in-flight edits and command termination have settled.
+- **Resume** is offered for failed, cancelled, or interrupted workers. Choose a model and optional steering instructions.
+- **Discard Queued Messages** prevents unstarted messages from executing while retaining their records.
+- **Compact Worker** generates a summary or accepts a manual one.
+- **Export Transcript** saves the conversation and archival history. **Clean Up Saved Workers** supports bulk deletion. Deletion removes archives, change snapshots, and operation keys too.
+- **Browse Saved Workspaces** reveals other saved transcript stores.
+
+Review before/after diffs and revert individual changes in the panel. Revert checks current content and refuses to overwrite later user edits. Worker edits use WorkspaceEdit and native editor undo. Already-dirty buffers are readable/editable and stay unsaved; previously clean files are saved. Returned hashes and change snapshots include formatting and other save participants. Shell commands see disk contents, so save dirty buffers before validation.
+
+Revert is tracked as worker maintenance. Conflicting follow-ups, deletion and other edits are blocked until it settles, and shutdown retains store ownership while it finishes. A restart during Revert preserves the task’s prior state and flags uncertain file effects for inspection.
+
+## Models and settings
+
+Models must be exposed by `vscode.lm.selectChatModels()`. A settings entry alone is insufficient if the provider does not expose it through this API. **Enable Model** tests tool calling and tool-result replay. Background work requires affirmative access and never initiates first-use consent.
+
+Setup and workers use the same response handling. Text and tool calls are processed; known reasoning parts, token-usage footers, and optional server continuation markers are excluded from task output. Workers send their durable message history on each request rather than relying on server continuation markers. Other response types fail explicitly with the part type and, for data parts, the MIME type; payload contents are excluded from that diagnostic. If an older installation reports `unsupported_response` for your BYOK model, install the rebuilt VSIX, run **Developer: Reload Window**, and retry **Enable Model** before resuming the failed worker.
+
+Enabling another model preserves the default. **Set Default Model** makes that choice explicit. Disabling the default clears it and offers a replacement. **Configure Model Profile** edits options for an exact model ID; profile values override shared options.
+
+The extension does not extract `${secret:...}` values, query the OS keychain, or directly connect to model endpoints. Live credential-backed Qwen access must be tested using Enable Model in your VS Code window.
+
+| Setting (prefix `codexSubagent.`) | Default | Purpose |
+| --- | --- | --- |
+| `defaultModel` | First enabled | Exact model ID; no silent fallback |
+| `allowWrites` | `false` | Enable writes for explicitly writable workers |
+| `allowShell` | `false` | Offer individually approved shell commands |
+| `maxConcurrentWorkers` | `2` | Active conversations per store |
+| `maxToolRounds` | `40` | Tool rounds before explicit resumption |
+| `turnTimeoutSeconds` | `600` | Deadline including tools and summaries |
+| `autoCompact` | `true` | Summarize/archive at context, history, and turn limits |
+| `notifyOnCompletion` | `true` | Completion/failure notifications |
+| `modelProfiles` | `{}` | Provider options keyed by exact model ID |
+| `modelOptions` | `{}` | Shared provider options |
+
+## Permissions and editing
+
+Read-only is the default. For code changes, enable `codexSubagent.allowWrites` in **User Settings** and request `permission: "workspace-write"` when spawning. Spawn rejects that permission if the write tool is disabled. `subagent_health` reports effective tools before delegation.
+
+Tools include paginated UTF-8 reads, directory listing/creation, bounded literal search, hash-checked writes, exact-text patches, rename, and delete. Changes have recoverable before/after snapshots. Stale hashes, symlink paths, hard-linked replacements, and writes to `.git`, `.codex`, or `.vscode` are rejected. Missing parent directories can be created in order. These checks are not an OS filesystem sandbox against arbitrary concurrent external processes.
+
+Optional `codexSubagent.allowShell` offers shell execution to workspace-write workers. Each exact command needs approval in VS Code. Commands run with the extension host's OS access, outside Codex's sandbox. Time/output are bounded. POSIX cancellation and deadlines terminate the process group, retaining the forced-kill grace period even if the shell exits first; Windows cancellation targets the direct process. Repository settings cannot grant write/shell access.
+
+## Parent ownership and lifecycle
+
+Give each conversation a unique `ownerId` and optional readable `ownerLabel`. Spawn/send/resume use distinct `requestId` values. **Retry ambiguous transport results with the SAME key and arguments** to recover accepted work. Keys are scoped to the owner when supplied. Mutating controls must pass the worker's ownerId. The VS Code panel can administer all groups; ownership is a coordination boundary, not OS-user authentication.
+
+Default `parentPolicy: "keep"` preserves work across disconnects. For unattended cancellation, use `parentPolicy: "cancel-on-expiry"` and a `leaseSeconds` value. Renew with `subagent_parent` / `action: "heartbeat"`; explicitly cancel a group using `action: "stop"`. Leases are checked about every five seconds. The relay emits MCP logging notifications for tracked workers that stop; clients may display these without injecting them into model context, so polling remains available.
+
+Native Codex parent-stop events and native agent UI integration are not exposed to this extension. A transport disconnect is not treated as proof of cancellation. Explicit stop/lease policies handle that boundary while retaining recoverable work.
+
+| MCP tool | Purpose |
+| --- | --- |
+| `subagent_health`, `subagent_models` | Check the host, effective tools, and models |
+| `subagent_spawn` | Start an asynchronous worker with explicit context |
+| `subagent_send`, `subagent_discard_queued` | Queue a follow-up or discard unstarted work |
+| `subagent_status`, `subagent_wait`, `subagent_list` | Read output/history, wait, or list by owner |
+| `subagent_cancel`, `subagent_resume` | Stop/recover work, optionally changing model/instructions |
+| `subagent_compact` | Automatic or manual summary with immutable archives |
+| `subagent_parent` | Renew leases or stop a parent group |
+| `subagent_delete` | Permanently delete a stopped worker |
+
+Status supports `outputOffset`/`outputLimit`, `turnId`/`attempt`, and `afterMessage`/`messageLimit`. History offsets stay continuous across rollovers. Supply context explicitly: workers do not inherit hidden parent conversation, native tools, skills, or approvals.
+
+To target a registered worktree from a Codex conversation rooted in the main checkout, pass its absolute `workspaceRoot`. Keep the returned root on subsequent controls, and group wait IDs by root. The server verifies that roots are open workspace folders or registered worktrees; arbitrary sibling folders are rejected. This also handles worktrees nested inside the main checkout.
+
+Model-generated manual compaction returns immediately as cancellable background maintenance. Wait for it to stop before resuming or sending another message to that worker; unrelated workers remain responsive.
+
+## Preservation and workspaces
+
+Sessions, operation keys, and tool results are checkpointed in extension storage. Partial text is saved roughly once per second as chunks arrive and on handled failures. A crash can lose the latest uncheckpointed text; unfinished streams are never considered completed.
+
+A durable started record precedes effects. Missing results are sealed as outcome-uncertain, never blindly replayed. Transient failures before any response part receive bounded retries; other errors remain visible for deliberate recovery. Reloaded active work becomes interrupted and resumes explicitly.
+
+Before context/history limits, the worker model summarizes history and the engine writes an immutable archive before reducing active history. Full messages, turn results and prior attempts remain accessible. Summary failure retains the original history. Corrupt files are copied to quarantine, their IDs remain reserved, and retry cannot overwrite them.
+
+Each canonical folder has its own store, tools and bridge owner. Single-folder and multi-folder windows share that owner even when their folder sets overlap; a surviving window can take over after the owner closes. During handoff, requests may return a retryable `host_stopping` or `host_reconnecting` error; retry mutations with the same request key. Registered Git worktrees receive isolated roots/stores on demand without another window; arbitrary sibling folders are rejected. Folder additions, reordering, single-folder conversion and workspace Save As preserve workers across extension-host restarts. Pass the returned `workspaceRoot` on subsequent MCP controls. Tools stay inside that worker’s folder. Removing a nested folder preserves its separate history rather than routing its workers into the containing folder’s store.
+
+Older grouped stores migrate automatically, retaining worker IDs, request keys, archives and snapshots. Copies are committed before their old checkpoint is removed; interrupted migrations can continue on the next activation. An older extension host still owning a store must be reloaded before migration can finish. Removed folders retain readable/exportable/deletable history in their saved workspace; restore the folder before continuing work or generating a history summary.
+
+Worktrees used by a workspace are remembered before delegation. Removing a worktree stops its active workers and retains their history across reloads, while other roots continue refreshing. Recreating the worktree at the same path restores access to its saved workers for explicit continuation.
+
+The owning window supplies model access and editor buffers. Save unsaved changes in other windows before delegating edits; those buffers are not inherited across editor processes.
+
+Limits include 200,000 output characters per turn, approximately 20 MB of active history before rollover, and 200 retained workers per store. Archives are retained until explicit cleanup. Transcripts and snapshots contain local plaintext task/file content; diagnostics shows their location. Codex and the extension must share a local/remote environment; registry routing does not cross machines. VS Code must stay open to supply its model API.
+
+## Development and validation
+
+```sh
+npm ci
+npm run typecheck
+npm run lint
+npm test
+npm run test:host
+npm run vsix
+```
+
+The VSIX bundles extension, relay and dependencies. It uses VS Code's Node runtime with no startup downloads. Minimum editor version: 1.104.
+
+Portable tests use fake models, temporary stores, real stdio MCP clients and temporary Git worktrees. Loopback tests need permission to bind a local port. `test:host` launches an installed VS Code in isolated temporary profiles to exercise actual activation, diagnostics, MCP handshake, native undo, and dirty buffers. Set `VSCODE_EXECUTABLE` for a non-default installation. Neither suite starts an LLM or uses live credentials.
+
+For live acceptance: enable your Qwen model, delegate a read-only task, send a follow-up, review a disposable edit, and reload during a task before resuming it. Use diagnostics if discovery, consent, or tool replay fails.
+
+See [architecture notes](docs/design.md), [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli), and [VS Code Language Model API](https://code.visualstudio.com/api/extension-guides/ai/language-model).
