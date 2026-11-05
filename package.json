@@ -8,6 +8,11 @@
     "type": "git",
     "url": "https://github.com/xisui-PA/codex_subagent.git"
   },
+  "license": "MIT",
+  "homepage": "https://github.com/xisui-PA/codex_subagent#readme",
+  "bugs": {
+    "url": "https://github.com/xisui-PA/codex_subagent/issues"
+  },
   "engines": {
     "vscode": "^1.104.0"
   },
@@ -345,7 +350,7 @@
     "clean": "rm -rf dist",
     "test": "npm run build && npm run build:test && node --test \"tests/*.test.cjs\"",
     "build:test": "tsc -p tsconfig.json --outDir .test-build --sourceMap false",
-    "vsix": "vsce package --allow-missing-repository --out codex-subagent-0.2.0.vsix",
+    "vsix": "vsce package",
     "test:host": "npm run build && npm run build:test && node tests/run-host-tests.cjs"
   },
   "devDependencies": {

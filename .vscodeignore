@@ -5,6 +5,8 @@ tests/**
 **/*.map
 **/*.ts
 .gitignore
+.github/**
+AGENTS.md
 tsconfig.json
 .test-build/**
 node_modules/**

@@ -1,15 +1,24 @@
 # Codex Subagent
 
-Persistent workers for Codex, powered by models configured in VS Code. Supports BYOK endpoints on other machines, including your configured Qwen model. **No LLM is installed, downloaded, or started locally.** Model credentials stay with VS Code's Language Model API.
+Persistent workers for Codex, powered by tool-capable language models configured in VS Code. Use a compatible model exposed through VS Code's Language Model API, including a BYOK provider. **No LLM is installed, downloaded, or started locally.** Model credentials stay with VS Code's Language Model API.
 
-## Setup
+## Prerequisites
 
-1. Install `codex-subagent-0.2.0.vsix` using **Extensions: Install from VSIX**, or press **F5** in this repository.
-2. Open a trusted filesystem workspace and run **Codex Subagent: Set Up Workers**.
-3. Select your model, such as `Qwen3.8-27B-oQ6e-mtp`, and approve VS Code model access if prompted. Setup tests an inert tool call and a follow-up using its result; this probe accesses no workspace files.
-4. Setup registers MCP and checks a real stdio handshake through the worker host. In **Codex chat → gear → Codex Settings → MCP Servers**, check that `codex_subagent` is configured and enabled. This page does not list individual tools; use the chat test below to check which tools Codex can access.
-5. Send the connection test below in Codex chat. If Codex cannot find the tools or the MCP call fails, run **Developer: Reload Window** from the VS Code Command Palette (**Cmd+Shift+P** on macOS, **Ctrl+Shift+P** on Windows/Linux), reopen Codex chat, and send the test again. Use a window reload to reconnect; these instructions do not rely on a separate MCP restart control.
-6. After the connection test passes, ask Codex: **“Use the codex_subagent MCP tools to spawn a read-only worker to inspect README.md. Give this conversation a unique ownerId, wait for completion, and report its findings.”** This checks actual model inference and workspace access.
+- VS Code desktop version 1.104 or newer.
+- [Codex](https://github.com/openai/codex) installed and configured in VS Code, since Codex performs the delegation.
+- A tool-capable language model configured in VS Code via **Chat: Manage Language Models** (or any other VS Code language model provider that exposes models through the Language Model API).
+- A trusted filesystem workspace for worker execution.
+- Codex and this extension must run in the same local/remote environment; registry routing does not cross machines.
+
+## Installation
+
+1. Install **Codex Subagent** from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=xisui.codex-subagent) (extension ID `xisui.codex-subagent`), or run `code --install-extension xisui.codex-subagent` from a terminal.
+2. Alternatively, package a [VSIX](#development-and-release) and install it with **Extensions: Install from VSIX**.
+3. Open a trusted filesystem workspace and run **Codex Subagent: Set Up Workers**.
+4. Select a tool-capable model and approve VS Code model access if prompted. Setup tests an inert tool call and a follow-up using its result; this probe accesses no workspace files.
+5. Setup registers MCP and checks a real stdio handshake through the worker host. In **Codex chat → gear → Codex Settings → MCP Servers**, check that `codex_subagent` is configured and enabled. This page does not list individual tools; use the chat test below to check which tools Codex can access.
+6. Send the connection test below in Codex chat. If Codex cannot find the tools or the MCP call fails, run **Developer: Reload Window** from the VS Code Command Palette (**Cmd+Shift+P** on macOS, **Ctrl+Shift+P** on Windows/Linux), reopen Codex chat, and send the test again. Use a window reload to reconnect; these instructions do not rely on a separate MCP restart control.
+7. After the connection test passes, ask Codex: **“Use the codex_subagent MCP tools to spawn a read-only worker to inspect README.md. Give this conversation a unique ownerId, wait for completion, and report its findings.”** This checks actual model inference and workspace access.
 
 Copy this connection test into Codex chat (the setup/register notification offers a **Copy Connection Test** action that copies it to the clipboard):
 
@@ -24,6 +33,12 @@ Reloading the window interrupts active workers. After reloading, inspect them in
 **Check MCP Connection** repeats the handshake independently. It verifies the MCP server and host, not whether an existing Codex conversation has refreshed its tools. **Show Diagnostics**, **Show Log**, and **Retry Worker Host** remain available after startup failures and in an empty window.
 
 Registration adds a managed entry to `$CODEX_HOME/config.toml` or `~/.codex/config.toml`. It preserves unrelated content and config symlinks; the backup is beside the actual config target. The relay is copied into stable extension storage and refreshed after updates. Existing managed registrations are repaired on activation; new registrations require setup. **Unregister MCP from Codex** removes the entry and retains transcripts.
+
+## Data and privacy
+
+Worker requests flow through VS Code's Language Model API to the provider you selected. Task text, file contents, tool results, and message history can be sent to that provider, whose privacy and data policies apply.
+
+Transcripts, change snapshots, and archives are stored in plaintext in extension storage on the extension host's filesystem (on the remote host for remote workspaces) and are retained until you clean them up. **Show Diagnostics** shows their storage location; **Export Transcript** and **Clean Up Saved Workers** export or delete them. Model credentials remain managed by VS Code; this extension does not read, store, or transmit them.
 
 ## Worker experience
 
@@ -47,11 +62,11 @@ Revert is tracked as worker maintenance. Conflicting follow-ups, deletion and ot
 
 Models must be exposed by `vscode.lm.selectChatModels()`. A settings entry alone is insufficient if the provider does not expose it through this API. **Enable Model** tests tool calling and tool-result replay. Background work requires affirmative access and never initiates first-use consent.
 
-Setup and workers use the same response handling. Text and tool calls are processed; known reasoning parts, token-usage footers, and optional server continuation markers are excluded from task output. Workers send their durable message history on each request rather than relying on server continuation markers. Other response types fail explicitly with the part type and, for data parts, the MIME type; payload contents are excluded from that diagnostic. If an older installation reports `unsupported_response` for your BYOK model, install the rebuilt VSIX, run **Developer: Reload Window**, and retry **Enable Model** before resuming the failed worker.
+Setup and workers use the same response handling. Text and tool calls are processed; known reasoning parts, token-usage footers, and optional server continuation markers are excluded from task output. Workers send their durable message history on each request rather than relying on server continuation markers. Other response types fail explicitly with the part type and, for data parts, the MIME type; payload contents are excluded from that diagnostic. If an older installation reports `unsupported_response` for your model, install a rebuilt version, run **Developer: Reload Window**, and retry **Enable Model** before resuming the failed worker.
 
 Enabling another model preserves the default. **Set Default Model** makes that choice explicit. Disabling the default clears it and offers a replacement. **Configure Model Profile** edits options for an exact model ID; profile values override shared options.
 
-The extension does not extract `${secret:...}` values, query the OS keychain, or directly connect to model endpoints. Live credential-backed Qwen access must be tested using Enable Model in your VS Code window.
+The extension does not extract `${secret:...}` values, query the OS keychain, or directly connect to model endpoints. Live credential-backed access must be tested using Enable Model in your VS Code window.
 
 | Setting (prefix `codexSubagent.`) | Default | Purpose |
 | --- | --- | --- |
@@ -117,7 +132,9 @@ The owning window supplies model access and editor buffers. Save unsaved changes
 
 Limits include 200,000 output characters per turn, approximately 20 MB of active history before rollover, and 200 retained workers per store. Archives are retained until explicit cleanup. Transcripts and snapshots contain local plaintext task/file content; diagnostics shows their location. Codex and the extension must share a local/remote environment; registry routing does not cross machines. VS Code must stay open to supply its model API.
 
-## Development and validation
+## Development and release
+
+Development and CI use Node.js 22 or newer (`vsce` requires Node 22+). For local development, run `npm ci`, then press **F5** to launch the extension from source.
 
 ```sh
 npm ci
@@ -128,10 +145,27 @@ npm run test:host
 npm run vsix
 ```
 
-The VSIX bundles extension, relay and dependencies. It uses VS Code's Node runtime with no startup downloads. Minimum editor version: 1.104.
+The VSIX bundles extension, relay and dependencies. It uses VS Code's Node runtime with no startup downloads. Minimum editor version: 1.104. `npm run vsix` produces a version-derived filename, `codex-subagent-<version>.vsix`.
 
-Portable tests use fake models, temporary stores, real stdio MCP clients and temporary Git worktrees. Loopback tests need permission to bind a local port. `test:host` launches an installed VS Code in isolated temporary profiles to exercise actual activation, diagnostics, MCP handshake, native undo, and dirty buffers. Set `VSCODE_EXECUTABLE` for a non-default installation. Neither suite starts an LLM or uses live credentials.
+Portable tests use fake models, temporary stores, real stdio MCP clients and temporary Git worktrees. Loopback tests need permission to bind a local port. `npm run test:host` launches an installed VS Code in isolated temporary profiles to exercise actual activation, diagnostics, MCP handshake, native undo, and dirty buffers. Set `VSCODE_EXECUTABLE` for a non-default installation. Neither suite starts an LLM or uses live credentials.
 
-For live acceptance: enable your Qwen model, delegate a read-only task, send a follow-up, review a disposable edit, and reload during a task before resuming it. Use diagnostics if discovery, consent, or tool replay fails.
+For live acceptance: enable your model, delegate a read-only task, send a follow-up, review a disposable edit, and reload during a task before resuming it. Use diagnostics if discovery, consent, or tool replay fails.
+
+CI (`.github/workflows/ci.yml`) runs on pushes to `main` (including merged pull requests), opened/updated/reopened pull requests targeting `main`, and manual dispatch: it installs dependencies with `npm ci`, then runs typecheck, lint, the portable test suite, and `npm run vsix`. Tags alone do not auto-trigger CI; when you manually dispatch on a release tag (`gh workflow run ci.yml --ref v<version>`), the run fails unless the tag is exactly `v` plus the `package.json` version, matching the release tag policy. The resulting `codex-subagent-*.vsix` is uploaded as a 14-day artifact. CI builds and checks only; it never publishes.
+
+Publishing is manual and happens after validation:
+
+1. Update the `package.json` and `package-lock.json` versions with `npm version <version> --no-git-tag-version`.
+2. Run the local validation and host checks above, plus a live smoke test in your own VS Code window.
+3. Merge the version change into `main` (via pull request) and tag that `main` commit with `v<version>`.
+4. Wait for the successful `main` CI run for that tagged commit and download its VSIX artifact. If you need to rebuild the release artifact, manually dispatch at the tag instead (`gh workflow run ci.yml --ref v<version>`).
+5. Upload **that tested artifact** to the VS Code Marketplace at https://marketplace.visualstudio.com/manage under the publisher ID `xisui` (the account display name `xisui-PA` is not the manifest publisher).
+
+Do not bump the version after validation or rebuild a different artifact after CI; publish exactly the VSIX CI tested and uploaded.
+
+## Support and license
+
+- Report issues: [GitHub Issues](https://github.com/xisui-PA/codex_subagent/issues)
+- License: [MIT](LICENSE)
 
 See [architecture notes](docs/design.md), [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli), and [VS Code Language Model API](https://code.visualstudio.com/api/extension-guides/ai/language-model).
