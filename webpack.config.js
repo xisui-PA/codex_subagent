@@ -12,6 +12,7 @@ module.exports = (env, argv) => {
     target: 'node',
     entry: {
       extension: './src/extension.ts',
+      relay: './src/relay.ts',
     },
     devtool: 'source-map',
     output: {

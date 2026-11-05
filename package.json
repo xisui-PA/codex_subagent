@@ -1,24 +1,337 @@
 {
   "name": "codex-subagent",
   "displayName": "Codex Subagent",
-  "description": "A VS Code extension skeleton for codex_subagent.",
-  "version": "0.0.1",
+  "description": "Persistent BYOK worker agents for Codex, using VS Code language models through MCP.",
+  "version": "0.2.0",
   "publisher": "xisui",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xisui-PA/codex_subagent.git"
+  },
   "engines": {
-    "vscode": "^1.100.0"
+    "vscode": "^1.104.0"
   },
   "categories": [
+    "AI",
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "codexSubagent.helloWorld",
-        "title": "Hello World"
+        "command": "codexSubagent.register",
+        "title": "Register MCP with Codex",
+        "category": "Codex Subagent",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "codexSubagent.unregister",
+        "title": "Unregister MCP from Codex",
+        "category": "Codex Subagent",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "codexSubagent.enableModel",
+        "title": "Enable Model",
+        "category": "Codex Subagent",
+        "icon": "$(add)"
+      },
+      {
+        "command": "codexSubagent.disableModel",
+        "title": "Disable Model",
+        "category": "Codex Subagent",
+        "icon": "$(remove)"
+      },
+      {
+        "command": "codexSubagent.diagnostics",
+        "title": "Show Diagnostics",
+        "category": "Codex Subagent",
+        "icon": "$(info)"
+      },
+      {
+        "command": "codexSubagent.showLog",
+        "title": "Show Log",
+        "category": "Codex Subagent",
+        "icon": "$(output)"
+      },
+      {
+        "command": "codexSubagent.refresh",
+        "title": "Refresh Workers",
+        "category": "Codex Subagent",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "codexSubagent.openWorker",
+        "title": "Open Worker Transcript",
+        "category": "Codex Subagent",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "codexSubagent.cancelWorker",
+        "title": "Cancel Worker",
+        "category": "Codex Subagent",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "codexSubagent.resumeWorker",
+        "title": "Resume Worker",
+        "category": "Codex Subagent",
+        "icon": "$(play)"
+      },
+      {
+        "command": "codexSubagent.deleteWorker",
+        "title": "Delete Worker",
+        "category": "Codex Subagent",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "codexSubagent.setup",
+        "title": "Set Up Workers",
+        "category": "Codex Subagent",
+        "icon": "$(wand)"
+      },
+      {
+        "command": "codexSubagent.checkConnection",
+        "title": "Check MCP Connection",
+        "category": "Codex Subagent",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "codexSubagent.retryHost",
+        "title": "Retry Worker Host",
+        "category": "Codex Subagent",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "codexSubagent.newWorker",
+        "title": "New Worker",
+        "category": "Codex Subagent",
+        "icon": "$(add)"
+      },
+      {
+        "command": "codexSubagent.sendMessage",
+        "title": "Send Follow-up",
+        "category": "Codex Subagent",
+        "icon": "$(comment)"
+      },
+      {
+        "command": "codexSubagent.compactWorker",
+        "title": "Compact Worker",
+        "category": "Codex Subagent",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "codexSubagent.discardQueued",
+        "title": "Discard Queued Messages",
+        "category": "Codex Subagent",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "codexSubagent.exportWorker",
+        "title": "Export Transcript",
+        "category": "Codex Subagent",
+        "icon": "$(export)"
+      },
+      {
+        "command": "codexSubagent.cleanupWorkers",
+        "title": "Clean Up Saved Workers",
+        "category": "Codex Subagent",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "codexSubagent.savedWorkspaces",
+        "title": "Browse Saved Workspaces",
+        "category": "Codex Subagent",
+        "icon": "$(folder-library)"
+      },
+      {
+        "command": "codexSubagent.setDefaultModel",
+        "title": "Set Default Model",
+        "category": "Codex Subagent",
+        "icon": "$(star-full)"
+      },
+      {
+        "command": "codexSubagent.configureModel",
+        "title": "Configure Model Profile",
+        "category": "Codex Subagent",
+        "icon": "$(settings-gear)"
       }
-    ]
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "codexSubagent.workers",
+          "name": "Codex Workers",
+          "icon": "$(hubot)",
+          "visibility": "visible"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "codexSubagent.workers",
+        "contents": "Delegate work to your VS Code models.\n[Set up workers](command:codexSubagent.setup)\n[New worker](command:codexSubagent.newWorker)\n[Diagnostics](command:codexSubagent.diagnostics)\n[Retry host](command:codexSubagent.retryHost)",
+        "when": "view == codexSubagent.workers"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "codexSubagent.newWorker",
+          "when": "view == codexSubagent.workers",
+          "group": "navigation"
+        },
+        {
+          "command": "codexSubagent.refresh",
+          "when": "view == codexSubagent.workers",
+          "group": "navigation"
+        },
+        {
+          "command": "codexSubagent.setup",
+          "when": "view == codexSubagent.workers",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "codexSubagent.cancelWorker",
+          "when": "view == codexSubagent.workers && viewItem == workerRunning",
+          "group": "inline"
+        },
+        {
+          "command": "codexSubagent.resumeWorker",
+          "when": "view == codexSubagent.workers && viewItem == workerResumable",
+          "group": "inline"
+        },
+        {
+          "command": "codexSubagent.sendMessage",
+          "when": "view == codexSubagent.workers && viewItem == workerCompleted",
+          "group": "inline"
+        },
+        {
+          "command": "codexSubagent.sendMessage",
+          "when": "view == codexSubagent.workers && viewItem == workerRunning",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.openWorker",
+          "when": "view == codexSubagent.workers && viewItem == workerCompleted",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.exportWorker",
+          "when": "view == codexSubagent.workers && viewItem == workerCompleted",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.compactWorker",
+          "when": "view == codexSubagent.workers && viewItem == workerResumable",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.compactWorker",
+          "when": "view == codexSubagent.workers && viewItem == workerCompleted",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.discardQueued",
+          "when": "view == codexSubagent.workers && viewItem == workerResumable",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.discardQueued",
+          "when": "view == codexSubagent.workers && viewItem == workerRunning",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.deleteWorker",
+          "when": "view == codexSubagent.workers && viewItem == workerCompleted",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.deleteWorker",
+          "when": "view == codexSubagent.workers && viewItem == workerResumable",
+          "group": "actions"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Codex Subagent",
+      "properties": {
+        "codexSubagent.defaultModel": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Exact model ID. Use Set Default Model to choose; enabling another model preserves this choice."
+        },
+        "codexSubagent.allowWrites": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "description": "Allow workers explicitly spawned with workspace-write permission to edit workspace files. Only user-level settings are honored."
+        },
+        "codexSubagent.allowShell": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "description": "Offer shell execution to workspace-write workers. Every command still needs explicit approval in VS Code. Commands do not inherit the Codex sandbox. Only user-level settings are honored."
+        },
+        "codexSubagent.maxConcurrentWorkers": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 8,
+          "scope": "machine",
+          "description": "Maximum simultaneously active worker conversations."
+        },
+        "codexSubagent.maxToolRounds": {
+          "type": "integer",
+          "default": 40,
+          "minimum": 1,
+          "maximum": 200,
+          "scope": "machine",
+          "description": "Maximum model/tool rounds per turn before manual resumption is required."
+        },
+        "codexSubagent.turnTimeoutSeconds": {
+          "type": "integer",
+          "default": 600,
+          "minimum": 10,
+          "maximum": 3600,
+          "scope": "machine",
+          "description": "Deadline per worker turn, including tool execution. Timeout preserves the session for explicit resumption."
+        },
+        "codexSubagent.modelOptions": {
+          "type": "object",
+          "default": {},
+          "scope": "machine",
+          "description": "Provider-specific options passed to VS Code sendRequest, such as supported reasoning options. Never put credentials here."
+        },
+        "codexSubagent.autoCompact": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "Summarize and archive older history automatically before context/storage/turn limits. Full transcripts remain exportable."
+        },
+        "codexSubagent.notifyOnCompletion": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "Notify when an observed worker finishes or fails."
+        },
+        "codexSubagent.modelProfiles": {
+          "type": "object",
+          "default": {},
+          "scope": "machine",
+          "additionalProperties": {
+            "type": "object"
+          },
+          "description": "Per-model options keyed by exact model ID. Override shared modelOptions; use Configure Model Profile."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
@@ -30,12 +343,16 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "clean": "rm -rf dist",
-    "test": "node --test \"tests/*.test.cjs\""
+    "test": "npm run build && npm run build:test && node --test \"tests/*.test.cjs\"",
+    "build:test": "tsc -p tsconfig.json --outDir .test-build --sourceMap false",
+    "vsix": "vsce package --allow-missing-repository --out codex-subagent-0.2.0.vsix",
+    "test:host": "npm run build && npm run build:test && node tests/run-host-tests.cjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
     "@types/node": "^24.x",
     "@types/vscode": "^1.100.0",
+    "@vscode/vsce": "^4.1.0",
     "eslint": "^9.39.5",
     "eslint-plugin-import": "^2.32.0",
     "eslint-plugin-jsdoc": "^65.3.11",
@@ -45,5 +362,29 @@
     "typescript-eslint": "^8.71.2",
     "webpack": "^5.112.2",
     "webpack-cli": "^7.3.1"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "smol-toml": "^1.9.1",
+    "zod": "^4.6.7"
+  },
+  "keywords": [
+    "codex",
+    "mcp",
+    "subagent",
+    "byok",
+    "local-llm"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Diagnostics and model setup are available; worker execution requires a trusted filesystem workspace."
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
   }
 }
