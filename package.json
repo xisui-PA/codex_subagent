@@ -3,7 +3,7 @@
   "displayName": "Codex Subagent",
   "description": "Persistent BYOK worker agents for Codex, using VS Code language models through MCP.",
   "version": "0.2.0",
-  "publisher": "xisui",
+  "publisher": "xisui-PA",
   "repository": {
     "type": "git",
     "url": "https://github.com/xisui-PA/codex_subagent.git"
