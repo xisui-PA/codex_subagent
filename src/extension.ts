@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { CommandApprovals } from './command-approval';
 import { WorkerComposer } from './composer';
 import { promises as fs } from 'node:fs';
 import { mcpInstructions } from './api';
@@ -67,6 +68,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
   status.command = 'codexSubagent.workers.focus'; status.text = '$(hubot) Workers'; status.show();
   context.subscriptions.push(log, tree, status, vscode.window.registerTreeDataProvider('codexSubagent.workers', tree));
   const provider = new VscodeProvider(context);
+  const approvals = new CommandApprovals();
+  context.subscriptions.push(approvals);
   const registry = path.join(context.globalStorageUri.fsPath, 'bridges');
   const configPath = (): string => path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'config.toml');
   let relay = context.asAbsolutePath('dist/relay.js');
@@ -178,7 +181,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
         files: {
           canWrite: () => userBoolean('allowWrites'), allowShell: () => userBoolean('allowShell'),
           readOpenText: file => openText(file)?.getText(), applyChange: applyEditorChange,
-          approveCommand: async (text, cwd, signal) => !signal.aborted && await vscode.window.showWarningMessage(`Worker requests a shell command in ${cwd}:\n${text}`, { modal: true, detail: 'Runs with VS Code’s OS access, outside the Codex sandbox. Unsaved editor changes are not visible to the shell.' }, 'Run Command') === 'Run Command' && !signal.aborted
+          approveCommand: async (text, cwd, signal, workspaceRoot) => approvals.request(text, cwd, signal, workspaceRoot)
         }, onChange: () => {
           void refresh();
         }, onError: message => report(new WorkerError('checkpoint_failed', message))
@@ -481,6 +484,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     for (const choice of picked) {
       await control(await requireBroker().session(choice.session.workspaceRoot || roots()[0], choice.session.id), 'subagent_delete');
     }
+  });
+  command('revokeShellApproval', async () => {
+    const granted = approvals.getGrantedRoots();
+    if (!granted.length) {
+      void vscode.window.showInformationMessage('No active workspace shell approvals.');
+      return;
+    }
+    const choice = await vscode.window.showQuickPick([
+      ...granted.map(root => ({ label: path.basename(root), description: root, root })),
+      { label: 'All workspaces', description: 'Revoke every active session grant', root: undefined as string | undefined }
+    ], { title: 'Revoke shell approval' });
+    if (!choice) {
+      return;
+    }
+    approvals.revoke(choice.root);
+    void vscode.window.showInformationMessage('Shell approval revoked. Future commands will ask for approval.');
   });
   command('savedWorkspaces', async () => {
     const current = requireBroker();

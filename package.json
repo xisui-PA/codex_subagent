@@ -4,6 +4,7 @@
   "description": "Persistent BYOK worker agents for Codex, using VS Code language models through MCP.",
   "version": "0.2.0",
   "publisher": "xisui-PA",
+  "icon": "media/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/xisui-PA/codex_subagent.git"
@@ -163,6 +164,12 @@
         "title": "Configure Model Profile",
         "category": "Codex Subagent",
         "icon": "$(settings-gear)"
+      },
+      {
+        "command": "codexSubagent.revokeShellApproval",
+        "title": "Revoke Shell Approval",
+        "category": "Codex Subagent",
+        "icon": "$(shield)"
       }
     ],
     "views": {
@@ -282,7 +289,7 @@
           "type": "boolean",
           "default": false,
           "scope": "machine",
-          "description": "Offer shell execution to workspace-write workers. Every command still needs explicit approval in VS Code. Commands do not inherit the Codex sandbox. Only user-level settings are honored."
+          "description": "Offer shell execution to workspace-write workers. Requires one-time or workspace-session approval in VS Code. Session grants expire on reload or revocation. Commands use VS Code's OS access, outside the Codex sandbox. Only user-level settings are honored."
         },
         "codexSubagent.maxConcurrentWorkers": {
           "type": "integer",

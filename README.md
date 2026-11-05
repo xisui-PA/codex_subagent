@@ -72,7 +72,7 @@ The extension does not extract `${secret:...}` values, query the OS keychain, or
 | --- | --- | --- |
 | `defaultModel` | First enabled | Exact model ID; no silent fallback |
 | `allowWrites` | `false` | Enable writes for explicitly writable workers |
-| `allowShell` | `false` | Offer individually approved shell commands |
+| `allowShell` | `false` | Offer shell commands with one-time or workspace-session approval |
 | `maxConcurrentWorkers` | `2` | Active conversations per store |
 | `maxToolRounds` | `40` | Tool rounds before explicit resumption |
 | `turnTimeoutSeconds` | `600` | Deadline including tools and summaries |
@@ -87,7 +87,7 @@ Read-only is the default. For code changes, enable `codexSubagent.allowWrites` i
 
 Tools include paginated UTF-8 reads, directory listing/creation, bounded literal search, hash-checked writes, exact-text patches, rename, and delete. Changes have recoverable before/after snapshots. Stale hashes, symlink paths, hard-linked replacements, and writes to `.git`, `.codex`, or `.vscode` are rejected. Missing parent directories can be created in order. These checks are not an OS filesystem sandbox against arbitrary concurrent external processes.
 
-Optional `codexSubagent.allowShell` offers shell execution to workspace-write workers. Each exact command needs approval in VS Code. Commands run with the extension host's OS access, outside Codex's sandbox. Time/output are bounded. POSIX cancellation and deadlines terminate the process group, retaining the forced-kill grace period even if the shell exits first; Windows cancellation targets the direct process. Repository settings cannot grant write/shell access.
+Optional `codexSubagent.allowShell` offers shell execution to workspace-write workers. Commands without an active session grant open a scrollable **Review Worker Command** tab showing the full command and working directory with **Run once**, **Allow for this workspace session**, and **Cancel** controls; closing the tab or pressing Escape denies it. A workspace-session grant covers all workers in the same canonical workspace/worktree for this VS Code window, including commands already waiting there, but other workspace/worktree roots need separate grants. The grant is memory only: it ends on window reload/restart or when you run **Revoke Shell Approval**, which also targets one root or all roots and does not terminate running commands (use **Cancel Worker** for that). Commands run with the extension host's OS access, outside Codex's sandbox. Time/output are bounded. POSIX cancellation and deadlines terminate the process group, retaining the forced-kill grace period even if the shell exits first; Windows cancellation targets the direct process. Repository settings cannot grant write/shell access.
 
 ## Parent ownership and lifecycle
 

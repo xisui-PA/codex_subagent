@@ -27,7 +27,7 @@ const descriptions: Record<keyof typeof schemas, string> = {
   patch_file: 'Replace exactly one occurrence of oldText with newText in a file, using its current SHA-256 hash. Ambiguous or stale edits fail. Changes are reviewable in VS Code.',
   delete_file: 'Delete a workspace file only if its current hash matches expectedHash. A recoverable before-image is saved for the worker change review.',
   rename_file: 'Rename a workspace file to a new path. Requires its current expectedHash and a nonexistent destination. The parent directory must exist.',
-  run_command: 'Run a shell command only after the user approves the exact command in VS Code. No Codex sandbox or approval is inherited. Output is bounded; cancelled commands may have partial side effects.'
+  run_command: 'Run a shell command only after the user approves it in VS Code, either one-time or for the active workspace session. No Codex sandbox or approval is inherited. Output is bounded; cancelled commands may have partial side effects.'
 };
 const hash = (text: string): string => createHash('sha256').update(text).digest('hex');
 const skipped = new Set(['node_modules', 'dist', 'build', 'coverage', 'vendor']);
@@ -36,7 +36,7 @@ export interface FileToolOptions {
   canWrite: () => boolean;
   allowShell: () => boolean;
   checkDocument?: (file: string) => void;
-  approveCommand?: (command: string, cwd: string, signal: AbortSignal) => Promise<boolean>;
+  approveCommand?: (command: string, cwd: string, signal: AbortSignal, workspaceRoot: string) => Promise<boolean>;
   readOpenText?: (file: string) => string | undefined;
   applyChange?: (change: ChangeContent, expectedHash: string) => Promise<void>;
   recordChange?: (session: Session, change: ChangeContent) => Promise<void>;
@@ -277,7 +277,7 @@ export class FileTools implements WorkspaceTools {
       if (!(await fs.stat(cwd)).isDirectory()) {
         throw new WorkerError('invalid_path', 'Command path must be a directory.');
       }
-      const approved = await abortable(this.options.approveCommand(args.command, cwd, signal), signal);
+      const approved = await abortable(this.options.approveCommand(args.command, cwd, signal, this.workspaceRoot), signal);
       signal.throwIfAborted();
       if (!approved || !this.options.allowShell()) {
         throw new WorkerError('command_denied', 'User declined the command.');
