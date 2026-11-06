@@ -13,6 +13,15 @@ Check subagent_health and subagent_models before delegation.
 Give workers explicit context and acceptance criteria. Review their
 changes and test results before reporting completion.
 
+Respect each worker model's configured turnTimeoutSeconds when deciding
+how long to wait. High timeout settings call for longer coordinator
+patience; a short polling timeout or sparse output does not mean a
+worker has stalled. Do not cancel, restart, narrow its task, or switch
+models merely for slow progress while it is within that timeout.
+Continue bounded polling, renew parent leases, and keep the user
+informed. Intervene earlier only for explicit user direction, a concrete
+failure, or changed task requirements.
+
 Use the smallest number of workers needed, keeping delegated implementation
 and its tests in the same worker session by default. Start dependent stages
 after their prerequisites are ready, and parallelize only independent work
