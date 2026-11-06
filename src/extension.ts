@@ -12,6 +12,7 @@ import { exportTranscript } from './exporter';
 import { applyEditorChange, openText } from './editor';
 import { WorkerPanel, PanelMessage } from './panel';
 import { eligibleModels, parseModelSettings, poolAllows } from './model-settings';
+import { ModelsTree } from './models-view';
 import { prepareRuntime, register, repairRegistration } from './registration';
 import { WorkerBroker, unpack } from './runtime';
 import { Mutex } from './storage';
@@ -67,7 +68,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
   const tree = new WorkerTree();
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 10);
   status.command = 'codexSubagent.workers.focus'; status.text = '$(hubot) Workers'; status.show();
-  context.subscriptions.push(log, tree, status, vscode.window.registerTreeDataProvider('codexSubagent.workers', tree));
+  const models = new ModelsTree();
+  // Re-read the User-level pool, drive the welcome context key, and refresh.
+  const syncModels = (): void => {
+    models.refresh();
+    void vscode.commands.executeCommand('setContext', 'codexSubagent.modelsEmpty', models.pool.empty);
+  };
+  syncModels();
+  context.subscriptions.push(log, tree, models, status,
+    vscode.window.registerTreeDataProvider('codexSubagent.workers', tree),
+    vscode.window.registerTreeDataProvider('codexSubagent.models', models));
   const provider = new VscodeProvider(context);
   const approvals = new CommandApprovals();
   context.subscriptions.push(approvals);
@@ -282,7 +292,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
       await refresh();
     }
   });
-  command('configureModel', async () => {
+  command('openModelSettings', async () => {
+    // Only the User-level pool is honored, so open User settings explicitly.
+    // In a remote window this extension runs remotely (extensionKind
+    // workspace), so the relevant user settings are the remote ones:
+    // openRemoteSettings targets the remote user profile, openGlobalSettings
+    // the local one; both parse query options (unlike openSettings, which
+    // ignores a target option).
+    const action = vscode.env.remoteName ? 'workbench.action.openRemoteSettings' : 'workbench.action.openGlobalSettings';
+    await vscode.commands.executeCommand(action, { query: '@id:codexSubagent.models' });
+  });
+  command('configureModel', async (...args: unknown[]) => {
+    const [arg] = args;
     // Offer only configured model IDs (provider.enabled()), including IDs
     // currently unavailable in VS Code; an unconfigured model has no options
     // entry and enabling it is a separate command.
@@ -291,9 +312,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
       void vscode.window.showInformationMessage('No worker model is configured. Run Codex Subagent: Enable Model first; model options live at codexSubagent.models.<model-id>.modelOptions.');
       return;
     }
-    const id = await vscode.window.showQuickPick(ids, { title: 'Choose a configured model to edit its provider options' });
+    // A context menu passes the tree's model node, a tree click passes its ID;
+    // otherwise offer a quick pick. A cancelled pick returns quietly.
+    const preselected = typeof arg === 'string' ? arg : arg && typeof arg === 'object' && typeof (arg as { id?: unknown }).id === 'string' ? (arg as { id: string }).id : undefined;
+    let id: string | undefined = preselected && ids.includes(preselected) ? preselected : undefined;
     if (!id) {
-      return;
+      id = await vscode.window.showQuickPick(ids, { title: 'Choose a configured model to edit its provider options' });
+      if (!id) {
+        return;
+      }
     }
     const value = await vscode.window.showInputBox({ title: `Model options for ${id}`, value: JSON.stringify(provider.options(id)), prompt: 'JSON object of provider-specific options passed to sendRequest; do not include credentials.', validateInput: text => {
       try {
@@ -599,7 +626,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     log.appendLine(`Registration repair: ${failure(error).message}`);
   }
   await configure();
-  context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => {
+  context.subscriptions.push(vscode.lm.onDidChangeChatModels(() => {
+    // The Models view labels its roots with VS Code model names, so a catalog
+    // change must re-read them (refresh keeps the strict global-only pool).
+    syncModels();
+  }), vscode.workspace.onDidChangeWorkspaceFolders(() => {
     void configure().catch(report);
   }), vscode.workspace.onDidGrantWorkspaceTrust(() => {
     void configure().catch(report);
@@ -609,6 +640,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     if (!event.affectsConfiguration('codexSubagent')) {
       return;
     }
+    // The Models view depends only on the User-level pool, so it refreshes in
+    // every window, broker or workspace availability or not.
+    syncModels();
     try {
       broker?.settingsChanged();
     } catch (error) {

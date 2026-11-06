@@ -42,7 +42,9 @@ Transcripts, change snapshots, and archives are stored in plaintext in extension
 
 ## Worker experience
 
-Explorer's **Codex Workers** view groups workers by parent conversation and workspace root. Click a worker for its live conversation panel: output, current activity, recent tools, errors, changed files, and recovery actions. Completion/failure notifications link back to the worker.
+The Activity Bar's **Codex Subagent** view container holds the **Codex Workers** and **Models** views. The workers view groups workers by parent conversation and workspace root. Click a worker for its live conversation panel: output, current activity, recent tools, errors, changed files, and recovery actions. Completion/failure notifications link back to the worker.
+
+The **Models** view shows the strict User-settings `codexSubagent.models` pool in insertion/priority order, without needing a worker host or a trusted workspace. Expanding a model shows its effective policy (`allowWrite`, `allowShell`, `numSessions`, `maxToolRounds`, `turnTimeoutSeconds`, `autoCompact`) with built-in defaults (true/true/1/40/600/true) flagged as `default`, plus its `modelOptions` entries as readable JSON. Title actions offer **Enable Model**, **Configure Model Options**, and **Open Model Settings** (scoped to `codexSubagent.models` in User Settings); clicking a model configures its options. A malformed setting shows a visible error row that opens the settings; an empty pool shows Enable Model / Open User Settings guidance. The view refreshes on `codexSubagent` configuration changes.
 
 - **New Worker** starts a task directly from VS Code.
 - **Send Follow-up** queues a message behind the active turn.

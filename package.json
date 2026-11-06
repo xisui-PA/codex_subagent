@@ -2,7 +2,7 @@
   "name": "codex-subagent",
   "displayName": "Codex Subagent",
   "description": "Persistent BYOK worker agents for Codex, using VS Code language models through MCP.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "xisui-PA",
   "icon": "media/icon.png",
   "repository": {
@@ -160,18 +160,39 @@
         "icon": "$(settings-gear)"
       },
       {
+        "command": "codexSubagent.openModelSettings",
+        "title": "Open Model Settings",
+        "category": "Codex Subagent",
+        "icon": "$(settings)"
+      },
+      {
         "command": "codexSubagent.revokeShellApproval",
         "title": "Revoke Shell Approval",
         "category": "Codex Subagent",
         "icon": "$(shield)"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codexSubagent",
+          "title": "Codex Subagent",
+          "icon": "media/container.svg"
+        }
+      ]
+    },
     "views": {
-      "explorer": [
+      "codexSubagent": [
         {
           "id": "codexSubagent.workers",
           "name": "Codex Workers",
           "icon": "$(hubot)",
+          "visibility": "visible"
+        },
+        {
+          "id": "codexSubagent.models",
+          "name": "Models",
+          "icon": "$(brain)",
           "visibility": "visible"
         }
       ]
@@ -181,6 +202,11 @@
         "view": "codexSubagent.workers",
         "contents": "Delegate work to your VS Code models.\n[Set up workers](command:codexSubagent.setup)\n[New worker](command:codexSubagent.newWorker)\n[Diagnostics](command:codexSubagent.diagnostics)\n[Retry host](command:codexSubagent.retryHost)",
         "when": "view == codexSubagent.workers"
+      },
+      {
+        "view": "codexSubagent.models",
+        "contents": "No worker models are enabled.\n[Enable Model](command:codexSubagent.enableModel)\n[Open User Settings](command:codexSubagent.openModelSettings)",
+        "when": "view == codexSubagent.models && codexSubagent.modelsEmpty"
       }
     ],
     "menus": {
@@ -198,6 +224,21 @@
         {
           "command": "codexSubagent.setup",
           "when": "view == codexSubagent.workers",
+          "group": "navigation"
+        },
+        {
+          "command": "codexSubagent.enableModel",
+          "when": "view == codexSubagent.models",
+          "group": "navigation"
+        },
+        {
+          "command": "codexSubagent.configureModel",
+          "when": "view == codexSubagent.models",
+          "group": "navigation"
+        },
+        {
+          "command": "codexSubagent.openModelSettings",
+          "when": "view == codexSubagent.models",
           "group": "navigation"
         }
       ],
@@ -260,6 +301,16 @@
         {
           "command": "codexSubagent.deleteWorker",
           "when": "view == codexSubagent.workers && viewItem == workerResumable",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.configureModel",
+          "when": "view == codexSubagent.models && viewItem == modelEntry",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.openModelSettings",
+          "when": "view == codexSubagent.models",
           "group": "actions"
         }
       ]
