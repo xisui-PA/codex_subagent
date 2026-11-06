@@ -90,6 +90,24 @@ export class WorkerBroker {
       }
     }
   }
+  /**
+   * Live settings changed in this window. Ask every locally owned engine to
+   * re-evaluate queued work against the new pool (repaired malformed config,
+   * raised numSessions). Ownership, running jobs and draining tools are left
+   * untouched; windows that do not own a store simply have nothing to do.
+   */
+  settingsChanged(): void {
+    if (this.closed) {
+      return;
+    }
+    for (const runtime of this.local.values()) {
+      try {
+        runtime.engine.reschedule();
+      } catch (error) {
+        this.options.onError(failure(error).message);
+      }
+    }
+  }
   async catalog(): Promise<{ identity: string; roots: string[]; directory: string }[]> {
     return workspaceCatalog(this.options.storage);
   }

@@ -11,10 +11,11 @@ import { defaults } from './engine';
 import { exportTranscript } from './exporter';
 import { applyEditorChange, openText } from './editor';
 import { WorkerPanel, PanelMessage } from './panel';
+import { eligibleModels, parseModelSettings } from './model-settings';
 import { prepareRuntime, register, repairRegistration } from './registration';
 import { WorkerBroker, unpack } from './runtime';
 import { Mutex } from './storage';
-import { ChangeContent, failure, Message, Model, Session, SessionHeader, WorkerError } from './types';
+import { ChangeContent, failure, Message, Model, ModelPolicy, Session, SessionHeader, WorkerError } from './types';
 import { VscodeProvider } from './vscode-provider';
 
 let cleanup: (() => Promise<void>) | undefined;
@@ -103,6 +104,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     }
     return broker;
   };
+  // Only user-level (global) settings are honored for pool routing/permissions.
+  const modelPool = (): Record<string, ModelPolicy> => parseModelSettings(vscode.workspace.getConfiguration('codexSubagent').inspect<unknown>('models')?.globalValue);
   const refresh = async (): Promise<void> => {
     if (!broker || refreshing || !alive) {
       return;
@@ -111,6 +114,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     try {
       const sessions = await broker.list();
       tree.refresh(sessions);
+      // Strict settings read once per refresh: a malformed pool must surface as
+      // guidance in every panel instead of stale or invalid model choices.
+      let pool: Record<string, ModelPolicy> | undefined;
+      let poolError = '';
+      try {
+        pool = modelPool();
+      } catch (error) {
+        poolError = failure(error).message;
+      }
       const active = sessions.filter(s => ['running', 'queued'].includes(s.state)).length;
       status.text = `$(hubot) Workers${active ? `: ${active}` : ''}`;
       status.tooltip = `${sessions.length} saved workers · ${active} active`;
@@ -139,7 +151,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
             message = failure(error).code === 'outside_workspace' || (error as NodeJS.ErrnoException).code === 'ENOENT'
               ? 'This folder is not open. Restore it to continue work; saved history remains available.' : failure(error).message;
           }
-          entry.panel.update(s, models);
+          // Filter in this window: the webview dropdown must mirror the exact
+          // pool/permission policy currently saved, not a stale list.
+          let choices: ReturnType<typeof eligibleModels> = { models: [] };
+          if (poolError) {
+            choices = { models: [], guidance: poolError };
+          } else if (!message) {
+            choices = eligibleModels({ permission: s.permission, available: models, pool, previous: s.model.id });
+          }
+          entry.panel.update(s, choices.models, choices.guidance);
           if (message) {
             entry.panel.error(message);
           }
@@ -176,7 +196,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
           const integer = (name: string, fallback: number, min: number, max: number): number => {
             const value = c.get<unknown>(name, fallback); return typeof value === 'number' && Number.isInteger(value) ? Math.min(max, Math.max(min, value)) : fallback;
           };
-          return { ...defaults, maxConcurrent: integer('maxConcurrentWorkers', 2, 1, 8), maxToolRounds: integer('maxToolRounds', 40, 1, 200), turnTimeoutMs: integer('turnTimeoutSeconds', 600, 10, 3600) * 1000, autoCompact: c.get('autoCompact', true) };
+          return { ...defaults, maxConcurrent: integer('maxConcurrentWorkers', 2, 1, 8), maxToolRounds: integer('maxToolRounds', 40, 1, 200), turnTimeoutMs: integer('turnTimeoutSeconds', 600, 10, 3600) * 1000, autoCompact: c.get('autoCompact', true), models: parseModelSettings(c.inspect<unknown>('models')?.globalValue) };
         }, defaultModel: () => provider.defaultModel(),
         files: {
           canWrite: () => userBoolean('allowWrites'), allowShell: () => userBoolean('allowShell'),
@@ -243,7 +263,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
   command('refresh', refresh);
   command('retryHost', configure);
   command('enableModel', async () => {
-    await provider.enable(); await refresh();
+    await provider.enable(); broker?.settingsChanged(); await refresh();
   });
   command('setDefaultModel', async () => {
     const models = await provider.models();
@@ -256,6 +276,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     const id = await vscode.window.showQuickPick(provider.enabled(), { title: 'Disable a worker model' }); if (id) {
       const wasDefault = provider.defaultModel() === id;
       await provider.disable(id);
+      broker?.settingsChanged();
       if (wasDefault && (await provider.models()).length) {
         await vscode.commands.executeCommand('codexSubagent.setDefaultModel');
       }
@@ -352,14 +373,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     const task = await vscode.window.showInputBox({ title: 'New worker task', prompt: 'Describe the task and supply relevant paths/context.' }); if (!task?.trim()) {
       return;
     }
-    const permission = await vscode.window.showQuickPick(['read-only', 'workspace-write'], { title: 'Worker permissions' }); if (!permission) {
+    const pickedPermission = await vscode.window.showQuickPick(['read-only', 'workspace-write'], { title: 'Worker permissions' }); if (!pickedPermission) {
       return;
     }
+    const permission: Session['permission'] = pickedPermission === 'workspace-write' ? 'workspace-write' : 'read-only';
     const models = unpack<{ models: Model[] }>(await current.invoke(root, 'subagent_models', {})).models;
-    const model = await vscode.window.showQuickPick(models.map(m => ({ label: m.name, detail: m.id, model: m })), { title: 'Worker model' }); if (!model) {
+    const pool = modelPool();
+    const eligible = eligibleModels({ permission, available: models, pool });
+    if (!eligible.models.length) {
+      void vscode.window.showWarningMessage(eligible.guidance || 'No eligible worker model is available.');
       return;
     }
-    const worker = unpack<{ id: string }>(await current.invoke(root, 'subagent_spawn', { requestId: randomUUID(), ownerId: 'manual', ownerLabel: 'Manual tasks', task, permission, model: model.model.id }));
+    const poolActive = Object.keys(pool).length > 0;
+    const byId = new Map(models.map(m => [m.id, m]));
+    const choices: { label: string; detail: string; model?: Model }[] = [{ label: 'Automatic', detail: poolActive ? 'first eligible configured model with a free session' : 'enabled default model' }];
+    for (const entry of eligible.models) {
+      choices.push({ label: entry.name, detail: entry.id + (entry.policy ? ' · ' + String(entry.policy.numSessions ?? 1) + ' active session(s)' : ''), model: byId.get(entry.id)! });
+    }
+    const choice = await vscode.window.showQuickPick(choices, { title: 'Worker model' }); if (!choice) {
+      return;
+    }
+    const worker = unpack<{ id: string }>(await current.invoke(root, 'subagent_spawn', { requestId: randomUUID(), ownerId: 'manual', ownerLabel: 'Manual tasks', task, permission, ...(choice.model ? { model: choice.model.id } : {}) }));
     const session = await current.session(root, worker.id); await vscode.commands.executeCommand('codexSubagent.openWorker', { kind: 'worker', session });
   });
   command('openWorker', async arg => {
@@ -383,6 +417,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
         await control(latest, 'subagent_cancel');
       }
       if (message.action === 'resume') {
+        if (latest.state === 'completed' && !message.model) {
+          // A completed worker must never be resumed with its old, possibly
+          // removed, model id: require the explicit eligible choice.
+          throw new WorkerError('not_resumable', 'Choose an eligible model to continue a completed worker. Leave the message empty to switch the model only.');
+        }
         await control(latest, 'subagent_resume', { requestId: message.requestId, model: message.model, message: message.message });
       }
       if (message.action === 'compact') {
@@ -433,14 +472,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     const s = await selected(arg); if (!s) {
       return;
     }
-    if (!['failed', 'cancelled', 'interrupted'].includes(s.state)) {
-      throw new WorkerError('not_resumable', 'This worker is complete. Send a follow-up instead.');
+    // Completed workers may switch model (and optionally continue with one
+    // follow-up turn). They always require an explicit, currently eligible model.
+    const completed = s.state === 'completed';
+    if (!completed && !['failed', 'cancelled', 'interrupted'].includes(s.state)) {
+      throw new WorkerError('not_resumable', 'This worker is busy. Cancel it before resuming.');
+    }
+    if (completed && !s.turns.length) {
+      throw new WorkerError('not_resumable', 'This worker has no conversation to continue. Start a new worker instead.');
     }
     const models = unpack<{ models: Model[] }>(await requireBroker().invoke(s.workspaceRoot || roots()[0], 'subagent_models', {})).models;
-    const choice = await vscode.window.showQuickPick(models.map(m => ({ label: m.name, detail: m.id, picked: m.id === s.model.id, model: m })), { title: 'Resume using model' }); if (!choice) {
+    const eligible = eligibleModels({ permission: s.permission, available: models, pool: modelPool(), previous: s.model.id });
+    if (!eligible.models.length) {
+      void vscode.window.showWarningMessage(eligible.guidance || 'No eligible worker model is available.');
       return;
     }
-    const message = await vscode.window.showInputBox({ title: 'Recovery instructions', prompt: 'Optional steering message; leave empty to continue.', value: '' }); if (message === undefined) {
+    const choice = await vscode.window.showQuickPick(eligible.models.map(model => ({
+      label: model.name,
+      description: model.id === s.model.id ? 'current' : undefined,
+      detail: model.id + (model.policy ? ' · ' + String(model.policy.numSessions ?? 1) + ' active session(s)' : ''),
+      model
+    })), { title: completed ? 'Model for this completed worker' : 'Resume using model', placeHolder: completed ? 'The worker keeps its history; no inference runs unless you add a message.' : undefined });
+    if (!choice) {
+      return;
+    }
+    const message = await vscode.window.showInputBox({
+      title: completed ? 'Optional follow-up' : 'Recovery instructions',
+      prompt: completed ? 'Leave empty to switch the model only. Any text becomes one new follow-up turn; earlier turns are preserved.' : 'Optional steering message; leave empty to continue.',
+      value: ''
+    }); if (message === undefined) {
       return;
     }
     await control(s, 'subagent_resume', { requestId: randomUUID(), model: choice.model.id, message: message || undefined });
@@ -521,6 +581,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     void configure().catch(report);
   }), vscode.workspace.onDidGrantWorkspaceTrust(() => {
     void configure().catch(report);
+  }), vscode.workspace.onDidChangeConfiguration(event => {
+    // Every window receives user-level configuration changes. Only the owning
+    // window has local runtimes; the others have nothing to reschedule.
+    if (!event.affectsConfiguration('codexSubagent')) {
+      return;
+    }
+    try {
+      broker?.settingsChanged();
+    } catch (error) {
+      report(error);
+    }
+    void refresh();
   }));
   const timer = setInterval(() => {
     void refresh();

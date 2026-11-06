@@ -33,17 +33,29 @@ exports.run = async () => {
     assert.equal(connection.handshake, 'passed'); assert.equal(connection.host.ready, true);
     const { WorkerPanel } = require(path.join(process.env.CODEX_TEST_REPOSITORY, '.test-build', 'panel.js'));
     const panel = new WorkerPanel('Render test', async () => {}, () => {});
-    const rendered = new Promise(resolve => {
-      const disposable = panel.panel.webview.onDidReceiveMessage(message => { if (message.action === 'rendered') { disposable.dispose(); resolve(message); } });
-    });
     const now = new Date().toISOString();
-    panel.update({ id: 'example', title: '<script>literal title</script>', model: { id: 'fake', name: 'Fake' }, state: 'completed', permission: 'read-only', revision: 1, createdAt: now, updatedAt: now, turns: [{ id: 'turn', input: 'Task', output: 'Result', state: 'completed', tools: [] }], messages: [] }, []);
-    let timeout;
+    const completedWorker = { id: 'example', title: '<script>literal title</script>', model: { id: 'fake', name: 'Fake' }, state: 'completed', permission: 'read-only', revision: 1, createdAt: now, updatedAt: now, turns: [{ id: 'turn', input: 'Task', output: 'Result', state: 'completed', tools: [] }], messages: [] };
+    // Register the listener before updating so a fast first render cannot be missed.
+    const nextRender = update => {
+      const rendered = new Promise(resolve => {
+        const disposable = panel.panel.webview.onDidReceiveMessage(message => { if (message.action === 'rendered') { disposable.dispose(); resolve(message); } });
+      });
+      update();
+      let timeout;
+      const guard = new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('Worker webview did not render')), 20_000); });
+      return Promise.race([rendered, guard]).finally(() => clearTimeout(timeout));
+    };
     try {
-      const renderedState = await Promise.race([rendered, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('Worker webview did not render')), 20_000); })]);
+      const renderedState = await nextRender(() => panel.update(completedWorker, []));
       assert.equal(renderedState.title, '<script>literal title</script>');
-      assert.equal(renderedState.resumeEnabled, false, 'Completed workers must not offer Resume');
-    } finally { clearTimeout(timeout); panel.dispose(); }
+      // No eligible models are supplied here, so model recovery stays disabled.
+      assert.equal(renderedState.resumeEnabled, false, 'No eligible models must disable model recovery');
+      // Same completed worker, now with eligible models and a newer revision, must
+      // offer the model switch / optional follow-up recovery path.
+      const switchable = await nextRender(() => panel.update({ ...completedWorker, revision: 2 }, [{ id: 'fake', name: 'Fake' }, { id: 'fake/other', name: 'Fake Other' }]));
+      assert.equal(switchable.title, '<script>literal title</script>');
+      assert.equal(switchable.resumeEnabled, true, 'Completed workers must offer model switching or a follow-up when an eligible model exists');
+    } finally { panel.dispose(); }
     {
       // Command approval layout inspection in a real webview. The command is
       // never executed; the request is always aborted and the service disposed.

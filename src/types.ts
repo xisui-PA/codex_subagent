@@ -40,14 +40,20 @@ export interface Session {
 export interface FileChange { id: string; path: string; target?: string; kind: 'write' | 'delete' | 'rename'; state: 'pending' | 'applied' | 'reverted'; createdAt: string }
 export interface ChangeContent extends FileChange { before: string | null; after: string | null }
 export type SessionHeader = Pick<Session, 'id' | 'title' | 'model' | 'permission' | 'state' | 'revision' | 'createdAt' | 'updatedAt' | 'ownerId' | 'ownerLabel' | 'workspaceRoot' | 'activity' | 'parentPolicy' | 'parentExpiresAt'> & { lastTurnId?: string; lastAttempt?: number };
+export interface ModelPolicy {
+  allowWrite?: boolean; allowShell?: boolean; numSessions?: number; maxToolRounds?: number;
+  turnTimeoutSeconds?: number; autoCompact?: boolean;
+}
 export interface Settings {
   maxConcurrent: number; maxTurns: number; maxToolRounds: number; turnTimeoutMs: number;
   maxOutputChars: number; maxHistoryBytes: number; maxSessions: number; retries: number;
-  autoCompact?: boolean;
+  autoCompact?: boolean; models?: Record<string, ModelPolicy>;
 }
 export interface WorkspaceTools {
   definitions(permission: Session['permission']): Tool[];
-  execute(name: string, input: Record<string, unknown>, permission: Session['permission'], signal: AbortSignal, session?: Session): Promise<string>;
+  // authorize is re-evaluated immediately before a side effect so a policy
+  // change during a tool call cannot be bypassed by stale definitions.
+  execute(name: string, input: Record<string, unknown>, permission: Session['permission'], signal: AbortSignal, session?: Session, authorize?: () => void): Promise<string>;
   forSession?(session: Session): WorkspaceTools;
   workspaceRoot?: string;
 }

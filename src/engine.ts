@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { digest, Mutex, SessionStore } from './storage';
 import { abortable } from './async';
-import { failure, Message, Model, Part, Provider, Session, Settings, Turn, WorkerError, WorkspaceTools } from './types';
+import { effectiveSettings } from './model-settings';
+import { failure, Message, Model, ModelPolicy, Part, Provider, Session, Settings, Turn, WorkerError, WorkspaceTools } from './types';
 
 export interface SpawnInput {
   requestId: string; task: string; model?: string; title?: string; instructions?: string;
@@ -19,6 +20,10 @@ export class WorkerEngine {
   private readonly mutex = new Mutex();
   private readonly active = new Map<string, { controller: AbortController; promise: Promise<void>; maintenance?: 'compact' | 'edit' }>();
   private stopped = false;
+  // Schedule can run inside detached job promises; a malformed pool saved by
+  // the user throws from the strict settings callback and must be reported,
+  // not rejected. Reported once until the settings are fixed again.
+  private configError = false;
   private readonly lifecycle = new AbortController();
   readonly runtimeErrors = new Map<string, ReturnType<typeof failure>>();
   onChange: () => void = () => undefined;
@@ -47,8 +52,43 @@ export class WorkerEngine {
   list(): import('./types').SessionHeader[] {
     return this.store.list().map(s => this.runtimeErrors.has(s.id) ? { ...s, state: 'failed', activity: 'Checkpoint failed' } : s);
   }
-  private async select(selector?: string): Promise<Model> {
+  private async allocate(permission: Session['permission']): Promise<Model> {
+    const pool = this.pool();
     const models = await abortable(this.models(), AbortSignal.any([this.lifecycle.signal, AbortSignal.timeout(15_000)]));
+    const candidates: { model: Model; policy: ModelPolicy; reserved: number }[] = [];
+    for (const [id, policy] of pool) {
+      if (permission === 'workspace-write' && policy.allowWrite === false) {
+        continue;
+      }
+      const found = models.filter(m => m.id === id);
+      if (found.length !== 1) {
+        continue;
+      }
+      candidates.push({ model: found[0], policy, reserved: this.reservedFor(found[0].id) });
+    }
+    if (!candidates.length) {
+      throw new WorkerError('model_unavailable', 'No configured codexSubagent.models entry is enabled. Run subagent_models and configure exact enabled model IDs.');
+    }
+    const free = candidates.find(c => c.reserved < this.capacityOf(c.policy));
+    return (free || candidates[0]!).model;
+  }
+  private async select(selector: string | undefined, explicit: boolean, permission: Session['permission']): Promise<Model> {
+    const models = await abortable(this.models(), AbortSignal.any([this.lifecycle.signal, AbortSignal.timeout(15_000)]));
+    const pool = this.pool();
+    if (explicit && pool.length) {
+      const entry = pool.find(([id]) => id === selector);
+      if (!entry) {
+        throw new WorkerError('model_unavailable', `Model '${selector || ''}' is not configured in codexSubagent.models. Use an exact configured model ID from subagent_models.`);
+      }
+      if (permission === 'workspace-write' && entry[1].allowWrite === false) {
+        throw new WorkerError('permission_denied', `Model '${selector}' does not allow workspace-write. Choose a configured model with allowWrite enabled.`);
+      }
+      const exact = models.filter(m => m.id === selector);
+      if (exact.length !== 1) {
+        throw new WorkerError('model_unavailable', `Model '${selector}' is unavailable or ambiguous. Run subagent_models and use an exact model ID.`);
+      }
+      return exact[0];
+    }
     const key = selector || this.defaultModel();
     const exact = models.filter(m => m.id === key);
     const matches = exact.length ? exact : models.filter(m => m.name === key || `${m.vendor}/${m.name}` === key);
@@ -58,6 +98,111 @@ export class WorkerEngine {
         : 'Select a default model using Codex Subagent: Enable Model, or supply an exact ID from subagent_models.');
     }
     return matches[0];
+  }
+  private pool(): [string, ModelPolicy][] {
+    return Object.entries(this.settings().models || {});
+  }
+  private poolActive(): boolean {
+    return this.pool().length > 0;
+  }
+  private capacityOf(policy: ModelPolicy): number {
+    return Math.max(1, policy.numSessions || 1);
+  }
+  // Queued/running sessions plus still-draining jobs and compaction/edit
+  // maintenance all hold a slot until their promise settles.
+  // Count durable session headers plus draining jobs by header data only;
+  // store.get would clone the full transcript for every queued session.
+  private reservedFor(modelId: string, excludeId?: string): number {
+    const reserved = new Set<string>();
+    for (const header of this.store.list()) {
+      if (header.id !== excludeId && header.model.id === modelId && (['queued', 'running'].includes(header.state) || this.active.has(header.id))) {
+        reserved.add(header.id);
+      }
+    }
+    return reserved.size;
+  }
+  private activeFor(modelId: string, excludeId?: string): number {
+    let count = 0;
+    for (const header of this.store.list()) {
+      if (header.id !== excludeId && header.model.id === modelId && this.active.has(header.id)) {
+        count++;
+      }
+    }
+    return count;
+  }
+  private slotAvailable(session: Pick<Session, 'model'> & { id?: string }): boolean {
+    const pool = this.pool();
+    if (!pool.length) {
+      return this.active.size < this.settings().maxConcurrent;
+    }
+    const entry = pool.find(([id]) => id === session.model.id);
+    // A queued session must never count its own still-draining job against itself.
+    return !entry || this.activeFor(session.model.id, session.id) < this.capacityOf(entry[1]);
+  }
+  private settingsFor(modelId: string): Settings {
+    return effectiveSettings(this.settings(), modelId);
+  }
+  // Session-scoped tools with pool policy applied to the exposed definitions.
+  // execute rechecks the pool policy on EVERY call so a policy removed
+  // mid-session rejects restricted tools before any side effect. The same
+  // check is exposed as the optional sixth authorize callback, which tools
+  // invoke immediately before mutating so a revocation during a tool call is
+  // still enforced even if the model's call was emitted earlier.
+  private toolsFor(session: Session): WorkspaceTools {
+    const scoped = this.tools.forSession?.(session) || this.tools;
+    return {
+      get workspaceRoot() {
+        return scoped.workspaceRoot;
+      },
+      definitions: permission => scoped.definitions(permission).filter(tool => {
+        const policy = this.settings().models?.[session.model.id];
+        if (policy?.allowWrite === false && ['write_file', 'patch_file', 'create_directory', 'delete_file', 'rename_file', 'run_command'].includes(tool.name)) {
+          return false;
+        }
+        if (policy?.allowShell === false && tool.name === 'run_command') {
+          return false;
+        }
+        return true;
+      }),
+      execute: (name, input, permission, signal, s, authorize) => {
+        const target = s || session;
+        // Re-resolve the live policy on every invocation; never trust the
+        // definitions or the session snapshot captured when the turn started.
+        const check = (): void => {
+          authorize?.();
+          this.assertPoolPolicy(target);
+          const policy = this.settings().models?.[target.model.id];
+          if (policy?.allowWrite === false && ['write_file', 'patch_file', 'create_directory', 'delete_file', 'rename_file', 'run_command'].includes(name)) {
+            throw new WorkerError('permission_denied', `Model '${target.model.id}' no longer allows workspace writes. Resume with a model that allows writes, or cancel the worker.`);
+          }
+          if (policy?.allowShell === false && name === 'run_command') {
+            throw new WorkerError('permission_denied', `Model '${target.model.id}' does not allow shell commands. Resume with a model that allows shell, or cancel the worker.`);
+          }
+        };
+        check();
+        return scoped.execute(name, input, permission, signal, s, check);
+      }
+    };
+  }
+  private assertPoolMembership(session: Session, guidance = 'Resume with an exact enabled model ID from subagent_models.'): void {
+    const models = this.settings().models;
+    if (!models || !Object.keys(models).length) {
+      return;
+    }
+    if (!models[session.model.id]) {
+      throw new WorkerError('model_unavailable', `Model '${session.model.id}' is no longer configured in codexSubagent.models. ${guidance}`);
+    }
+  }
+  private assertPoolPolicy(session: Session): void {
+    this.assertPoolMembership(session);
+    const models = this.settings().models;
+    if (!models || !Object.keys(models).length) {
+      return;
+    }
+    const policy = models[session.model.id]!;
+    if (session.permission === 'workspace-write' && policy.allowWrite === false) {
+      throw new WorkerError('permission_denied', `Model '${session.model.id}' no longer allows workspace-write. Resume with a model that allows writes, or cancel the worker.`);
+    }
   }
   private operationKey(requestId: string, ownerId?: string): string {
     return digest(ownerId ? [ownerId, requestId] : requestId);
@@ -89,7 +234,11 @@ export class WorkerEngine {
       if (this.store.list().length >= this.settings().maxSessions) {
         throw new WorkerError('session_limit', 'Delete finished workers before creating more.');
       }
-      const model = await this.select(input.model);
+      const model = input.model
+        ? await this.select(input.model, true, input.permission)
+        : this.poolActive()
+          ? await this.allocate(input.permission)
+          : await this.select(undefined, false, input.permission);
       const available = this.tools.definitions(input.permission);
       if (input.permission === 'workspace-write' && !available.some(t => t.name === 'write_file')) {
         throw new WorkerError('permission_denied', 'Workspace writes are disabled. Enable Codex Subagent: Allow Writes in User Settings, or request read-only permission.');
@@ -121,13 +270,15 @@ export class WorkerEngine {
         throw new WorkerError('host_stopping', 'Extension is shutting down.', true);
       }
       const session = this.session(id);
+      this.assertPoolPolicy(session);
       if (this.active.get(id)?.maintenance) {
         throw new WorkerError('worker_busy', 'Worker maintenance is in progress. Wait or cancel it before sending a follow-up.');
       }
       if (['failed', 'interrupted', 'cancelled'].includes(session.state)) {
         throw new WorkerError('resume_required', 'Call subagent_resume before sending more messages.');
       }
-      if ((this.settings().autoCompact ? session.turns.filter(t => t.state !== 'completed').length : session.turns.length) >= this.settings().maxTurns) {
+      const sendSettings = this.settingsFor(session.model.id);
+      if ((sendSettings.autoCompact ? session.turns.filter(t => t.state !== 'completed').length : session.turns.length) >= sendSettings.maxTurns) {
         throw new WorkerError('turn_limit', 'Worker turn limit reached. Start a new worker with a summary.');
       }
       const turn = this.newTurn(message);
@@ -156,10 +307,20 @@ export class WorkerEngine {
         throw new WorkerError('host_stopping', 'Extension is shutting down.', true);
       }
       const session = this.session(id);
-      if (this.active.has(id) || !['failed', 'interrupted', 'cancelled'].includes(session.state)) {
-        throw new WorkerError('not_resumable', 'Only stopped, failed, or interrupted workers can be resumed.');
+      if (this.active.has(id)) {
+        throw new WorkerError('not_resumable', 'Worker is still busy. Cancel it and wait for its tools to settle before resuming.');
       }
-      const selected = await this.select(model || session.model.id);
+      // A completed worker has no unfinished turn to repair. Pool policy
+      // changes can still block it, so an explicit enabled model recovers it:
+      // without a message only the model migrates (no inference, no replay);
+      // with a message exactly one fresh follow-up turn is queued.
+      if (session.state === 'completed') {
+        return this.resumeCompleted(session, requestId, fingerprint, model, message);
+      }
+      if (!['failed', 'interrupted', 'cancelled'].includes(session.state)) {
+        throw new WorkerError('not_resumable', 'Only stopped, failed, or interrupted workers can be resumed. Completed workers are recovered by resuming with an explicit enabled model.');
+      }
+      const selected = await this.select(model || session.model.id, true, session.permission);
       await this.store.change(id, s => {
         this.repairPendingTools(s);
         const turn = s.turns.find(t => t.state !== 'completed');
@@ -190,6 +351,49 @@ export class WorkerEngine {
       this.schedule();
       return this.store.get(id);
     });
+  }
+  private async resumeCompleted(session: Session, requestId: string, fingerprint: string, model?: string, message?: string): Promise<Session> {
+    const id = session.id;
+    if (!model) {
+      throw new WorkerError('not_resumable', 'Worker is completed, not stopped. Resume it with an explicit enabled model to recover it after a model policy change; without a message only the model migrates and the worker stays completed.');
+    }
+    const selected = await this.select(model, true, session.permission);
+    if (!message) {
+      // Migration only: completed turns and history are untouched, nothing is
+      // replayed, and no inference is scheduled. The last completed turn
+      // anchors the operation record because Session.operations requires one.
+      const migrated = await this.store.change(id, s => {
+        const last = s.turns.at(-1);
+        if (!last) {
+          throw new WorkerError('not_resumable', 'Worker has no completed turn to attach the model migration to.');
+        }
+        s.model = selected;
+        s.operations[this.operationKey(requestId, s.ownerId)] = { fingerprint, turnId: last.id };
+      });
+      this.runtimeErrors.delete(id);
+      this.onChange();
+      return migrated;
+    }
+    // Same guard as send: the follow-up is a normal turn on the target model.
+    const target = this.settingsFor(selected.id);
+    const used = target.autoCompact ? session.turns.filter(t => t.state !== 'completed').length : session.turns.length;
+    if (used >= target.maxTurns) {
+      throw new WorkerError('turn_limit', 'Worker turn limit reached. Start a new worker with a summary.');
+    }
+    const turn = this.newTurn(message);
+    const queued = await this.store.change(id, s => {
+      this.repairPendingTools(s);
+      s.turns.push(turn);
+      s.model = selected;
+      s.state = 'queued';
+      if (s.parentPolicy === 'cancel-on-expiry') {
+        s.parentExpiresAt = Date.now() + (s.parentLeaseSeconds || 120) * 1000;
+      }
+      s.operations[this.operationKey(requestId, s.ownerId)] = { fingerprint, turnId: turn.id };
+    });
+    this.runtimeErrors.delete(id);
+    this.schedule();
+    return queued;
   }
   async cancel(id: string): Promise<Session> {
     return this.mutex.run(async () => {
@@ -249,11 +453,19 @@ export class WorkerEngine {
       if (this.active.has(id) || s.state === 'queued') {
         throw new WorkerError('worker_busy', 'Cancel or wait for the worker before compacting.');
       }
+      // Automatic compaction calls the provider, so the model must still be
+      // configured. Check membership only (a revoked allowWrite does not matter
+      // for a summarizer that never receives tools) and do it before the
+      // pending-tool repair, state change, or provider request. A supplied
+      // manual summary needs no provider and stays available for recovery.
+      if (summary === undefined) {
+        this.assertPoolMembership(s, 'Supply a manual summary to compact without a model, or resume with an exact enabled model ID from subagent_models.');
+      }
       await this.store.change(id, draft => this.repairPendingTools(draft));
       if (summary !== undefined) {
         const result = await this.store.archive(id, summary); this.onChange(); return result;
       }
-      if (this.active.size >= this.settings().maxConcurrent) {
+      if (!this.slotAvailable(s)) {
         throw new WorkerError('worker_busy', 'All worker slots are busy. Wait for a slot before automatic compaction.');
       }
       await this.store.change(id, draft => {
@@ -264,8 +476,13 @@ export class WorkerEngine {
       const controller = new AbortController();
       const signal = AbortSignal.any([controller.signal, this.lifecycle.signal]);
       const promise = Promise.resolve().then(async () => {
-        const timer = setTimeout(() => controller.abort(new WorkerError('timeout', 'Compaction timed out; history was retained.', true)), this.settings().turnTimeoutMs);
+        // The strict settings callback can throw (a malformed model pool saved
+        // after the durable state='running' commit). Resolve the deadline
+        // inside the try so that failure restores the pre-compaction state
+        // instead of stranding a completed worker as running.
+        let timer: ReturnType<typeof setTimeout> | undefined;
         try {
+          timer = setTimeout(() => controller.abort(new WorkerError('timeout', 'Compaction timed out; history was retained.', true)), this.settingsFor(s.model.id).turnTimeoutMs);
           const generated = await this.summarize(this.store.get(id), signal);
           signal.throwIfAborted();
           await this.store.archive(id, generated);
@@ -285,7 +502,9 @@ export class WorkerEngine {
             draft.activity = 'Compaction stopped; history retained'; draft.maintenanceError = problem;
           });
         } finally {
-          clearTimeout(timer);
+          if (timer !== undefined) {
+            clearTimeout(timer);
+          }
         }
       }).catch(error => {
         this.runtimeErrors.set(id, { code: 'checkpoint_failed', message: failure(error).message, retryable: true }); this.onError(id, error);
@@ -446,32 +665,52 @@ export class WorkerEngine {
       }
     }
   }
+  // Re-evaluate queued work after the model pool/capacity settings change.
+  // Strict settings are still validated by schedule(), which reports a
+  // malformed pool through onError instead of rejecting this UI-facing call.
+  reschedule(): void {
+    this.schedule();
+  }
   private schedule(): void {
     if (this.stopped) {
       return;
     }
-    for (const s of this.store.list()) {
-      if (this.active.size >= this.settings().maxConcurrent) {
-        break;
+    try {
+      const pool = this.pool();
+      for (const s of this.store.list()) {
+        if (!pool.length && this.active.size >= this.settings().maxConcurrent) {
+          break;
+        }
+        if (s.state !== 'queued' || this.active.has(s.id) || this.runtimeErrors.has(s.id)) {
+          continue;
+        }
+        if (!this.slotAvailable(s)) {
+          continue;
+        }
+        // Cancellation/discard may have suspended every turn while an earlier job
+        // is finishing. A stale queued session must never schedule empty jobs.
+        if (!this.store.get(s.id).turns.some(t => t.state === 'queued')) {
+          continue;
+        }
+        const controller = new AbortController();
+        const promise = Promise.resolve().then(() => this.run(s.id, controller)).catch(error => {
+          this.runtimeErrors.set(s.id, { code: 'checkpoint_failed', message: `Worker stopped because its checkpoint could not be committed: ${failure(error).message}. Fix storage access, then explicitly resume.`, retryable: true });
+          this.onError(s.id, error);
+        }).finally(() => {
+          this.active.delete(s.id); this.onChange(); this.schedule();
+        });
+        this.active.set(s.id, { controller, promise });
       }
-      if (s.state !== 'queued' || this.active.has(s.id) || this.runtimeErrors.has(s.id)) {
-        continue;
+      this.onChange();
+      this.configError = false;
+    } catch (error) {
+      // Malformed model settings throw from the strict settings callback.
+      // Report once per invalid period and stop scheduling until corrected.
+      if (!this.configError) {
+        this.configError = true;
+        this.onError('settings', error);
       }
-      // Cancellation/discard may have suspended every turn while an earlier job
-      // is finishing. A stale queued session must never schedule empty jobs.
-      if (!this.store.get(s.id).turns.some(t => t.state === 'queued')) {
-        continue;
-      }
-      const controller = new AbortController();
-      const promise = Promise.resolve().then(() => this.run(s.id, controller)).catch(error => {
-        this.runtimeErrors.set(s.id, { code: 'checkpoint_failed', message: `Worker stopped because its checkpoint could not be committed: ${failure(error).message}. Fix storage access, then explicitly resume.`, retryable: true });
-        this.onError(s.id, error);
-      }).finally(() => {
-        this.active.delete(s.id); this.onChange(); this.schedule();
-      });
-      this.active.set(s.id, { controller, promise });
     }
-    this.onChange();
   }
   private async run(id: string, controller: AbortController): Promise<void> {
     while (!controller.signal.aborted) {
@@ -480,9 +719,11 @@ export class WorkerEngine {
       if (!turn) {
         return;
       }
-      const timeout = setTimeout(() => controller.abort(new WorkerError('timeout', 'Turn deadline reached; resume to continue.', true)), this.settings().turnTimeoutMs);
+      let timeout: ReturnType<typeof setTimeout> | undefined;
       try {
         controller.signal.throwIfAborted();
+        this.assertPoolPolicy(session);
+        timeout = setTimeout(() => controller.abort(new WorkerError('timeout', 'Turn deadline reached; resume to continue.', true)), this.settingsFor(session.model.id).turnTimeoutMs);
         const started = await this.store.change(id, s => {
           const t = s.turns.find(t => t.id === turn.id)!;
           if (t.state !== 'queued') {
@@ -527,7 +768,7 @@ export class WorkerEngine {
       messages.push({ role: 'user', parts: [{ type: 'text', text: `Coordinator-provided summary of earlier history:\n${session.summary.text}` }] });
     }
     messages.push(...session.messages.slice(session.summary?.through || 0));
-    const tools = (this.tools.forSession?.(session) || this.tools).definitions(session.permission);
+    const tools = this.toolsFor(session).definitions(session.permission);
     const toolTokens = await abortable(this.provider.countTokens(session.model, { role: 'user', parts: [{ type: 'text', text: JSON.stringify(tools) }] }), signal);
     let count = toolTokens;
     for (const message of messages) {
@@ -590,24 +831,30 @@ export class WorkerEngine {
     return summary;
   }
   private async perform(id: string, turnId: string, signal: AbortSignal): Promise<void> {
-    for (let round = 0; round < this.settings().maxToolRounds; round++) {
+    for (let round = 0; round < this.settingsFor(this.store.get(id).model.id).maxToolRounds; round++) {
       signal.throwIfAborted();
       let session = this.store.get(id);
+      const performSettings = this.settingsFor(session.model.id);
       let messages: Message[];
       try {
-        if (JSON.stringify(session).length > this.settings().maxHistoryBytes || session.turns.length > this.settings().maxTurns) {
+        if (JSON.stringify(session).length > this.settings().maxHistoryBytes || session.turns.length > performSettings.maxTurns) {
           throw new WorkerError('history_limit', 'History storage limit reached. Compact the worker to continue.', true);
         }
         messages = await this.prompt(session, signal);
       } catch (error) {
-        if (!this.settings().autoCompact || !['context_limit', 'history_limit'].includes(failure(error).code)) {
+        if (!performSettings.autoCompact || !['context_limit', 'history_limit'].includes(failure(error).code)) {
           throw error;
         }
+        // The same membership rule applies to in-turn automatic compaction:
+        // refuse before any state change or summarizer provider request, and
+        // let the turn fail with model_unavailable rather than call a model
+        // that is no longer configured.
+        this.assertPoolMembership(session, 'Resume with an exact enabled model ID from subagent_models.');
         const summary = await this.summarize(session, signal);
         session = await this.store.archive(id, summary);
         messages = await this.prompt(session, signal);
       }
-      const tools = this.tools.forSession?.(session) || this.tools;
+      const tools = this.toolsFor(session);
       await this.store.change(id, s => {
         s.activity = 'Generating response';
       }); this.onChange();

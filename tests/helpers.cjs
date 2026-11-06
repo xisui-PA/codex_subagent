@@ -27,7 +27,7 @@ async function fixture(t, options = {}) {
     ...options.provider,
   };
   const tools = options.tools || { definitions: () => [], execute: async () => 'ok' };
-  const engine = new WorkerEngine(store, provider, tools, () => ({ ...defaults, autoCompact: false, retries: 0, ...options.settings }), () => model.id);
+  const engine = new WorkerEngine(store, provider, tools, options.settingsFn || (() => ({ ...defaults, autoCompact: false, retries: 0, ...options.settings })), () => model.id);
   t.after(async () => { await engine.shutdown(); await store.close(); await fs.rm(root, { recursive: true, force: true }); });
   return { root, store, engine, provider, requests };
 }

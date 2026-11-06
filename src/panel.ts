@@ -13,7 +13,7 @@ export class WorkerPanel {
   readonly whenReady = new Promise<void>(resolve => {
     this.resolveReady = resolve;
   });
-  private pending?: { session: Session; models: { id: string; name: string }[] };
+  private pending?: { session: Session; models: { id: string; name: string }[]; hint?: string };
   private lastSignature = '';
   constructor(title: string, private readonly action: (message: PanelMessage) => Promise<void>, onClose: () => void, private readonly composer = new WorkerComposer({ load: () => undefined, save: async () => undefined })) {
     this.panel = vscode.window.createWebviewPanel('codexSubagent.worker', title, vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [] });
@@ -24,7 +24,7 @@ export class WorkerPanel {
       if (value && typeof value === 'object' && 'action' in value && value.action === 'ready') {
         this.ready = true; this.resolveReady();
         if (this.pending) {
-          this.update(this.pending.session, this.pending.models); this.pending = undefined;
+          this.update(this.pending.session, this.pending.models, this.pending.hint); this.pending = undefined;
         }
         this.composerState();
         return;
@@ -55,19 +55,19 @@ export class WorkerPanel {
       void this.panel.webview.postMessage({ type: 'composer', composer: this.composer.state() });
     }
   }
-  update(session: Session, models: { id: string; name: string }[]): void {
+  update(session: Session, models: { id: string; name: string }[], hint?: string): void {
     if (this.disposed) {
       return;
     }
     if (!this.ready) {
-      this.pending = { session, models }; return;
+      this.pending = { session, models, hint }; return;
     }
-    const signature = `${session.id}:${session.revision}:${session.state}:${session.activity}:${JSON.stringify(models)}`;
+    const signature = `${session.id}:${session.revision}:${session.state}:${session.activity}:${JSON.stringify(models)}:${hint || ''}`;
     if (signature === this.lastSignature) {
       return;
     }
     this.lastSignature = signature;
-    this.panel.title = session.title; void this.panel.webview.postMessage({ type: 'state', session, models });
+    this.panel.title = session.title; void this.panel.webview.postMessage({ type: 'state', session, models, hint: hint || '' });
   }
   history(messages: Message[], offset: number): void {
     if (!this.disposed) {
@@ -88,25 +88,25 @@ export class WorkerPanel {
 }
 function html(nonce: string, source: string): string {
   return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${source} 'nonce-${nonce}'; script-src 'nonce-${nonce}';"><meta name="viewport" content="width=device-width, initial-scale=1"><style nonce="${nonce}">
-body{font:var(--vscode-font-size) var(--vscode-font-family);color:var(--vscode-foreground);padding:20px;max-width:1000px;margin:auto}h1{font-size:22px}#meta,#activity{color:var(--vscode-descriptionForeground);margin:8px 0}button,select,textarea{font:inherit}button{background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:0;padding:7px 12px;margin:4px;cursor:pointer}button:disabled{opacity:.45;cursor:default}textarea,select{background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);padding:8px}textarea{width:95%;min-height:80px}pre{white-space:pre-wrap;word-break:break-word;font:inherit;line-height:1.5}article{border-bottom:1px solid var(--vscode-panel-border);padding:12px 0}.role{font-weight:600;color:var(--vscode-descriptionForeground)}#error{color:var(--vscode-errorForeground);white-space:pre-wrap}.change{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.change span{flex:1}details{margin:12px 0}#tools{padding:12px;background:var(--vscode-textCodeBlock-background)}</style></head><body>
+body{font:var(--vscode-font-size) var(--vscode-font-family);color:var(--vscode-foreground);padding:20px;max-width:1000px;margin:auto}h1{font-size:22px}#meta,#activity{color:var(--vscode-descriptionForeground);margin:8px 0}button,select,textarea{font:inherit}button{background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:0;padding:7px 12px;margin:4px;cursor:pointer}button:disabled{opacity:.45;cursor:default}textarea,select{background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);padding:8px}textarea{width:95%;min-height:80px}pre{white-space:pre-wrap;word-break:break-word;font:inherit;line-height:1.5}article{border-bottom:1px solid var(--vscode-panel-border);padding:12px 0}.role{font-weight:600;color:var(--vscode-descriptionForeground)}#error{color:var(--vscode-errorForeground);white-space:pre-wrap}#modelGuidance{color:var(--vscode-descriptionForeground);margin-left:6px}.change{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.change span{flex:1}details{margin:12px 0}#tools{padding:12px;background:var(--vscode-textCodeBlock-background)}</style></head><body>
 <h1 id="title">Worker</h1><div id="meta"></div><div id="activity" role="status" aria-live="polite">Connecting…</div><div id="error" role="alert"></div>
-<div><button id="cancel">Cancel</button><button id="resume">Resume</button><select id="model" aria-label="Model for resumption"></select><button id="compact">Compact history</button><button id="discard">Discard queued messages</button><button id="history">Earlier history</button><button id="export">Export transcript</button></div>
+<div><button id="cancel">Cancel</button><button id="resume">Resume</button><select id="model" aria-label="Model for resumption"></select><span id="modelGuidance" role="note"></span><button id="compact">Compact history</button><button id="discard">Discard queued messages</button><button id="history">Earlier history</button><button id="export">Export transcript</button></div>
 <details open><summary>Changed files</summary><div id="changes"></div></details><details><summary>Recent tool activity</summary><div id="tools"></div></details>
-<details id="past"><summary>Archived conversation</summary><div id="historyContent"></div></details><div id="conversation"></div><label for="message">Follow-up or recovery instructions</label><textarea id="message" maxlength="200000" disabled placeholder="Queue a follow-up, or describe how the worker should resume…"></textarea><button id="send" disabled>Send follow-up</button><div id="composerError" role="alert"></div><div id="pendingRequest" hidden><p id="pendingText"></p><button id="retry">Retry pending request</button><button id="clearPending">Clear retry record</button><p>Clearing the retry record keeps your draft. It does not cancel work that was already accepted.</p></div>
+<details id="past"><summary>Archived conversation</summary><div id="historyContent"></div></details><div id="conversation"></div><label for="message">Follow-up, recovery instructions, or model switch</label><textarea id="message" maxlength="200000" disabled placeholder="Queue a follow-up, describe how the worker should resume, or leave empty to switch a completed worker’s model…"></textarea><button id="send" disabled>Send follow-up</button><div id="composerError" role="alert"></div><div id="pendingRequest" hidden><p id="pendingText"></p><button id="retry">Retry pending request</button><button id="clearPending">Clear retry record</button><p>Clearing the retry record keeps your draft. It does not cancel work that was already accepted.</p></div>
 <script nonce="${nonce}">
-const vscode=acquireVsCodeApi();let state;const el=id=>document.getElementById(id);const post=(action,extra={})=>vscode.postMessage({action,...extra});let lastModel='';let historyOffset=0;let historyLoading=false;
+const vscode=acquireVsCodeApi();let state;const el=id=>document.getElementById(id);const post=(action,extra={})=>vscode.postMessage({action,...extra});let lastModel='';let modelIds=[];let historyOffset=0;let historyLoading=false;
 let composer={draft:'',busy:false};let composerReady=false;const remembered=vscode.getState();if(remembered&&typeof remembered.draft==='string')el('message').value=remembered.draft;
-function composerControls(){const pending=!!composer.pending;el('message').disabled=!composerReady||composer.busy;el('send').disabled=!composerReady||composer.busy||pending||!state||!['running','queued','completed'].includes(state.state)||!!state.maintenance||state.activity==='Summarizing history'||!el('message').value.trim();el('resume').disabled=!composerReady||composer.busy||pending||!state||!['failed','interrupted','cancelled'].includes(state.state)||!state.turns.some(t=>t.state!=='completed');el('model').disabled=composer.busy||pending;el('pendingRequest').hidden=!pending;el('retry').disabled=composer.busy;el('clearPending').disabled=composer.busy;el('pendingText').textContent=pending?'This '+(composer.pending.action==='send'?'follow-up':'resumption')+' has not been acknowledged. Retry submits the original request: '+(composer.pending.message||'Continue without extra instructions').slice(0,300):'';el('composerError').textContent=composer.error||'';}
+function composerControls(){const pending=!!composer.pending;el('message').disabled=!composerReady||composer.busy;el('send').disabled=!composerReady||composer.busy||pending||!state||!['running','queued','completed'].includes(state.state)||!!state.maintenance||state.activity==='Summarizing history'||!el('message').value.trim();const recoverable=!!state&&['failed','interrupted','cancelled'].includes(state.state)&&state.turns.some(t=>t.state!=='completed');const complete=!!state&&state.state==='completed'&&state.turns.length>0;const offer=!!state&&(recoverable||complete)&&modelIds.length>0;el('resume').disabled=!composerReady||composer.busy||pending||!offer;el('resume').textContent=complete?'Switch model / follow up':'Resume';el('resume').title=complete?'Change the model of this completed worker. Leave the message empty to switch only; any message becomes one new turn with the earlier turns preserved.':'Continue interrupted or failed work from the saved conversation.';el('model').disabled=composer.busy||pending||!modelIds.length;el('pendingRequest').hidden=!pending;el('retry').disabled=composer.busy;el('clearPending').disabled=composer.busy;el('pendingText').textContent=pending?'This '+(composer.pending.action==='send'?'follow-up':'resumption')+' has not been acknowledged. Retry submits the original request: '+(composer.pending.message||'Continue without extra instructions').slice(0,300):'';el('composerError').textContent=composer.error||'';}
 function submit(action,extra={}){post('draft',{message:el('message').value});composer.busy=true;composerControls();post(action,extra);}
 el('message').oninput=()=>{vscode.setState({draft:el('message').value});post('draft',{message:el('message').value});composerControls();};
 el('retry').onclick=()=>submit('retry');el('clearPending').onclick=()=>submit('clearPending');
 for(const id of ['cancel','compact','discard','export'])el(id).onclick=()=>post(id);el('history').onclick=()=>{historyLoading=true;el('history').disabled=true;post('history');};
 el('send').onclick=()=>{const message=el('message').value;if(message.trim())submit('send',{message});};
-el('resume').onclick=()=>submit('resume',{message:el('message').value,model:el('model').value||undefined});
+el('resume').onclick=()=>{if(!modelIds.length)return;submit('resume',{message:el('message').value,model:el('model').value||modelIds[0]});};
 function article(role,text){const a=document.createElement('article');const label=document.createElement('div');label.className='role';label.textContent=role;const p=document.createElement('pre');p.textContent=text;a.append(label,p);return a;}
 window.addEventListener('message',event=>{const d=event.data;if(d.type==='composer'){composer=d.composer;composerReady=true;el('message').value=composer.draft;vscode.setState({draft:composer.draft});composerControls();return;}if(d.type==='error'){el('error').textContent=d.message;historyLoading=false;el('history').disabled=!state||(state.messageBase||0)<=historyOffset;return;}if(d.type==='history'){historyLoading=false;historyOffset=d.offset;for(const message of d.messages){el('historyContent').append(article(message.role, message.parts.map(p=>p.type==='text'?p.text:JSON.stringify(p)).join('\\n')));}el('past').open=true;el('history').disabled=!state||(state.messageBase||0)<=historyOffset;return;}if(d.type!=='state')return;state=d.session;el('title').textContent=state.title;el('meta').textContent=[state.state,state.model.name,state.permission,state.ownerLabel||state.ownerId||'Ungrouped',state.workspaceRoot||''].join(' · ');el('activity').textContent=state.state==='running'?(state.activity||'Working…'):'Last updated '+new Date(state.updatedAt).toLocaleTimeString();
-el('history').disabled=historyLoading||(state.messageBase||0)<=historyOffset;const running=['running','queued'].includes(state.state);el('cancel').disabled=!running;composerControls();el('compact').disabled=running;el('discard').disabled=!!state.maintenance||!state.turns.some(t=>!t.started&&t.state!=='completed');
-const currentModel=el('model').value||state.model.id;const signature=JSON.stringify(d.models);if(lastModel!==signature){el('model').replaceChildren();for(const m of d.models){const o=document.createElement('option');o.value=m.id;o.textContent=m.name;el('model').append(o);}el('model').value=currentModel;lastModel=signature;}
+el('history').disabled=historyLoading||(state.messageBase||0)<=historyOffset;const running=['running','queued'].includes(state.state);el('cancel').disabled=!running;el('compact').disabled=running;el('discard').disabled=!!state.maintenance||!state.turns.some(t=>!t.started&&t.state!=='completed');
+const hint=d.hint||'';const signature=JSON.stringify([d.models,hint]);if(lastModel!==signature){const previous=el('model').value;modelIds=d.models.map(m=>m.id);el('model').replaceChildren();for(const m of d.models){const o=document.createElement('option');o.value=m.id;o.textContent=m.name;el('model').append(o);}const fallback=modelIds.includes(previous)?previous:modelIds.includes(state.model.id)?state.model.id:(modelIds[0]||'');el('model').value=fallback;el('modelGuidance').textContent=hint;lastModel=signature;}composerControls();
 const lastError=[...state.turns].reverse().find(t=>t.error);el('error').textContent=state.maintenanceError?state.maintenanceError.message:lastError?lastError.error.message:'';
 const conversation=el('conversation');const nearBottom=window.innerHeight+window.scrollY>=document.body.scrollHeight-100;conversation.replaceChildren();if(state.summary)conversation.append(article('Earlier history summary',state.summary.text));for(const t of state.turns){conversation.append(article('Task · '+t.state,t.input));const out=t.output.trimEnd();if(out)conversation.append(article('Worker',out));}if(nearBottom)window.scrollTo(0,document.body.scrollHeight);
 el('tools').textContent=state.turns.flatMap(t=>t.tools).slice(-20).map(t=>t.call.name+' — '+t.state).join('\\n')||'No tools used yet.';

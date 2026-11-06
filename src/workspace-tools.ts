@@ -125,8 +125,24 @@ export class FileTools implements WorkspaceTools {
     }
     return new TextDecoder('utf-8', { fatal: true }).decode(data);
   }
-  async execute(name: string, input: Record<string, unknown>, permission: Session['permission'], signal: AbortSignal, session?: Session): Promise<string> {
+  // Recheck the global write switch and the caller's latest policy after any
+  // wait. Only the engine supplies the sixth argument; user-driven reverts and
+  // direct callers omit it, so for them just the global switch applies.
+  private confirmWrite(authorize?: () => void): void {
+    if (!this.options.canWrite()) {
+      throw new WorkerError('permission_denied', 'Workspace writes are disabled.');
+    }
+    authorize?.();
+  }
+  private confirmShell(authorize?: () => void): void {
+    if (!this.options.allowShell() || !this.options.approveCommand) {
+      throw new WorkerError('permission_denied', 'Shell commands are disabled.');
+    }
+    authorize?.();
+  }
+  async execute(name: string, input: Record<string, unknown>, permission: Session['permission'], signal: AbortSignal, session?: Session, authorize?: () => void): Promise<string> {
     signal.throwIfAborted();
+    authorize?.();
     if (name === 'read_file') {
       const args = schemas.read_file.parse(input);
       const file = await this.resolve(args.path);
@@ -193,7 +209,11 @@ export class FileTools implements WorkspaceTools {
       const args = schemas.create_directory.parse(input);
       return this.writes.run(async () => {
         signal.throwIfAborted();
+        // This call may have waited behind another write; recheck now.
+        this.confirmWrite(authorize);
         const directory = await this.resolve(args.path, true);
+        // Recheck once more immediately before the mutation.
+        this.confirmWrite(authorize);
         try {
           await fs.mkdir(directory);
         } catch (error) {
@@ -211,6 +231,8 @@ export class FileTools implements WorkspaceTools {
       const args = schemas.write_file.parse(input);
       return this.writes.run(async () => {
         signal.throwIfAborted();
+        // This call may have queued behind another write; recheck now.
+        this.confirmWrite(authorize);
         const file = await this.resolve(args.path, true);
         this.options.checkDocument?.(file);
         const existing = await fs.lstat(file).catch(error => {
@@ -230,7 +252,7 @@ export class FileTools implements WorkspaceTools {
           }
           signal.throwIfAborted();
         }
-        const change = await this.saveChange({ path: file, kind: 'write', before, after: args.content }, args.expectedHash, signal, session);
+        const change = await this.saveChange({ path: file, kind: 'write', before, after: args.content }, args.expectedHash, signal, session, authorize);
         return JSON.stringify({ path: file, hash: hash(change.after!), bytes: Buffer.byteLength(change.after!), changeId: change.id });
       });
     }
@@ -245,7 +267,7 @@ export class FileTools implements WorkspaceTools {
       if (first < 0 || before.indexOf(args.oldText, first + 1) >= 0) {
         throw new WorkerError('patch_conflict', 'oldText must match exactly once. Supply more surrounding context.');
       }
-      return this.execute('write_file', { path: file, expectedHash: args.expectedHash, content: before.slice(0, first) + args.newText + before.slice(first + args.oldText.length) }, permission, signal, session);
+      return this.execute('write_file', { path: file, expectedHash: args.expectedHash, content: before.slice(0, first) + args.newText + before.slice(first + args.oldText.length) }, permission, signal, session, authorize);
     }
     if (name === 'delete_file' || name === 'rename_file') {
       if (permission !== 'workspace-write' || !this.options.canWrite()) {
@@ -253,6 +275,9 @@ export class FileTools implements WorkspaceTools {
       }
       const args = name === 'delete_file' ? schemas.delete_file.parse(input) : schemas.rename_file.parse(input);
       return this.writes.run(async () => {
+        signal.throwIfAborted();
+        // This call may have queued behind another write; recheck now.
+        this.confirmWrite(authorize);
         const file = await this.resolve(args.path, true);
         this.options.checkDocument?.(file);
         const stat = await fs.lstat(file);
@@ -264,7 +289,7 @@ export class FileTools implements WorkspaceTools {
         if (target && await fs.lstat(target).catch(() => undefined)) {
           throw new WorkerError('file_conflict', 'Rename destination already exists.');
         }
-        const change = await this.saveChange({ path: file, target, kind: name === 'rename_file' ? 'rename' : 'delete', before, after: name === 'rename_file' ? before : null }, args.expectedHash, signal, session);
+        const change = await this.saveChange({ path: file, target, kind: name === 'rename_file' ? 'rename' : 'delete', before, after: name === 'rename_file' ? before : null }, args.expectedHash, signal, session, authorize);
         return JSON.stringify({ path: file, target, changeId: change.id, changed: true });
       });
     }
@@ -279,19 +304,26 @@ export class FileTools implements WorkspaceTools {
       }
       const approved = await abortable(this.options.approveCommand(args.command, cwd, signal, this.workspaceRoot), signal);
       signal.throwIfAborted();
-      if (!approved || !this.options.allowShell()) {
+      if (!approved) {
         throw new WorkerError('command_denied', 'User declined the command.');
       }
+      // The dialog can stay open indefinitely. Recheck the global switch and
+      // the caller's latest policy immediately before spawning, so a
+      // revocation made while it was open still blocks the command.
+      this.confirmShell(authorize);
       return this.command(args.command, cwd, args.timeoutMs, signal);
     }
     throw new WorkerError('unknown_tool', `Unknown worker tool: ${name}`);
   }
-  private async saveChange(content: Pick<ChangeContent, 'path' | 'target' | 'kind' | 'before' | 'after'>, expectedHash: string, signal: AbortSignal, session?: Session): Promise<ChangeContent> {
+  private async saveChange(content: Pick<ChangeContent, 'path' | 'target' | 'kind' | 'before' | 'after'>, expectedHash: string, signal: AbortSignal, session?: Session, authorize?: () => void): Promise<ChangeContent> {
     const change: ChangeContent = { ...content, id: randomUUID(), state: 'pending', createdAt: new Date().toISOString() };
     if (session) {
       await this.options.recordChange?.(session, change);
     }
     signal.throwIfAborted();
+    // Recording the change awaits a durable checkpoint. Recheck right before
+    // the actual mutation so a revocation made during that wait blocks it.
+    this.confirmWrite(authorize);
     if (this.options.applyChange) {
       await this.options.applyChange(change, expectedHash);
       if (change.kind === 'write') {
