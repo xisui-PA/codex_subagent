@@ -240,6 +240,42 @@ test('checkpoint failure stops work and can resume after storage is repaired', a
   assert.equal((await finished(engine, worker.id)).state, 'completed');
 });
 
+test('whitespace-only tool rounds do not accumulate blank lines while preserving real formatting', async t => {
+  const { engine } = await fixture(t, {
+    async *stream(_m, _h, _t, _s, n) {
+      if (n === 1) { yield { type: 'text', text: 'Found it\n' }; yield { type: 'call', id: 'c1', name: 'read_file', input: {} }; }
+      else if (n === 2) { yield { type: 'text', text: '\n\n  ' }; yield { type: 'call', id: 'c2', name: 'read_file', input: {} }; }
+      else if (n === 3) { yield { type: 'text', text: '\n\n' }; yield { type: 'call', id: 'c3', name: 'read_file', input: {} }; }
+      else { yield { type: 'text', text: '  line1\nline2\n' }; }
+    },
+    tools: { definitions: () => [], execute: async () => 'ok' },
+  });
+  const worker = await spawn(engine);
+  const done = await finished(engine, worker.id);
+  assert.equal(done.state, 'completed');
+  assert.equal(done.turns[0].output, 'Found it\n  line1\nline2\n');
+  const assistantText = done.messages.filter(m => m.role === 'assistant').flatMap(m => m.parts).filter(p => p.type === 'text').map(p => p.text);
+  assert.deepEqual(assistantText, ['Found it\n', '\n\n  ', '\n\n', '  line1\nline2\n']);
+});
+
+test('streamed whitespace flushes with the first meaningful chunk of a response', async t => {
+  const { engine } = await fixture(t, {
+    async *stream() { yield { type: 'text', text: '  ' }; yield { type: 'text', text: '\n' }; yield { type: 'text', text: 'Answer\n' }; }
+  });
+  const worker = await spawn(engine);
+  const done = await finished(engine, worker.id);
+  assert.equal(done.state, 'completed');
+  assert.equal(done.turns[0].output, '  \nAnswer\n');
+});
+
+test('output limits still bound whitespace-prefixed streams', async t => {
+  const { engine } = await fixture(t, { settings: { maxOutputChars: 5 }, async *stream() { yield { type: 'text', text: '   ' }; yield { type: 'text', text: 'too much output' }; } });
+  const worker = await spawn(engine);
+  const current = await finished(engine, worker.id);
+  assert.equal(current.turns[0].error.code, 'output_limit');
+  assert.equal(current.turns[0].output, '   to');
+});
+
 test('output limits preserve bounded partial output', async t => {
   const { engine } = await fixture(t, { settings: { maxOutputChars: 5 }, async *stream() { yield { type: 'text', text: 'too much output' }; } });
   const worker = await spawn(engine);

@@ -624,6 +624,14 @@ export class WorkerEngine {
       let attempts = 0;
       while (true) {
         try {
+          // Models often emit whitespace-only text around tool calls. Buffer
+          // leading whitespace per response so it flushes together with the
+          // first meaningful chunk (preserving indentation), while whitespace
+          // from a response with no meaningful text is dropped instead of
+          // accumulating blank lines in turn output. Raw parts stay in the
+          // committed history unchanged for replay.
+          let pending = '';
+          let meaningful = false;
           const iterator = this.provider.stream(session.model, messages, tools.definitions(session.permission), signal)[Symbol.asyncIterator]();
           try {
             while (true) {
@@ -641,12 +649,28 @@ export class WorkerEngine {
                 throw new WorkerError('protocol_error', 'Model emitted an unsolicited tool result.');
               }
               if (part.type === 'text') {
-                const remaining = this.settings().maxOutputChars - output.length;
-                if (part.text.length > remaining) {
-                  output += part.text.slice(0, Math.max(0, remaining));
-                  throw new WorkerError('output_limit', 'Turn output limit reached; resume with a narrower task.');
+                let appended = part.text;
+                if (!meaningful) {
+                  // Whitespace preceding the first meaningful chunk is held
+                  // until it can be flushed with content; a response that
+                  // never produces meaningful text contributes no output.
+                  pending += part.text;
+                  if (!pending.trim()) {
+                    appended = '';
+                  } else {
+                    meaningful = true;
+                    appended = pending;
+                    pending = '';
+                  }
                 }
-                output += part.text;
+                if (appended) {
+                  const remaining = this.settings().maxOutputChars - output.length;
+                  if (appended.length > remaining) {
+                    output += appended.slice(0, Math.max(0, remaining));
+                    throw new WorkerError('output_limit', 'Turn output limit reached; resume with a narrower task.');
+                  }
+                  output += appended;
+                }
                 const previous = parts.at(-1);
                 if (previous?.type === 'text') {
                   previous.text += part.text;

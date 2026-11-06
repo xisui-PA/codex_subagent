@@ -15,7 +15,7 @@ Module._load = originalLoad;
 function fixture(action, composer) {
   let hostMessage; let pageMessage; let dispose;
   const nodes = new Map(); const timers = new Set();
-  const element = () => ({ value: '', textContent: '', disabled: false, append() {}, replaceChildren() {} });
+  const element = () => ({ value: '', textContent: '', disabled: false, children: [], append(...children) { this.children.push(...children); }, replaceChildren(...children) { this.children = [...children]; } });
   const node = id => { if (!nodes.has(id)) { nodes.set(id, element()); } return nodes.get(id); };
   const webview = { cspSource: 'mock', html: '', onDidReceiveMessage: fn => { hostMessage = fn; }, postMessage: data => { pageMessage({ data }); return Promise.resolve(true); } };
   createPanel = () => ({ webview, onDidDispose: fn => { dispose = fn; }, reveal() {}, dispose: () => dispose() });
@@ -23,13 +23,13 @@ function fixture(action, composer) {
   const script = webview.html.match(/<script nonce="[^"]+">([\s\S]*)<\/script>/)[1];
   vm.runInNewContext(script, {
     acquireVsCodeApi: () => ({ postMessage: message => hostMessage(message), getState: () => undefined, setState() {} }),
-    document: { getElementById: node, createElement: element, body: { scrollHeight: 100 } },
+    document: { getElementById: node, createElement: () => element(), body: { scrollHeight: 100 } },
     window: { addEventListener: (_name, fn) => { pageMessage = fn; }, innerHeight: 800, scrollY: 0, scrollTo() {} },
     setTimeout: (fn, delay) => { const timer = setTimeout(fn, delay); timers.add(timer); return timer; }, clearTimeout
   });
   const now = new Date().toISOString();
   panel.update({ id: 'worker', title: 'Test', revision: 0, state: 'completed', activity: 'Done', model: { id: 'model', name: 'Model' }, permission: 'read-only', createdAt: now, updatedAt: now, turns: [{ id: 'turn', state: 'completed', input: 'Task', output: 'done', tools: [] }], messages: [] }, []);
-  return { node, hostMessage: message => hostMessage(message), close: () => { for (const timer of timers) { clearTimeout(timer); } panel.dispose(); } };
+  return { node, panel, hostMessage: message => hostMessage(message), close: () => { for (const timer of timers) { clearTimeout(timer); } panel.dispose(); } };
 }
 
 test('webview keeps failed follow-up text and retries its persisted request after reopening', async () => {
@@ -65,4 +65,31 @@ test('a slow draft save cannot overwrite text typed after that save began', asyn
     release.resolve(); await sleep(20);
     assert.equal(view.node('message').value, 'Newer typing');
   } finally { release.resolve(); view.close(); }
+});
+
+test('worker articles skip whitespace-only outputs and trim only trailing whitespace on display', async () => {
+  const composer = new WorkerComposer({ load: () => undefined, save: async () => undefined });
+  const view = fixture(async () => {}, composer);
+  try {
+    const now = new Date().toISOString();
+    view.panel.update({
+      id: 'worker', title: 'Test', revision: 1, state: 'completed', activity: 'Done',
+      model: { id: 'model', name: 'Model' }, permission: 'read-only', createdAt: now, updatedAt: now,
+      turns: [
+        { id: 't1', state: 'completed', input: 'Task one', output: '  formatted code\n  line\n', tools: [] },
+        { id: 't2', state: 'completed', input: 'Task two', output: '\n\n  \n', tools: [] },
+        { id: 't3', state: 'completed', input: 'Task three', output: '', tools: [] }
+      ],
+      messages: []
+    }, []);
+    const conversation = view.node('conversation');
+    await until(() => conversation.children.length >= 4);
+    // Task 1 + trimmed Worker 1, Task 2 (no Worker article for whitespace-only
+    // output), Task 3 (no Worker article for empty output).
+    assert.equal(conversation.children.length, 4);
+    const worker = conversation.children[1].children[1];
+    assert.equal(worker.textContent, '  formatted code\n  line');
+    const labels = conversation.children.map(a => a.children[0].textContent);
+    assert.deepEqual(labels, ['Task · completed', 'Worker', 'Task · completed', 'Task · completed']);
+  } finally { view.close(); }
 });
