@@ -42,13 +42,15 @@ Transcripts, change snapshots, and archives are stored in plaintext in extension
 
 ## Worker experience
 
-Explorer's **Codex Workers** view groups workers by parent conversation and workspace root. Click a worker for its live conversation panel: output, current activity, recent tools, errors, changed files, and recovery actions. Completion/failure notifications link back to the worker.
+The Activity Bar's **Codex Subagent** view container holds the **Codex Workers** and **Models** views. The workers view groups workers by parent conversation and workspace root. Click a worker for its live conversation panel: output, current activity, recent tools, errors, changed files, and recovery actions. Completion/failure notifications link back to the worker.
+
+The **Models** view shows the strict User-settings `codexSubagent.models` pool in insertion/priority order, without needing a worker host or a trusted workspace. Expanding a model shows its effective policy (`allowWrite`, `allowShell`, `numSessions`, `maxToolRounds`, `turnTimeoutSeconds`, `autoCompact`) with built-in defaults (true/true/1/40/600/true) flagged as `default`, plus its `modelOptions` entries as readable JSON. Title actions offer **Enable Model**, **Configure Model Options**, and **Open Model Settings** (scoped to `codexSubagent.models` in User Settings); clicking a model configures its options. A malformed setting shows a visible error row that opens the settings; an empty pool shows Enable Model / Open User Settings guidance. The view refreshes on `codexSubagent` configuration changes.
 
 - **New Worker** starts a task directly from VS Code.
 - **Send Follow-up** queues a message behind the active turn.
 - Panel drafts and unacknowledged follow-ups/resumptions are saved in extension state. **Retry pending request** reuses the original request key and arguments, including after reopening a panel or reloading VS Code. The draft clears only after acknowledgement. **Clear retry record** keeps the draft and does not cancel accepted work.
 - **Cancel** stops generation and suspends queued messages. The worker remains busy until in-flight edits and command termination have settled.
-- **Resume** is offered for failed, cancelled, or interrupted workers. Choose a model and optional steering instructions.
+- **Resume** continues failed, cancelled, or interrupted workers from their saved conversation: choose an eligible model and optional steering instructions. A completed worker whose model was removed or restricted can also be recovered: choose a replacement model and leave the message empty to switch the model only (no inference and no replay), or add text to queue exactly one follow-up turn that preserves the earlier turns.
 - **Discard Queued Messages** prevents unstarted messages from executing while retaining their records.
 - **Compact Worker** generates a summary or accepts a manual one.
 - **Export Transcript** saves the conversation and archival history. **Clean Up Saved Workers** supports bulk deletion. Deletion removes archives, change snapshots, and operation keys too.
@@ -64,30 +66,57 @@ Models must be exposed by `vscode.lm.selectChatModels()`. A settings entry alone
 
 Setup and workers use the same response handling. Text and tool calls are processed; known reasoning parts, token-usage footers, and optional server continuation markers are excluded from task output. Workers send their durable message history on each request rather than relying on server continuation markers. Other response types fail explicitly with the part type and, for data parts, the MIME type; payload contents are excluded from that diagnostic. If an older installation reports `unsupported_response` for your model, install a rebuilt version, run **Developer: Reload Window**, and retry **Enable Model** before resuming the failed worker.
 
-Enabling another model preserves the default. **Set Default Model** makes that choice explicit. Disabling the default clears it and offers a replacement. **Configure Model Profile** edits options for an exact model ID; profile values override shared options.
+Enable/disable sync directly with the `codexSubagent.models` setting: **Enable Model** runs the probe and, only after it passes, adds the exact model ID to the setting (an existing entry keeps its policy and position); **Disable Model** removes just that key from the setting while preserving every other entry and order. Manual User Settings edits are authoritative and take effect immediately. **Configure Model Options** edits the provider request options stored at `codexSubagent.models.<model-id>.modelOptions` for a configured model ID.
+
+Reasoning effort for a BYOK model comes from VS Code's persisted language-model configuration, not from the per-model `modelOptions` under `codexSubagent.models`. Verified in VS Code 1.144.1, `sendChatRequest` resolves and merges that configuration into every request ([`languageModels.ts`](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/contrib/chat/common/languageModels.ts)), so workers inherit the selected model's configured `reasoningEffort` automatically. The fallback order is persisted per-model effort, then VS Code's model-configuration schema default, then the provider/model default when no effort is supplied; conversation-specific Copilot overrides are not inherited. This behavior is scoped to the verified implementation rather than claimed for the older 1.104 minimum.
+
+The per-model `modelOptions` objects remain provider request options. The built-in Custom Endpoint provider reads effort from model configuration and filters ordinary model options, so adding `reasoningEffort` or `reasoning_effort` to those settings does not override effort there. The Language Model API does not expose the full effective BYOK configuration to this extension; a worker-specific override would require request-configuration support.
 
 The extension does not extract `${secret:...}` values, query the OS keychain, or directly connect to model endpoints. Live credential-backed access must be tested using Enable Model in your VS Code window.
 
+### Ordered worker model pool
+
+`codexSubagent.models` is an ordered pool of worker models keyed by **exact enabled model IDs**; the JSON key insertion order is the automatic-selection priority. The IDs below are placeholders — replace them with the exact IDs shown by **Enable Model** / **Show Diagnostics**.
+
+```json
+{
+  "codexSubagent.models": {
+    "model-a-id": { "allowWrite": false, "numSessions": 1 },
+    "model-b-id": { "allowWrite": true, "allowShell": false, "numSessions": 1 },
+    "model-c-id": { "allowWrite": true, "allowShell": true, "numSessions": 2, "maxToolRounds": 60, "turnTimeoutSeconds": 900, "modelOptions": { "temperature": 0.2 } }
+  }
+}
+```
+
+Spawns and **New Worker** selections that omit a model are routed automatically: read-only work takes `model-a-id` first; workspace-write work skips it and uses `model-b-id`, then `model-c-id`, because only `model-b-id`/`model-c-id` allow writes (three concurrent writers: B, C, C).
+
+- `numSessions` bounds **active** conversations for that model inside its owning workspace/store. Omit it for the built-in default of 1.
+- When every eligible model is full, the worker queues on the highest-priority eligible model and is **not** migrated to a freer model.
+- An explicitly chosen model stays pinned and is still subject to that model's permission flags and `numSessions`.
+- `codexSubagent.models` is now the sole permission/limit policy source. `allowWrite` and `allowShell` default to true when omitted, so set either explicitly to `false` to restrict that model. Only user-level settings are honored.
+- `maxToolRounds`, `turnTimeoutSeconds` and `autoCompact` are optional per-model fields with built-in defaults when omitted: 40, 600 seconds, and `true`.
+- `modelOptions` is an optional per-model JSON object of provider-specific request options passed to VS Code `sendRequest` for that exact model (never credentials). Omitted means no extra options. The former top-level `modelOptions` and `modelProfiles` settings were removed without fallback: stale copies left in user settings are ignored; move their values into the model's nested `modelOptions`.
+- An empty pool (`{}`) means no models are enabled: no workers, tools or inference for any permission until at least one model is enabled (Enable Model adds the exact ID to the setting).
+- Writes still require `permission: "workspace-write"`. Shell still additionally requires one-time or workspace-session approval in VS Code.
+
+Settings are applied live. Saving or repairing `codexSubagent.models` (including raising `numSessions`) re-evaluates queued workers in the owning window, so stranded queues start once the settings are valid; the host is not restarted and started turns are not replayed. Permission changes are checked while tools run, so a restriction saved mid-turn can still fail that turn. **New Worker**, **Resume Worker**, and the panel dropdown offer only eligible configured models in pool order; when none is eligible they explain what to fix. Completed workers can switch to any eligible model, optionally with one follow-up turn.
+
+Provider request options now live inside each `codexSubagent.models` entry as nested `modelOptions`; they are unrelated to routing. Only user-level (global) settings are honored, and keys must reference models currently exposed and enabled by VS Code.
+
 | Setting (prefix `codexSubagent.`) | Default | Purpose |
 | --- | --- | --- |
-| `defaultModel` | First enabled | Exact model ID; no silent fallback |
-| `allowWrites` | `false` | Enable writes for explicitly writable workers |
-| `allowShell` | `false` | Offer individually approved shell commands |
-| `maxConcurrentWorkers` | `2` | Active conversations per store |
-| `maxToolRounds` | `40` | Tool rounds before explicit resumption |
-| `turnTimeoutSeconds` | `600` | Deadline including tools and summaries |
-| `autoCompact` | `true` | Summarize/archive at context, history, and turn limits |
+| `models` | `{}` | Sole enabled-model source: keys are exact enabled model IDs in automatic-selection priority order; values are per-model permissions, tuning (`allowWrite`, `allowShell`, `numSessions`, `maxToolRounds`, `turnTimeoutSeconds`, `autoCompact`) and provider request options (`modelOptions`). Empty means nothing is enabled |
 | `notifyOnCompletion` | `true` | Completion/failure notifications |
-| `modelProfiles` | `{}` | Provider options keyed by exact model ID |
-| `modelOptions` | `{}` | Shared provider options |
+
+Removed global settings (`allowWrites`, `allowShell`, `maxConcurrentWorkers`, `maxToolRounds`, `turnTimeoutSeconds`, `autoCompact`, `modelOptions`, `modelProfiles`) are ignored if still present in user settings; configure their per-model equivalents under `models` (provider request options go in each entry's nested `modelOptions`).
 
 ## Permissions and editing
 
-Read-only is the default. For code changes, enable `codexSubagent.allowWrites` in **User Settings** and request `permission: "workspace-write"` when spawning. Spawn rejects that permission if the write tool is disabled. `subagent_health` reports effective tools before delegation.
+Read-only is the default. For code changes, configure a model in `codexSubagent.models` with `allowWrite` true (or omitted) in **User Settings** and request `permission: "workspace-write"` when spawning. Spawn rejects that permission when the selected model policy or write tool is unavailable. `subagent_health` reports effective tools before delegation.
 
 Tools include paginated UTF-8 reads, directory listing/creation, bounded literal search, hash-checked writes, exact-text patches, rename, and delete. Changes have recoverable before/after snapshots. Stale hashes, symlink paths, hard-linked replacements, and writes to `.git`, `.codex`, or `.vscode` are rejected. Missing parent directories can be created in order. These checks are not an OS filesystem sandbox against arbitrary concurrent external processes.
 
-Optional `codexSubagent.allowShell` offers shell execution to workspace-write workers. Each exact command needs approval in VS Code. Commands run with the extension host's OS access, outside Codex's sandbox. Time/output are bounded. POSIX cancellation and deadlines terminate the process group, retaining the forced-kill grace period even if the shell exits first; Windows cancellation targets the direct process. Repository settings cannot grant write/shell access.
+A per-model `allowShell` policy in `codexSubagent.models` (default true when omitted, or false to restrict) may offer shell execution to workspace-write workers. Commands without an active session grant open a scrollable **Review Worker Command** tab showing the full command and working directory with **Run once**, **Allow for this workspace session**, and **Cancel** controls; closing the tab or pressing Escape denies it. A workspace-session grant covers all workers in the same canonical workspace/worktree for this VS Code window, including commands already waiting there, but other workspace/worktree roots need separate grants. The grant is memory only: it ends on window reload/restart or when you run **Revoke Shell Approval**, which also targets one root or all roots and does not terminate running commands (use **Cancel Worker** for that). Commands run with the extension host's OS access, outside Codex's sandbox. Time/output are bounded. POSIX cancellation and deadlines terminate the process group, retaining the forced-kill grace period even if the shell exits first; Windows cancellation targets the direct process. Repository settings cannot grant write/shell access.
 
 ## Parent ownership and lifecycle
 
@@ -103,7 +132,7 @@ Native Codex parent-stop events and native agent UI integration are not exposed 
 | `subagent_spawn` | Start an asynchronous worker with explicit context |
 | `subagent_send`, `subagent_discard_queued` | Queue a follow-up or discard unstarted work |
 | `subagent_status`, `subagent_wait`, `subagent_list` | Read output/history, wait, or list by owner |
-| `subagent_cancel`, `subagent_resume` | Stop/recover work, optionally changing model/instructions |
+| `subagent_cancel`, `subagent_resume` | Stop/recover work, optionally changing model/instructions; completed workers switch model (and optionally add one turn) when given an explicit enabled model |
 | `subagent_compact` | Automatic or manual summary with immutable archives |
 | `subagent_parent` | Renew leases or stop a parent group |
 | `subagent_delete` | Permanently delete a stopped worker |

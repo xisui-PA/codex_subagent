@@ -63,6 +63,28 @@ test('shell never starts without approval; approved command captures exit status
   assert.match(result.output, /test/);
 });
 
+test('approval callback receives the canonical owner root, not the command cwd', async t => {
+  const { root } = await fixture(t);
+  await fs.mkdir(path.join(root, 'child'));
+  const captured = [];
+  const tools = await FileTools.create([root], { canWrite: () => true, allowShell: () => true, approveCommand: async (...args) => { captured.push(args); return false; } });
+  await assert.rejects(tools.execute('run_command', { command: 'echo test', path: 'child' }, 'workspace-write', signal()), { code: 'command_denied' });
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0][0], 'echo test');
+  assert.equal(captured[0][1], await fs.realpath(path.join(root, 'child')), 'The command cwd must be the resolved child directory');
+  assert.equal(captured[0][3], await fs.realpath(root), 'The fourth argument must be the canonical owner root, not the child cwd');
+});
+
+test('permission gates block run_command before the approval callback', async t => {
+  const { root } = await fixture(t);
+  let calls = 0;
+  let tools = await FileTools.create([root], { canWrite: () => true, allowShell: () => true, approveCommand: async () => { calls++; return true; } });
+  await assert.rejects(tools.execute('run_command', { command: 'echo test' }, 'read-only', signal()), { code: 'permission_denied' });
+  tools = await FileTools.create([root], { canWrite: () => true, allowShell: () => false, approveCommand: async () => { calls++; return true; } });
+  await assert.rejects(tools.execute('run_command', { command: 'echo test' }, 'workspace-write', signal()), { code: 'permission_denied' });
+  assert.equal(calls, 0, 'The approver must never be consulted when permission or allowShell is off');
+});
+
 test('workers can create directory trees without shell access', async t => {
   const { root } = await fixture(t);
   const tools = await FileTools.create([root], { canWrite: () => true, allowShell: () => false });

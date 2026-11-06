@@ -2,8 +2,9 @@
   "name": "codex-subagent",
   "displayName": "Codex Subagent",
   "description": "Persistent BYOK worker agents for Codex, using VS Code language models through MCP.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "xisui-PA",
+  "icon": "media/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/xisui-PA/codex_subagent.git"
@@ -153,24 +154,45 @@
         "icon": "$(folder-library)"
       },
       {
-        "command": "codexSubagent.setDefaultModel",
-        "title": "Set Default Model",
-        "category": "Codex Subagent",
-        "icon": "$(star-full)"
-      },
-      {
         "command": "codexSubagent.configureModel",
-        "title": "Configure Model Profile",
+        "title": "Configure Model Options",
         "category": "Codex Subagent",
         "icon": "$(settings-gear)"
+      },
+      {
+        "command": "codexSubagent.openModelSettings",
+        "title": "Open Model Settings",
+        "category": "Codex Subagent",
+        "icon": "$(settings)"
+      },
+      {
+        "command": "codexSubagent.revokeShellApproval",
+        "title": "Revoke Shell Approval",
+        "category": "Codex Subagent",
+        "icon": "$(shield)"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codexSubagent",
+          "title": "Codex Subagent",
+          "icon": "media/container.svg"
+        }
+      ]
+    },
     "views": {
-      "explorer": [
+      "codexSubagent": [
         {
           "id": "codexSubagent.workers",
           "name": "Codex Workers",
           "icon": "$(hubot)",
+          "visibility": "visible"
+        },
+        {
+          "id": "codexSubagent.models",
+          "name": "Models",
+          "icon": "$(brain)",
           "visibility": "visible"
         }
       ]
@@ -180,6 +202,11 @@
         "view": "codexSubagent.workers",
         "contents": "Delegate work to your VS Code models.\n[Set up workers](command:codexSubagent.setup)\n[New worker](command:codexSubagent.newWorker)\n[Diagnostics](command:codexSubagent.diagnostics)\n[Retry host](command:codexSubagent.retryHost)",
         "when": "view == codexSubagent.workers"
+      },
+      {
+        "view": "codexSubagent.models",
+        "contents": "No worker models are enabled.\n[Enable Model](command:codexSubagent.enableModel)\n[Open User Settings](command:codexSubagent.openModelSettings)",
+        "when": "view == codexSubagent.models && codexSubagent.modelsEmpty"
       }
     ],
     "menus": {
@@ -197,6 +224,21 @@
         {
           "command": "codexSubagent.setup",
           "when": "view == codexSubagent.workers",
+          "group": "navigation"
+        },
+        {
+          "command": "codexSubagent.enableModel",
+          "when": "view == codexSubagent.models",
+          "group": "navigation"
+        },
+        {
+          "command": "codexSubagent.configureModel",
+          "when": "view == codexSubagent.models",
+          "group": "navigation"
+        },
+        {
+          "command": "codexSubagent.openModelSettings",
+          "when": "view == codexSubagent.models",
           "group": "navigation"
         }
       ],
@@ -260,80 +302,78 @@
           "command": "codexSubagent.deleteWorker",
           "when": "view == codexSubagent.workers && viewItem == workerResumable",
           "group": "actions"
+        },
+        {
+          "command": "codexSubagent.configureModel",
+          "when": "view == codexSubagent.models && viewItem == modelEntry",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.openModelSettings",
+          "when": "view == codexSubagent.models",
+          "group": "actions"
         }
       ]
     },
     "configuration": {
       "title": "Codex Subagent",
       "properties": {
-        "codexSubagent.defaultModel": {
-          "type": "string",
-          "default": "",
-          "scope": "machine",
-          "description": "Exact model ID. Use Set Default Model to choose; enabling another model preserves this choice."
-        },
-        "codexSubagent.allowWrites": {
-          "type": "boolean",
-          "default": false,
-          "scope": "machine",
-          "description": "Allow workers explicitly spawned with workspace-write permission to edit workspace files. Only user-level settings are honored."
-        },
-        "codexSubagent.allowShell": {
-          "type": "boolean",
-          "default": false,
-          "scope": "machine",
-          "description": "Offer shell execution to workspace-write workers. Every command still needs explicit approval in VS Code. Commands do not inherit the Codex sandbox. Only user-level settings are honored."
-        },
-        "codexSubagent.maxConcurrentWorkers": {
-          "type": "integer",
-          "default": 2,
-          "minimum": 1,
-          "maximum": 8,
-          "scope": "machine",
-          "description": "Maximum simultaneously active worker conversations."
-        },
-        "codexSubagent.maxToolRounds": {
-          "type": "integer",
-          "default": 40,
-          "minimum": 1,
-          "maximum": 200,
-          "scope": "machine",
-          "description": "Maximum model/tool rounds per turn before manual resumption is required."
-        },
-        "codexSubagent.turnTimeoutSeconds": {
-          "type": "integer",
-          "default": 600,
-          "minimum": 10,
-          "maximum": 3600,
-          "scope": "machine",
-          "description": "Deadline per worker turn, including tool execution. Timeout preserves the session for explicit resumption."
-        },
-        "codexSubagent.modelOptions": {
+        "codexSubagent.models": {
           "type": "object",
           "default": {},
           "scope": "machine",
-          "description": "Provider-specific options passed to VS Code sendRequest, such as supported reasoning options. Never put credentials here."
-        },
-        "codexSubagent.autoCompact": {
-          "type": "boolean",
-          "default": true,
-          "scope": "machine",
-          "description": "Summarize and archive older history automatically before context/storage/turn limits. Full transcripts remain exportable."
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "allowWrite": {
+                "type": "boolean",
+                "default": true,
+                "description": "Per-model write policy: omitted or true allows workspace-write workers for this model; false restricts all workspace edits and change tools."
+              },
+              "allowShell": {
+                "type": "boolean",
+                "default": true,
+                "description": "Per-model shell policy: omitted or true may offer shell to this model's workspace-write workers; false restricts it. Shell still requires workspace-write and user approval."
+              },
+              "numSessions": {
+                "type": "integer",
+                "default": 1,
+                "minimum": 1,
+                "maximum": 8,
+                "description": "Maximum simultaneously active conversations for this model in the owning workspace store. Built-in default when omitted: 1."
+              },
+              "maxToolRounds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Per-model tool rounds per turn before manual resumption is required. Built-in default when omitted: 40."
+              },
+              "turnTimeoutSeconds": {
+                "type": "integer",
+                "minimum": 10,
+                "maximum": 3600,
+                "description": "Per-model deadline per turn, including tool execution. Built-in default when omitted: 600."
+              },
+              "autoCompact": {
+                "type": "boolean",
+                "description": "Per-model automatic summarization before limits. Built-in default when omitted: true."
+              },
+              "modelOptions": {
+                "type": "object",
+                "default": {},
+                "additionalProperties": true,
+                "description": "Provider-specific request options passed to VS Code sendRequest for this exact model, such as supported reasoning options. Arbitrary provider JSON is allowed; never put credentials here. Omitted means no extra options."
+              }
+            }
+          },
+          "description": "The sole enabled-model source: each key is an exact VS Code model ID that is enabled for workers, and the value is that model's policy. Entry order is the automatic-selection priority. Enabling a model through 'Codex Subagent: Enable Model' adds its exact ID here (User settings only); disabling removes it. Manual User Settings edits take effect immediately. Workspace settings never enable or expand models. An explicit subagent_spawn model must match a key exactly (no name/vendor aliases). An empty object means no models are enabled: workers, tools and inference are unavailable until at least one model is enabled. This pool is the sole permission and limit configuration source; omitted numSessions/maxToolRounds/turnTimeoutSeconds/autoCompact use built-in defaults 1/40/600/true."
         },
         "codexSubagent.notifyOnCompletion": {
           "type": "boolean",
           "default": true,
           "scope": "machine",
           "description": "Notify when an observed worker finishes or fails."
-        },
-        "codexSubagent.modelProfiles": {
-          "type": "object",
-          "default": {},
-          "scope": "machine",
-          "additionalProperties": {
-            "type": "object"
-          },
-          "description": "Per-model options keyed by exact model ID. Override shared modelOptions; use Configure Model Profile."
         }
       }
     }

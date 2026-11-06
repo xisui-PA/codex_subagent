@@ -27,7 +27,7 @@ const descriptions: Record<keyof typeof schemas, string> = {
   patch_file: 'Replace exactly one occurrence of oldText with newText in a file, using its current SHA-256 hash. Ambiguous or stale edits fail. Changes are reviewable in VS Code.',
   delete_file: 'Delete a workspace file only if its current hash matches expectedHash. A recoverable before-image is saved for the worker change review.',
   rename_file: 'Rename a workspace file to a new path. Requires its current expectedHash and a nonexistent destination. The parent directory must exist.',
-  run_command: 'Run a shell command only after the user approves the exact command in VS Code. No Codex sandbox or approval is inherited. Output is bounded; cancelled commands may have partial side effects.'
+  run_command: 'Run a shell command only after the user approves it in VS Code, either one-time or for the active workspace session. No Codex sandbox or approval is inherited. Output is bounded; cancelled commands may have partial side effects.'
 };
 const hash = (text: string): string => createHash('sha256').update(text).digest('hex');
 const skipped = new Set(['node_modules', 'dist', 'build', 'coverage', 'vendor']);
@@ -36,7 +36,7 @@ export interface FileToolOptions {
   canWrite: () => boolean;
   allowShell: () => boolean;
   checkDocument?: (file: string) => void;
-  approveCommand?: (command: string, cwd: string, signal: AbortSignal) => Promise<boolean>;
+  approveCommand?: (command: string, cwd: string, signal: AbortSignal, workspaceRoot: string) => Promise<boolean>;
   readOpenText?: (file: string) => string | undefined;
   applyChange?: (change: ChangeContent, expectedHash: string) => Promise<void>;
   recordChange?: (session: Session, change: ChangeContent) => Promise<void>;
@@ -59,6 +59,21 @@ export class FileTools implements WorkspaceTools {
     const scoped = new FileTools([session.workspaceRoot, ...this.roots.filter(r => r !== session.workspaceRoot)], this.options);
     scoped.writes = this.writes;
     return scoped;
+  }
+  /**
+   * Explicit privileged view used ONLY for a user-initiated Revert of an
+   * already-recorded worker change. Model write policy gates inference and
+   * worker tool calls, never the user's own undo, so this view ignores the
+   * aggregate write switch while keeping every other protection: it reuses the
+   * same roots, write mutex, editor/checkDocument/applyChange and change
+   * snapshot callbacks, hash preconditions, protected paths and symlink checks.
+   * It never grants shell. Never hand this view to inference or tool dispatch.
+   */
+  forUserRevert(session: Session): FileTools {
+    const scoped = this.forSession(session);
+    const revert = new FileTools(scoped.roots, { ...this.options, canWrite: () => true, allowShell: () => false });
+    revert.writes = this.writes;
+    return revert;
   }
   static async create(roots: string[], options: FileToolOptions): Promise<FileTools> {
     return new FileTools(await Promise.all(roots.map(root => fs.realpath(root))), options);
@@ -125,8 +140,27 @@ export class FileTools implements WorkspaceTools {
     }
     return new TextDecoder('utf-8', { fatal: true }).decode(data);
   }
-  async execute(name: string, input: Record<string, unknown>, permission: Session['permission'], signal: AbortSignal, session?: Session): Promise<string> {
+  // Recheck the effective aggregate write capability and the caller's latest
+  // policy after any wait. Only the engine supplies the sixth argument. Trusted
+  // user reverts run through the explicit forUserRevert view, whose canWrite
+  // override already isolates them from model policy; every other caller,
+  // including direct worker callers that omit the callback, stays gated by the
+  // aggregate switch.
+  private confirmWrite(authorize?: () => void): void {
+    if (!this.options.canWrite()) {
+      throw new WorkerError('permission_denied', 'Workspace writes are disabled.');
+    }
+    authorize?.();
+  }
+  private confirmShell(authorize?: () => void): void {
+    if (!this.options.allowShell() || !this.options.approveCommand) {
+      throw new WorkerError('permission_denied', 'Shell commands are disabled.');
+    }
+    authorize?.();
+  }
+  async execute(name: string, input: Record<string, unknown>, permission: Session['permission'], signal: AbortSignal, session?: Session, authorize?: () => void): Promise<string> {
     signal.throwIfAborted();
+    authorize?.();
     if (name === 'read_file') {
       const args = schemas.read_file.parse(input);
       const file = await this.resolve(args.path);
@@ -193,7 +227,11 @@ export class FileTools implements WorkspaceTools {
       const args = schemas.create_directory.parse(input);
       return this.writes.run(async () => {
         signal.throwIfAborted();
+        // This call may have waited behind another write; recheck now.
+        this.confirmWrite(authorize);
         const directory = await this.resolve(args.path, true);
+        // Recheck once more immediately before the mutation.
+        this.confirmWrite(authorize);
         try {
           await fs.mkdir(directory);
         } catch (error) {
@@ -211,6 +249,8 @@ export class FileTools implements WorkspaceTools {
       const args = schemas.write_file.parse(input);
       return this.writes.run(async () => {
         signal.throwIfAborted();
+        // This call may have queued behind another write; recheck now.
+        this.confirmWrite(authorize);
         const file = await this.resolve(args.path, true);
         this.options.checkDocument?.(file);
         const existing = await fs.lstat(file).catch(error => {
@@ -230,7 +270,7 @@ export class FileTools implements WorkspaceTools {
           }
           signal.throwIfAborted();
         }
-        const change = await this.saveChange({ path: file, kind: 'write', before, after: args.content }, args.expectedHash, signal, session);
+        const change = await this.saveChange({ path: file, kind: 'write', before, after: args.content }, args.expectedHash, signal, session, authorize);
         return JSON.stringify({ path: file, hash: hash(change.after!), bytes: Buffer.byteLength(change.after!), changeId: change.id });
       });
     }
@@ -245,7 +285,7 @@ export class FileTools implements WorkspaceTools {
       if (first < 0 || before.indexOf(args.oldText, first + 1) >= 0) {
         throw new WorkerError('patch_conflict', 'oldText must match exactly once. Supply more surrounding context.');
       }
-      return this.execute('write_file', { path: file, expectedHash: args.expectedHash, content: before.slice(0, first) + args.newText + before.slice(first + args.oldText.length) }, permission, signal, session);
+      return this.execute('write_file', { path: file, expectedHash: args.expectedHash, content: before.slice(0, first) + args.newText + before.slice(first + args.oldText.length) }, permission, signal, session, authorize);
     }
     if (name === 'delete_file' || name === 'rename_file') {
       if (permission !== 'workspace-write' || !this.options.canWrite()) {
@@ -253,6 +293,9 @@ export class FileTools implements WorkspaceTools {
       }
       const args = name === 'delete_file' ? schemas.delete_file.parse(input) : schemas.rename_file.parse(input);
       return this.writes.run(async () => {
+        signal.throwIfAborted();
+        // This call may have queued behind another write; recheck now.
+        this.confirmWrite(authorize);
         const file = await this.resolve(args.path, true);
         this.options.checkDocument?.(file);
         const stat = await fs.lstat(file);
@@ -264,7 +307,7 @@ export class FileTools implements WorkspaceTools {
         if (target && await fs.lstat(target).catch(() => undefined)) {
           throw new WorkerError('file_conflict', 'Rename destination already exists.');
         }
-        const change = await this.saveChange({ path: file, target, kind: name === 'rename_file' ? 'rename' : 'delete', before, after: name === 'rename_file' ? before : null }, args.expectedHash, signal, session);
+        const change = await this.saveChange({ path: file, target, kind: name === 'rename_file' ? 'rename' : 'delete', before, after: name === 'rename_file' ? before : null }, args.expectedHash, signal, session, authorize);
         return JSON.stringify({ path: file, target, changeId: change.id, changed: true });
       });
     }
@@ -277,21 +320,28 @@ export class FileTools implements WorkspaceTools {
       if (!(await fs.stat(cwd)).isDirectory()) {
         throw new WorkerError('invalid_path', 'Command path must be a directory.');
       }
-      const approved = await abortable(this.options.approveCommand(args.command, cwd, signal), signal);
+      const approved = await abortable(this.options.approveCommand(args.command, cwd, signal, this.workspaceRoot), signal);
       signal.throwIfAborted();
-      if (!approved || !this.options.allowShell()) {
+      if (!approved) {
         throw new WorkerError('command_denied', 'User declined the command.');
       }
+      // The dialog can stay open indefinitely. Recheck the effective policy and
+      // the caller's latest model policy immediately before spawning, so a
+      // revocation made while it was open still blocks the command.
+      this.confirmShell(authorize);
       return this.command(args.command, cwd, args.timeoutMs, signal);
     }
     throw new WorkerError('unknown_tool', `Unknown worker tool: ${name}`);
   }
-  private async saveChange(content: Pick<ChangeContent, 'path' | 'target' | 'kind' | 'before' | 'after'>, expectedHash: string, signal: AbortSignal, session?: Session): Promise<ChangeContent> {
+  private async saveChange(content: Pick<ChangeContent, 'path' | 'target' | 'kind' | 'before' | 'after'>, expectedHash: string, signal: AbortSignal, session?: Session, authorize?: () => void): Promise<ChangeContent> {
     const change: ChangeContent = { ...content, id: randomUUID(), state: 'pending', createdAt: new Date().toISOString() };
     if (session) {
       await this.options.recordChange?.(session, change);
     }
     signal.throwIfAborted();
+    // Recording the change awaits a durable checkpoint. Recheck right before
+    // the actual mutation so a revocation made during that wait blocks it.
+    this.confirmWrite(authorize);
     if (this.options.applyChange) {
       await this.options.applyChange(change, expectedHash);
       if (change.kind === 'write') {

@@ -9,6 +9,8 @@ async function main() {
   if (!process.env.VSCODE_EXECUTABLE && process.platform === 'darwin' && !await fs.access(executable).then(() => true, () => false)) { executable = '/Applications/Visual Studio Code.app/Contents/MacOS/Electron'; }
   await fs.access(executable).catch(() => { throw new Error('Set VSCODE_EXECUTABLE to an installed VS Code executable. No editor download is performed.'); });
   const repository = path.resolve(__dirname, '..');
+  const manifest = JSON.parse(await fs.readFile(path.join(repository, 'package.json'), 'utf8'));
+  const extensionId = (manifest.publisher + '.' + manifest.name).toLowerCase();
   // macOS Unix sockets have a 103-character path limit; its default TMPDIR is long.
   const temporary = await fs.mkdtemp(path.join(process.platform === 'win32' ? os.tmpdir() : '/tmp', 'cw-host-'));
   try {
@@ -18,7 +20,7 @@ async function main() {
       if (scenario === 'locked') {
         const real = await fs.realpath(workspace);
         const hash = createHash('sha256').update(JSON.stringify(['root', real])).digest('hex').slice(0, 32);
-        const store = path.join(profile, 'user-data', 'User', 'globalStorage', 'xisui.codex-subagent', 'workspaces', hash);
+        const store = path.join(profile, 'user-data', 'User', 'globalStorage', extensionId, 'workspaces', hash);
         await fs.mkdir(store, { recursive: true });
         await fs.writeFile(path.join(store, 'owner.lock'), JSON.stringify({ pid: process.pid, nonce: 'test-owner' }));
       }
