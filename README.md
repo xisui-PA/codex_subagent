@@ -12,7 +12,7 @@ Persistent workers for Codex, powered by tool-capable language models configured
 
 ## Installation
 
-1. Install **Codex Subagent** from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=xisui.codex-subagent) (extension ID `xisui.codex-subagent`), or run `code --install-extension xisui.codex-subagent` from a terminal.
+1. Install **Codex Subagent** from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=xisui-pa.codex-subagent) (extension ID `xisui-pa.codex-subagent`), or run `code --install-extension xisui-pa.codex-subagent` from a terminal.
 2. Alternatively, package a [VSIX](#development-and-release) and install it with **Extensions: Install from VSIX**.
 3. Open a trusted filesystem workspace and run **Codex Subagent: Set Up Workers**.
 4. Select a tool-capable model and approve VS Code model access if prompted. Setup tests an inert tool call and a follow-up using its result; this probe accesses no workspace files.
@@ -188,7 +188,7 @@ Publishing is manual and happens after validation:
 2. Run the local validation and host checks above, plus a live smoke test in your own VS Code window.
 3. Merge the version change into `main` (via pull request) and tag that `main` commit with `v<version>`.
 4. Wait for the successful `main` CI run for that tagged commit and download its VSIX artifact. If you need to rebuild the release artifact, manually dispatch at the tag instead (`gh workflow run ci.yml --ref v<version>`).
-5. Upload **that tested artifact** to the VS Code Marketplace at https://marketplace.visualstudio.com/manage under the publisher ID `xisui` (the account display name `xisui-PA` is not the manifest publisher).
+5. Upload **that tested artifact** to the VS Code Marketplace at https://marketplace.visualstudio.com/manage under the publisher ID `xisui-pa`.
 
 Do not bump the version after validation or rebuild a different artifact after CI; publish exactly the VSIX CI tested and uploaded.
 
