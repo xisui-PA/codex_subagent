@@ -154,14 +154,8 @@
         "icon": "$(folder-library)"
       },
       {
-        "command": "codexSubagent.setDefaultModel",
-        "title": "Set Default Model",
-        "category": "Codex Subagent",
-        "icon": "$(star-full)"
-      },
-      {
         "command": "codexSubagent.configureModel",
-        "title": "Configure Model Profile",
+        "title": "Configure Model Options",
         "category": "Codex Subagent",
         "icon": "$(settings-gear)"
       },
@@ -273,12 +267,6 @@
     "configuration": {
       "title": "Codex Subagent",
       "properties": {
-        "codexSubagent.defaultModel": {
-          "type": "string",
-          "default": "",
-          "scope": "machine",
-          "description": "Exact model ID for spawns that omit model. Legacy fallback used only while codexSubagent.models is empty; with a configured pool the engine routes automatically. Use Set Default Model to choose; enabling another model preserves this choice."
-        },
         "codexSubagent.models": {
           "type": "object",
           "default": {},
@@ -290,102 +278,51 @@
               "allowWrite": {
                 "type": "boolean",
                 "default": true,
-                "description": "Restrict this model: when false, workspace-write workers on this model cannot edit files even if the global allowWrites is true."
+                "description": "Per-model write policy: omitted or true allows workspace-write workers for this model; false restricts all workspace edits and change tools."
               },
               "allowShell": {
                 "type": "boolean",
                 "default": true,
-                "description": "Restrict this model: when false, shell is not offered to this model's workspace-write workers even if the global allowShell is true."
+                "description": "Per-model shell policy: omitted or true may offer shell to this model's workspace-write workers; false restricts it. Shell still requires workspace-write and user approval."
               },
               "numSessions": {
                 "type": "integer",
                 "default": 1,
                 "minimum": 1,
                 "maximum": 8,
-                "description": "Maximum simultaneously active conversations for this model in the owning workspace store. Replaces maxConcurrentWorkers while models is configured."
+                "description": "Maximum simultaneously active conversations for this model in the owning workspace store. Built-in default when omitted: 1."
               },
               "maxToolRounds": {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 200,
-                "description": "Optional per-model tool rounds per turn before manual resumption is required. Omit to inherit codexSubagent.maxToolRounds."
+                "description": "Per-model tool rounds per turn before manual resumption is required. Built-in default when omitted: 40."
               },
               "turnTimeoutSeconds": {
                 "type": "integer",
                 "minimum": 10,
                 "maximum": 3600,
-                "description": "Optional per-model deadline per turn, including tool execution. Omit to inherit codexSubagent.turnTimeoutSeconds."
+                "description": "Per-model deadline per turn, including tool execution. Built-in default when omitted: 600."
               },
               "autoCompact": {
                 "type": "boolean",
-                "description": "Optional per-model automatic summarization before limits. Omit to inherit codexSubagent.autoCompact."
+                "description": "Per-model automatic summarization before limits. Built-in default when omitted: true."
+              },
+              "modelOptions": {
+                "type": "object",
+                "default": {},
+                "additionalProperties": true,
+                "description": "Provider-specific request options passed to VS Code sendRequest for this exact model, such as supported reasoning options. Arbitrary provider JSON is allowed; never put credentials here. Omitted means no extra options."
               }
             }
           },
-          "description": "Ordered pool of worker models keyed by exact model ID; entry order is the automatic-selection priority. Spawns without model pick the first eligible model with a free session; when all eligible models are full the worker queues on the highest-priority eligible model. An explicit model still pins but stays subject to its permission flags and numSessions. Keys must be enabled VS Code models. Only user-level (global) settings are honored; workspace settings cannot expand permissions. Empty {} keeps the legacy defaultModel and maxConcurrentWorkers behavior."
-        },
-        "codexSubagent.allowWrites": {
-          "type": "boolean",
-          "default": false,
-          "scope": "machine",
-          "description": "Master guard: allow workers explicitly spawned with workspace-write permission to edit workspace files. A per-model allowWrite: false in codexSubagent.models restricts further; workspace settings cannot expand this. Only user-level settings are honored."
-        },
-        "codexSubagent.allowShell": {
-          "type": "boolean",
-          "default": false,
-          "scope": "machine",
-          "description": "Master guard: offer shell execution to workspace-write workers. Requires one-time or workspace-session approval in VS Code. Session grants expire on reload or revocation. Commands use VS Code's OS access, outside the Codex sandbox. A per-model allowShell: false in codexSubagent.models restricts further; only user-level settings are honored."
-        },
-        "codexSubagent.maxConcurrentWorkers": {
-          "type": "integer",
-          "default": 2,
-          "minimum": 1,
-          "maximum": 8,
-          "scope": "machine",
-          "description": "Legacy global limit on simultaneously active worker conversations, used only while codexSubagent.models is empty; a configured pool uses per-model numSessions instead."
-        },
-        "codexSubagent.maxToolRounds": {
-          "type": "integer",
-          "default": 40,
-          "minimum": 1,
-          "maximum": 200,
-          "scope": "machine",
-          "description": "Maximum model/tool rounds per turn before manual resumption is required. A per-model maxToolRounds in codexSubagent.models overrides for that model."
-        },
-        "codexSubagent.turnTimeoutSeconds": {
-          "type": "integer",
-          "default": 600,
-          "minimum": 10,
-          "maximum": 3600,
-          "scope": "machine",
-          "description": "Deadline per worker turn, including tool execution. Timeout preserves the session for explicit resumption. A per-model turnTimeoutSeconds in codexSubagent.models overrides for that model."
-        },
-        "codexSubagent.modelOptions": {
-          "type": "object",
-          "default": {},
-          "scope": "machine",
-          "description": "Provider-specific options passed to VS Code sendRequest, such as supported reasoning options. Never put credentials here."
-        },
-        "codexSubagent.autoCompact": {
-          "type": "boolean",
-          "default": true,
-          "scope": "machine",
-          "description": "Summarize and archive older history automatically before context/storage/turn limits. Full transcripts remain exportable. A per-model autoCompact in codexSubagent.models overrides for that model."
+          "description": "The sole enabled-model source: each key is an exact VS Code model ID that is enabled for workers, and the value is that model's policy. Entry order is the automatic-selection priority. Enabling a model through 'Codex Subagent: Enable Model' adds its exact ID here (User settings only); disabling removes it. Manual User Settings edits take effect immediately. Workspace settings never enable or expand models. An explicit subagent_spawn model must match a key exactly (no name/vendor aliases). An empty object means no models are enabled: workers, tools and inference are unavailable until at least one model is enabled. This pool is the sole permission and limit configuration source; omitted numSessions/maxToolRounds/turnTimeoutSeconds/autoCompact use built-in defaults 1/40/600/true."
         },
         "codexSubagent.notifyOnCompletion": {
           "type": "boolean",
           "default": true,
           "scope": "machine",
           "description": "Notify when an observed worker finishes or fails."
-        },
-        "codexSubagent.modelProfiles": {
-          "type": "object",
-          "default": {},
-          "scope": "machine",
-          "additionalProperties": {
-            "type": "object"
-          },
-          "description": "Per-model provider request options keyed by exact model ID. Override shared modelOptions; use Configure Model Profile. Unrelated to codexSubagent.models routing/permission policies."
         }
       }
     }

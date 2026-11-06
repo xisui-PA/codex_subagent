@@ -43,9 +43,11 @@ export type SessionHeader = Pick<Session, 'id' | 'title' | 'model' | 'permission
 export interface ModelPolicy {
   allowWrite?: boolean; allowShell?: boolean; numSessions?: number; maxToolRounds?: number;
   turnTimeoutSeconds?: number; autoCompact?: boolean;
+  /** Provider-specific request options for this exact model; no credentials. */
+  modelOptions?: Record<string, unknown>;
 }
 export interface Settings {
-  maxConcurrent: number; maxTurns: number; maxToolRounds: number; turnTimeoutMs: number;
+  maxTurns: number; maxToolRounds: number; turnTimeoutMs: number;
   maxOutputChars: number; maxHistoryBytes: number; maxSessions: number; retries: number;
   autoCompact?: boolean; models?: Record<string, ModelPolicy>;
 }

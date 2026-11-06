@@ -7,7 +7,10 @@ const policySchema = z.object({
   numSessions: z.number().int().min(1).max(8).optional(),
   maxToolRounds: z.number().int().min(1).max(200).optional(),
   turnTimeoutSeconds: z.number().int().min(10).max(3600).optional(),
-  autoCompact: z.boolean().optional()
+  autoCompact: z.boolean().optional(),
+  // Provider-specific request options for this exact model. Arbitrary nested
+  // provider JSON is allowed, but the value itself must be an object map.
+  modelOptions: z.record(z.string(), z.unknown()).optional()
 }).strict();
 
 const maxModelIdLength = 500;
@@ -43,7 +46,7 @@ export function parseModelSettings(raw: unknown): Record<string, ModelPolicy> {
 
 export interface EligibleModel { id: string; name: string; policy?: ModelPolicy }
 export interface EligibleModelSet {
-  /** Selectable models in configured pool order (or enabled order for a legacy empty pool). */
+  /** Selectable models in configured pool order (pool keys are the enabled models). */
   models: EligibleModel[];
   /** Pre-selection: the previous model when still eligible, otherwise the first eligible model. */
   preferred?: string;
@@ -62,31 +65,26 @@ export interface EligibleModelInput {
 /**
  * Every surface that offers a model (New Worker, Resume Worker, panel dropdown)
  * must offer exactly the configured pool in priority order, minus models that
- * cannot honour the session permission. An empty legacy pool falls back to the
- * enabled model list. Pure so it is testable without VS Code.
+ * cannot honour the session permission. The pool keys are themselves the
+ * enabled models, so an empty pool offers nothing for ANY permission; Enable
+ * Model adds the exact ID to the setting. Pure, so it is testable without VS Code.
  */
 export function eligibleModels(input: EligibleModelInput): EligibleModelSet {
   const entries = Object.entries(input.pool || {});
   const models: EligibleModel[] = [];
   const missing: string[] = [];
   let restricted = 0;
-  if (entries.length === 0) {
-    for (const model of input.available) {
-      models.push({ id: model.id, name: model.name });
+  for (const [id, policy] of entries) {
+    const model = input.available.find(candidate => candidate.id === id);
+    if (!model) {
+      missing.push(id);
+      continue;
     }
-  } else {
-    for (const [id, policy] of entries) {
-      const model = input.available.find(candidate => candidate.id === id);
-      if (!model) {
-        missing.push(id);
-        continue;
-      }
-      if (input.permission === 'workspace-write' && policy.allowWrite === false) {
-        restricted++;
-        continue;
-      }
-      models.push({ id: model.id, name: model.name, policy });
+    if (input.permission === 'workspace-write' && policy.allowWrite === false) {
+      restricted++;
+      continue;
     }
+    models.push({ id: model.id, name: model.name, policy });
   }
   const preferred = models.find(model => model.id === input.previous)?.id ?? models[0]?.id;
   return { models, preferred, guidance: models.length ? undefined : eligibilityGuidance(input, entries.length, missing, restricted) };
@@ -96,16 +94,32 @@ function eligibilityGuidance(input: EligibleModelInput, configured: number, miss
   if (!input.available.length) {
     return 'No worker models are enabled. Run Codex Subagent: Enable Model and choose a tool-capable model.';
   }
+  if (input.permission === 'workspace-write' && !configured) {
+    return 'No model is configured in codexSubagent.models, so workspace-write is unavailable. Run Codex Subagent: Enable Model (this adds the exact model ID to codexSubagent.models in User Settings) and leave allowWrite true (or omit it); note that an empty pool also leaves no model available for read-only work.';
+  }
   if (!configured) {
-    return 'No enabled worker model is available. Run Codex Subagent: Enable Model, then retry.';
+    return 'No worker model is enabled. Run Codex Subagent: Enable Model, which adds the exact model ID to codexSubagent.models in User Settings, then retry.';
   }
   if (missing.length && missing.length === configured) {
     return `None of the configured codexSubagent.models IDs is an enabled VS Code model (${missing.join(', ')}). Run Codex Subagent: Enable Model for an exact ID or correct codexSubagent.models in User Settings.`;
   }
   if (restricted) {
-    return `No configured model allows workspace-write. Set allowWrite: true for a configured model and enable codexSubagent.allowWrites, or start read-only work. Otherwise update codexSubagent.models in User Settings.`;
+    return `No configured model allows workspace-write. Set allowWrite: true (or omit it) for a configured model in codexSubagent.models, or start read-only work. Update the pool in User Settings.`;
   }
   return 'No eligible worker model is configured. Review codexSubagent.models in User Settings, then retry.';
+}
+
+/**
+ * Aggregate capability used only to decide whether FileTools should create and
+ * expose restricted tools. It deliberately treats an empty pool as no access;
+ * WorkerEngine still enforces the exact per-session model policy on every call.
+ * Shell is only available through a single policy that allows both write and
+ * shell, matching the workspace-write requirement.
+ */
+export function poolAllows(pool: Record<string, ModelPolicy>, field: 'allowWrite' | 'allowShell'): boolean {
+  return Object.values(pool).some(policy =>
+    policy.allowWrite !== false && (field === 'allowWrite' || policy.allowShell !== false)
+  );
 }
 
 export function effectiveSettings(base: Settings, modelId: string): Settings {
@@ -113,12 +127,11 @@ export function effectiveSettings(base: Settings, modelId: string): Settings {
   if (!entry) {
     return base;
   }
-  // Only present per-model fields override; omitted fields inherit the global settings.
-  // Permission flags are enforced separately by the workspace tools, not by Settings.
+  // Only present per-model fields override; omitted fields retain the engine's
+  // built-in/base runtime settings. Permission flags and numSessions (per-model
+  // scheduler capacity) are enforced directly against the pool by the engine,
+  // not through Settings.
   const overlay: Partial<Settings> = {};
-  if (entry.numSessions !== undefined) {
-    overlay.maxConcurrent = entry.numSessions;
-  }
   if (entry.maxToolRounds !== undefined) {
     overlay.maxToolRounds = entry.maxToolRounds;
   }

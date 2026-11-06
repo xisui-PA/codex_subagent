@@ -144,13 +144,51 @@ test('global write switch revoked while a write is queued leaves the file untouc
   assert.equal(await exists(path.join(env.root, 'b.txt')), false);
 });
 
-test('user-driven reverts pass no callback and still write after a revocation', async t => {
+// Model write policy gates inference and worker tool calls, never the user's
+// own undo of a recorded change. runtime.ts routes ui_revert through the
+// explicit FileTools.forUserRevert view; nothing else may obtain it.
+test('user-driven revert still applies after the model write policy is revoked', async t => {
   const env = await fixture(t, { deferFirstRecord: false });
   const session = { id: 'revert', model, permission: 'workspace-write' };
+  // Withdraw both the model write policy and the aggregate worker switch.
   env.state.settings.models[model.id] = { ...policy(), allowWrite: false };
-  // runtime.ts applies ui_revert changes through the same tools with no
-  // authorization callback; the fix must not block those user actions.
-  const result = await settle(env.files.execute('write_file', { path: 'restored.txt', content: 'before', expectedHash: 'new' }, 'workspace-write', signal(), session));
+  env.state.canWrite = false;
+  const tools = env.engine.toolsFor(session);
+  assert.ok(!tools.definitions('workspace-write').some(t => t.name === 'write_file'), 'worker write tools must be withdrawn');
+  // engine.toolsFor(...).execute rejects synchronously on the revoked policy.
+  const denied = await settle(Promise.resolve().then(() => tools.execute('write_file', { path: 'blocked.txt', content: 'x', expectedHash: 'new' }, 'workspace-write', signal(), session)));
+  assert.equal(denied.status, 'rejected');
+  assert.equal(denied.error.code, 'permission_denied');
+  assert.equal(await exists(path.join(env.root, 'blocked.txt')), false, 'the revoked worker must not write');
+  // The user's undo of the recorded change still works through the explicit view.
+  const result = await settle(env.files.forUserRevert(session).execute('write_file', { path: 'restored.txt', content: 'before', expectedHash: 'new' }, 'workspace-write', signal(), session));
   assert.equal(result.status, 'fulfilled', result.error && result.error.stack);
   assert.equal(await fs.readFile(path.join(env.root, 'restored.txt'), 'utf8'), 'before');
+  // The privileged view never grants shell.
+  const shellDenied = await settle(env.files.forUserRevert(session).execute('run_command', { command: 'printf x > shell.txt', path: '.' }, 'workspace-write', signal(), session));
+  assert.equal(shellDenied.status, 'rejected');
+  assert.equal(shellDenied.error.code, 'permission_denied');
+  assert.equal(await exists(path.join(env.root, 'shell.txt')), false, 'revert must never spawn a command');
+});
+
+test('the privileged revert view shares the worker write mutex and keeps hash preconditions', async t => {
+  // Fresh fixture with the default deferred checkpoint: an actual worker write
+  // parks inside its durable recordChange before the mutation is committed.
+  const env = await fixture(t);
+  const session = { id: 'revert-mutex', model, permission: 'workspace-write' };
+  const file = path.join(env.root, 'shared.txt');
+  const { createHash } = require('node:crypto');
+  await fs.writeFile(file, 'initial');
+  const initialHash = createHash('sha256').update('initial').digest('hex');
+  const parked = settle(env.files.execute('write_file', { path: 'shared.txt', content: 'worker replacement', expectedHash: initialHash }, 'workspace-write', signal(), session));
+  await env.recordStarted.promise; // parked before the mutation, holding the write mutex
+  const reverting = settle(env.files.forUserRevert(session).execute('write_file', { path: 'shared.txt', content: 'initial', expectedHash: initialHash }, 'workspace-write', signal(), session));
+  await sleep(50);
+  assert.equal(await fs.readFile(file, 'utf8'), 'initial', 'the queued revert must wait behind the parked write');
+  env.recordRelease.resolve();
+  const results = await Promise.all([parked, reverting]);
+  assert.equal(results[0].status, 'fulfilled');
+  assert.equal(results[1].status, 'rejected', 'the revert must not clobber the worker write it waited behind');
+  assert.equal(results[1].error.code, 'file_conflict', 'revocation isolation must not weaken stale-hash protection');
+  assert.equal(await fs.readFile(file, 'utf8'), 'worker replacement');
 });

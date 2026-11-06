@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
-import { Message, Model, Part, Provider, WorkerError } from './types';
+import { Message, Model, ModelPolicy, Part, Provider, WorkerError } from './types';
 import { abortable } from './async';
+import { Mutex } from './storage';
+import { parseModelSettings } from './model-settings';
 
 export function metadata(model: vscode.LanguageModelChat): Model {
   return { id: model.id, name: model.name, vendor: model.vendor, family: model.family, version: model.version, maxInputTokens: model.maxInputTokens };
@@ -37,31 +39,94 @@ function providerError(error: unknown): WorkerError {
 
 export class VscodeProvider implements Provider {
   constructor(private readonly context: vscode.ExtensionContext) {}
+  /**
+   * The user-level codexSubagent.models object is the sole enabled-model source:
+   * each key is an exact enabled model ID, in pool priority order. Workspace
+   * settings can never enable or expand models, so only the global (user) value
+   * is read. Malformed settings fail loudly rather than silently enabling models.
+   */
   enabled(): string[] {
-    return this.context.globalState.get<string[]>('enabledModels', []);
+    return Object.keys(parseModelSettings(vscode.workspace.getConfiguration('codexSubagent').inspect<unknown>('models')?.globalValue));
+  }
+  /**
+   * VS Code's inspect().globalValue is a locally mirrored snapshot: it can keep
+   * exposing the OLD pool while configuration.update() is still in flight (the
+   * mirror is only replaced when the host publishes the change), so a
+   * read-modify-write of the whole pool is only safe when the read AND the
+   * awaited write are serialized. This process-wide lock covers every pool
+   * mutator (the setting is shared across provider instances in one extension
+   * host); the latest pool is always read inside the critical section, never
+   * captured beforehand.
+   */
+  private static readonly settingsLock = new Mutex();
+  /** Latest user pool with its exact keys and values, for safe read-modify-write. */
+  private pool(): Record<string, ModelPolicy> {
+    return parseModelSettings(vscode.workspace.getConfiguration('codexSubagent').inspect<unknown>('models')?.globalValue);
+  }
+  private static ownKeys(pool: Record<string, ModelPolicy>): [string, ModelPolicy][] {
+    // Object.fromEntries/entries keep an exact ID such as '__proto__' as an own
+    // property, so prototype pollution cannot make a model look enabled.
+    return Object.entries(pool);
+  }
+  /** Queued read-modify-write of the whole user pool; caller-visible failures propagate. */
+  private mutatePool(mutate: (pool: Record<string, ModelPolicy>) => Record<string, ModelPolicy> | undefined): Promise<void> {
+    return VscodeProvider.settingsLock.run(async () => {
+      const next = mutate(this.pool());
+      if (next === undefined) {
+        return;
+      }
+      // Await the write so the next queued mutation reads the committed pool.
+      await vscode.workspace.getConfiguration('codexSubagent').update('models', Object.fromEntries(VscodeProvider.ownKeys(next)), vscode.ConfigurationTarget.Global);
+    });
   }
   async models(): Promise<Model[]> {
     const enabled = this.enabled();
-    return (await vscode.lm.selectChatModels()).filter(m => enabled.includes(m.id) && this.context.languageModelAccessInformation.canSendRequest(m) === true).map(metadata);
-  }
-  options(modelId: string): Record<string, unknown> {
-    const config = vscode.workspace.getConfiguration('codexSubagent');
-    const profiles = config.get<Record<string, Record<string, unknown>>>('modelProfiles', {});
-    return { ...config.get<Record<string, unknown>>('modelOptions', {}), ...(profiles[modelId] || {}) };
-  }
-  defaultModel(): string {
-    return vscode.workspace.getConfiguration('codexSubagent').get<string>('defaultModel') || this.context.globalState.get<string>('defaultModel', '');
-  }
-  async setDefault(id: string): Promise<void> {
-    await vscode.workspace.getConfiguration('codexSubagent').update('defaultModel', id, vscode.ConfigurationTarget.Global);
-    await this.context.globalState.update('defaultModel', id);
-  }
-  async disable(id: string): Promise<void> {
-    const remaining = this.enabled().filter(candidate => candidate !== id);
-    await this.context.globalState.update('enabledModels', remaining);
-    if (this.defaultModel() === id) {
-      await this.setDefault('');
+    const available = await vscode.lm.selectChatModels();
+    const models: Model[] = [];
+    for (const id of enabled) {
+      const found = available.filter(model => model.id === id);
+      if (found.length === 1 && this.context.languageModelAccessInformation.canSendRequest(found[0]!) === true) {
+        models.push(metadata(found[0]!));
+      }
     }
+    return models;
+  }
+  /**
+   * Provider request options come ONLY from the selected model's nested
+   * models.<id>.modelOptions in the user (global) pool. The old top-level
+   * modelProfiles/modelOptions settings were removed without fallback, so
+   * stale values there are simply ignored. Unconfigured/absent options yield {}.
+   */
+  options(modelId: string): Record<string, unknown> {
+    const pool = this.pool();
+    // Own-property lookup so an exact ID such as '__proto__' cannot inherit
+    // Object.prototype members as "options".
+    if (!Object.prototype.hasOwnProperty.call(pool, modelId)) {
+      return {};
+    }
+    return pool[modelId]?.modelOptions || {};
+  }
+  /**
+   * Update only one configured model's nested modelOptions. The latest user
+   * pool is read inside the serialized critical section, so settings changed
+   * meanwhile are preserved and a model disabled meanwhile is not resurrected;
+   * every other policy field, entry and pool order stays intact.
+   */
+  async setModelOptions(id: string, options: Record<string, unknown>): Promise<void> {
+    await this.mutatePool(pool => {
+      // Own-property lookup so an exact ID such as '__proto__' is checked exactly.
+      if (!Object.prototype.hasOwnProperty.call(pool, id)) {
+        throw new WorkerError('model_not_configured', `${id} is no longer configured in codexSubagent.models. Re-enable it before setting its model options.`);
+      }
+      return { ...pool, [id]: { ...pool[id], modelOptions: options } };
+    });
+  }
+  /** Remove exactly one configured model key, preserving every other entry, value and order. */
+  async disable(id: string): Promise<void> {
+    await this.mutatePool(pool => {
+      const entries = VscodeProvider.ownKeys(pool).filter(([candidate]) => candidate !== id);
+      return Object.fromEntries(entries);
+    });
   }
   private async resolve(model: Model): Promise<vscode.LanguageModelChat> {
     if (!vscode.workspace.isTrusted) {
@@ -73,6 +138,12 @@ export class VscodeProvider implements Provider {
     const selected = (await vscode.lm.selectChatModels({ id: model.id }))[0];
     if (!selected || selected.vendor !== model.vendor || selected.version !== model.version) {
       throw new WorkerError('model_unavailable', 'The configured model changed. Re-enable it and explicitly resume the worker.');
+    }
+    // Recheck the enabled setting AFTER the async selection: the user may have
+    // removed the model (or the whole pool) while selectChatModels was pending.
+    // This runs synchronously before sendRequest/countTokens in every caller.
+    if (!this.enabled().includes(model.id)) {
+      throw new WorkerError('model_permission', 'This model was removed from codexSubagent.models while its request was preparing. Re-enable it or resume with another model.');
     }
     if (this.context.languageModelAccessInformation.canSendRequest(selected) !== true) {
       throw new WorkerError('model_permission', 'Model consent is missing or unknown. Run Codex Subagent: Enable Model in this window.');
@@ -194,11 +265,27 @@ export class VscodeProvider implements Provider {
         if (this.context.languageModelAccessInformation.canSendRequest(choice.model) !== true) {
           throw new WorkerError('model_permission', 'The provider answered, but VS Code did not report persistent model access. Check language model access permissions for this extension.');
         }
-        await this.context.globalState.update('enabledModels', [...new Set([...this.enabled(), choice.model.id])]);
-        if (!this.defaultModel()) {
-          await this.setDefault(choice.model.id);
-        }
-        void vscode.window.showInformationMessage(`${choice.model.name} passed tool calling and tool-result replay. ${this.defaultModel() === choice.model.id ? 'It is the default worker model.' : 'Your existing default is unchanged.'}`);
+        // Persist only after every check passed. The probe/consent above stays
+        // outside the settings lock; only the commit is queued, and it re-reads
+        // the latest pool inside the critical section so unrelated settings
+        // edits made while the probe ran are preserved, existing keys/values/
+        // order are untouched, and the new exact ID is appended with an empty
+        // policy (built-in defaults) only when absent. The queued commit is
+        // re-checked against cancellation, so cancelling the progress
+        // notification while it waits behind another settings write never
+        // persists the model.
+        let added = false;
+        await this.mutatePool(pool => {
+          controller.signal.throwIfAborted();
+          if (Object.prototype.hasOwnProperty.call(pool, choice.model.id)) {
+            return undefined;
+          }
+          added = true;
+          return { ...pool, [choice.model.id]: {} };
+        });
+        void vscode.window.showInformationMessage(added
+          ? `${choice.model.name} passed tool calling and tool-result replay. Added to codexSubagent.models in User Settings.`
+          : `${choice.model.name} passed tool calling and tool-result replay. It is already configured in codexSubagent.models; its policy was left unchanged.`);
       } finally {
         clearTimeout(timer); subscription.dispose(); source.cancel(); source.dispose();
       }

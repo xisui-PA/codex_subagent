@@ -11,7 +11,7 @@ import { defaults } from './engine';
 import { exportTranscript } from './exporter';
 import { applyEditorChange, openText } from './editor';
 import { WorkerPanel, PanelMessage } from './panel';
-import { eligibleModels, parseModelSettings } from './model-settings';
+import { eligibleModels, parseModelSettings, poolAllows } from './model-settings';
 import { prepareRuntime, register, repairRegistration } from './registration';
 import { WorkerBroker, unpack } from './runtime';
 import { Mutex } from './storage';
@@ -106,6 +106,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
   };
   // Only user-level (global) settings are honored for pool routing/permissions.
   const modelPool = (): Record<string, ModelPolicy> => parseModelSettings(vscode.workspace.getConfiguration('codexSubagent').inspect<unknown>('models')?.globalValue);
+  const configuredPool = (): Record<string, ModelPolicy> => {
+    try {
+      return modelPool();
+    } catch {
+      return {};
+    }
+  };
+  const configuredPoolAllows = (field: 'allowWrite' | 'allowShell'): boolean => poolAllows(configuredPool(), field);
   const refresh = async (): Promise<void> => {
     if (!broker || refreshing || !alive) {
       return;
@@ -188,18 +196,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     try {
       const realRoots = await Promise.all(roots().map(root => fs.realpath(root)));
       const identity = vscode.workspace.workspaceFile ? `workspace:${vscode.workspace.workspaceFile.toString()}` : `folder:${realRoots[0]}`;
-      const userBoolean = (name: string): boolean => vscode.workspace.getConfiguration('codexSubagent').inspect<boolean>(name)?.globalValue === true;
       const next = new WorkerBroker({
         storage: context.globalStorageUri.fsPath, registry, roots: realRoots, identity, provider,
-        settings: () => {
-          const c = vscode.workspace.getConfiguration('codexSubagent');
-          const integer = (name: string, fallback: number, min: number, max: number): number => {
-            const value = c.get<unknown>(name, fallback); return typeof value === 'number' && Number.isInteger(value) ? Math.min(max, Math.max(min, value)) : fallback;
-          };
-          return { ...defaults, maxConcurrent: integer('maxConcurrentWorkers', 2, 1, 8), maxToolRounds: integer('maxToolRounds', 40, 1, 200), turnTimeoutMs: integer('turnTimeoutSeconds', 600, 10, 3600) * 1000, autoCompact: c.get('autoCompact', true), models: parseModelSettings(c.inspect<unknown>('models')?.globalValue) };
-        }, defaultModel: () => provider.defaultModel(),
+        settings: () => ({
+          ...defaults,
+          models: parseModelSettings(vscode.workspace.getConfiguration('codexSubagent').inspect<unknown>('models')?.globalValue)
+        }),
         files: {
-          canWrite: () => userBoolean('allowWrites'), allowShell: () => userBoolean('allowShell'),
+          // No global write/shell switches remain. FileTools receives tools when
+          // at least one configured model policy allows them; engine wrappers and
+          // per-session live checks make the exact model policy authoritative.
+          canWrite: () => configuredPoolAllows('allowWrite'),
+          allowShell: () => configuredPoolAllows('allowShell'),
           readOpenText: file => openText(file)?.getText(), applyChange: applyEditorChange,
           approveCommand: async (text, cwd, signal, workspaceRoot) => approvals.request(text, cwd, signal, workspaceRoot)
         }, onChange: () => {
@@ -265,41 +273,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
   command('enableModel', async () => {
     await provider.enable(); broker?.settingsChanged(); await refresh();
   });
-  command('setDefaultModel', async () => {
-    const models = await provider.models();
-    const picked = await vscode.window.showQuickPick(models.map(model => ({ label: model.name, detail: model.id, model })), { title: 'Default worker model' });
-    if (picked) {
-      await provider.setDefault(picked.model.id); void vscode.window.showInformationMessage(`Default worker model: ${picked.model.name}`);
-    }
-  });
   command('disableModel', async () => {
-    const id = await vscode.window.showQuickPick(provider.enabled(), { title: 'Disable a worker model' }); if (id) {
-      const wasDefault = provider.defaultModel() === id;
+    // provider.enabled() returns every configured models-setting key, even IDs
+    // currently unavailable in VS Code, so disabling removes just that entry.
+    const id = await vscode.window.showQuickPick(provider.enabled(), { title: 'Disable a worker model (removes it from codexSubagent.models)' }); if (id) {
       await provider.disable(id);
       broker?.settingsChanged();
-      if (wasDefault && (await provider.models()).length) {
-        await vscode.commands.executeCommand('codexSubagent.setDefaultModel');
-      }
       await refresh();
     }
   });
   command('configureModel', async () => {
-    const models = await vscode.lm.selectChatModels();
-    const choice = await vscode.window.showQuickPick(models.map(model => ({ label: model.name, detail: model.id, model })), { title: 'Model options profile' });
-    if (!choice) {
+    // Offer only configured model IDs (provider.enabled()), including IDs
+    // currently unavailable in VS Code; an unconfigured model has no options
+    // entry and enabling it is a separate command.
+    const ids = provider.enabled();
+    if (!ids.length) {
+      void vscode.window.showInformationMessage('No worker model is configured. Run Codex Subagent: Enable Model first; model options live at codexSubagent.models.<model-id>.modelOptions.');
       return;
     }
-    const c = vscode.workspace.getConfiguration('codexSubagent');
-    const profiles = c.get<Record<string, Record<string, unknown>>>('modelProfiles', {});
-    const value = await vscode.window.showInputBox({ title: `Options for ${choice.model.name}`, value: JSON.stringify(profiles[choice.model.id] || {}), prompt: 'JSON object of provider-specific options; do not include credentials.', validateInput: text => {
+    const id = await vscode.window.showQuickPick(ids, { title: 'Choose a configured model to edit its provider options' });
+    if (!id) {
+      return;
+    }
+    const value = await vscode.window.showInputBox({ title: `Model options for ${id}`, value: JSON.stringify(provider.options(id)), prompt: 'JSON object of provider-specific options passed to sendRequest; do not include credentials.', validateInput: text => {
       try {
-        const value: unknown = JSON.parse(text); return value && typeof value === 'object' && !Array.isArray(value) ? null : 'Enter a JSON object.';
+        const parsed: unknown = JSON.parse(text); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? null : 'Enter a JSON object.';
       } catch {
         return 'Enter valid JSON.';
       }
     } });
     if (value !== undefined) {
-      await c.update('modelProfiles', { ...profiles, [choice.model.id]: JSON.parse(value) as Record<string, unknown> }, vscode.ConfigurationTarget.Global);
+      // setModelOptions re-reads the latest user pool, so settings changed
+      // while the dialog awaited are preserved and a model disabled meanwhile
+      // is not resurrected.
+      try {
+        await provider.setModelOptions(id, JSON.parse(value) as Record<string, unknown>);
+        broker?.settingsChanged();
+        await refresh();
+      } catch (error) {
+        report(error);
+      }
     }
   });
   const registerMcp = async (): Promise<void> => {
@@ -343,9 +356,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     await register(configPath(), process.execPath, relay, registry, true); void vscode.window.showInformationMessage('MCP unregistered. Run Developer: Reload Window to disconnect. Saved workers remain available.');
   });
   command('diagnostics', async () => {
+    // Parse the strict models setting exactly once: a malformed pool must not
+    // break Diagnostics; it is reported in the JSON instead.
+    let pool: Record<string, ModelPolicy> | undefined;
+    let poolError: string | undefined;
+    try {
+      pool = modelPool();
+    } catch (error) {
+      poolError = failure(error).message;
+    }
+    const enabled = Object.keys(pool || {});
     let models: unknown = [];
     try {
-      models = (await vscode.lm.selectChatModels()).map(m => ({ id: m.id, name: m.name, vendor: m.vendor, enabled: provider.enabled().includes(m.id), access: context.languageModelAccessInformation.canSendRequest(m) ?? 'unknown' }));
+      models = (await vscode.lm.selectChatModels()).map(m => ({ id: m.id, name: m.name, vendor: m.vendor, enabled: enabled.includes(m.id), access: context.languageModelAccessInformation.canSendRequest(m) ?? 'unknown' }));
     } catch (error) {
       models = { error: failure(error) };
     }
@@ -357,7 +380,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     } catch (error) {
       health = { error: failure(error) };
     }
-    const content = JSON.stringify({ startupError: startupError || null, workspaceRoots: roots(), storage: context.globalStorageUri.fsPath, codexConfig: configPath(), relay, defaultModel: provider.defaultModel(), models, health, instructions: mcpInstructions }, null, 2);
+    const content = JSON.stringify({ startupError: startupError || null, workspaceRoots: roots(), storage: context.globalStorageUri.fsPath, codexConfig: configPath(), relay, poolError, enabledModels: enabled, pool: pool ?? null, models, health, instructions: mcpInstructions }, null, 2);
     await vscode.window.showTextDocument(await vscode.workspace.openTextDocument({ content, language: 'json' }));
   });
   command('newWorker', async () => {
@@ -384,9 +407,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
       void vscode.window.showWarningMessage(eligible.guidance || 'No eligible worker model is available.');
       return;
     }
-    const poolActive = Object.keys(pool).length > 0;
     const byId = new Map(models.map(m => [m.id, m]));
-    const choices: { label: string; detail: string; model?: Model }[] = [{ label: 'Automatic', detail: poolActive ? 'first eligible configured model with a free session' : 'enabled default model' }];
+    const choices: { label: string; detail: string; model?: Model }[] = [{ label: 'Automatic', detail: 'first eligible configured model with a free session (pool order is priority)' }];
     for (const entry of eligible.models) {
       choices.push({ label: entry.name, detail: entry.id + (entry.policy ? ' · ' + String(entry.policy.numSessions ?? 1) + ' active session(s)' : ''), model: byId.get(entry.id)! });
     }

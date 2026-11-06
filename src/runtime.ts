@@ -12,7 +12,7 @@ import { contains, prepareWorkspaces, registeredWorktrees, rememberWorkspaceRoot
 
 export interface RuntimeOptions {
   storage: string; registry: string; roots: string[]; identity: string; provider: Provider;
-  settings: () => Settings; defaultModel: () => string; files: FileToolOptions;
+  settings: () => Settings; files: FileToolOptions;
   onChange: () => void; onError: (message: string) => void;
 }
 interface Local { root: string; roots: string[]; store: SessionStore; engine: WorkerEngine; files: FileTools; host: BridgeHost }
@@ -158,7 +158,7 @@ export class WorkerBroker {
       }).catch(async error => {
         await store.close(); throw error;
       });
-      const engine = new WorkerEngine(store, this.options.provider, files, this.options.settings, this.options.defaultModel);
+      const engine = new WorkerEngine(store, this.options.provider, files, this.options.settings);
       engine.onChange = this.options.onChange;
       engine.onError = (id, error) => this.options.onError(`${id}: ${failure(error).message}`);
       const host = new BridgeHost();
@@ -281,7 +281,11 @@ export class WorkerBroker {
         return respond(await engine.edit(a.id, async (s, signal) => {
           const c = await store.readChange(a.id, a.changeId);
           const hash = (text: string): string => digestText(text);
-          const scoped = files.forSession(s);
+          // Explicit trusted user-revert view: model write policy must not block
+          // undoing a recorded worker change, while every other check (hashes,
+          // protected paths, symlinks, dirty buffers, snapshots, undo, drains)
+          // and the shared write mutex remain exactly as for worker writes.
+          const scoped = files.forUserRevert(s);
           if (c.kind === 'rename') {
             await scoped.execute('rename_file', { path: c.target!, target: c.path, expectedHash: hash(c.after!) }, s.permission, signal, s);
           } else if (c.before === null) {
@@ -363,7 +367,7 @@ export class WorkerBroker {
       }
       const store = new SessionStore(await workspaceDirectory(this.options.storage, root));
       await store.open();
-      const engine = new WorkerEngine(store, this.options.provider, await FileTools.create([], this.options.files), this.options.settings, this.options.defaultModel);
+      const engine = new WorkerEngine(store, this.options.provider, await FileTools.create([], this.options.files), this.options.settings);
       try {
         if (name === 'ui_session' || name === 'ui_change') {
           const a = z.object({ id: identifier, changeId: changeIdentifier.optional() }).strict().parse(args);

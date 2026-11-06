@@ -26,7 +26,7 @@ async function legacy(t) {
   await fs.writeFile(path.join(directory, 'workspace.json'), JSON.stringify({ identity, roots: [root, other] }));
   const options = { storage, registry: path.join(storage, 'bridges'), roots: [root, other], identity,
     provider: { models: async () => [model], countTokens: async () => 10, async *stream() { yield { type: 'text', text: 'new answer' }; } },
-    settings: () => defaults, defaultModel: () => model.id, files: { canWrite: () => false, allowShell: () => false }, onChange() {}, onError() {} };
+    settings: () => ({ ...defaults, models: { [model.id]: {} } }), files: { canWrite: () => false, allowShell: () => false }, onChange() {}, onError() {} };
   return { root, other, a, b, change, storage, identity, directory, options };
 }
 

@@ -27,7 +27,14 @@ async function fixture(t, options = {}) {
     ...options.provider,
   };
   const tools = options.tools || { definitions: () => [], execute: async () => 'ok' };
-  const engine = new WorkerEngine(store, provider, tools, options.settingsFn || (() => ({ ...defaults, autoCompact: false, retries: 0, ...options.settings })), () => model.id);
+  // The model pool is always authoritative: fixtures configure explicit models
+  // with explicit per-model capacity. options.settings.models overrides ({} for
+  // an empty pool) so pool-behaviour tests can construct their own policies.
+  const settings = () => ({
+    ...defaults, autoCompact: false, retries: 0, ...options.settings,
+    models: options.settings?.models ?? { 'byok/qwen': { numSessions: 2 }, other: { numSessions: 2 } }
+  });
+  const engine = new WorkerEngine(store, provider, tools, options.settingsFn || settings);
   t.after(async () => { await engine.shutdown(); await store.close(); await fs.rm(root, { recursive: true, force: true }); });
   return { root, store, engine, provider, requests };
 }

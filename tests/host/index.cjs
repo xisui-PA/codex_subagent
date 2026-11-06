@@ -23,8 +23,9 @@ exports.run = async () => {
     const health = JSON.parse((await api.invoke('subagent_health', {})).content[0].text);
     assert.equal(health.ready, true); assert.ok(health.capabilities.includes('read_file'));
     assert.ok(!health.capabilities.includes('write_file'));
-    await vscode.workspace.getConfiguration('codexSubagent').update('allowWrites', true, vscode.ConfigurationTarget.Global);
+    await vscode.workspace.getConfiguration('codexSubagent').update('models', { fake: { allowWrite: true } }, vscode.ConfigurationTarget.Global);
     assert.ok(JSON.parse((await api.invoke('subagent_health', {})).content[0].text).capabilities.includes('write_file'));
+    await vscode.workspace.getConfiguration('codexSubagent').update('models', {}, vscode.ConfigurationTarget.Global);
     await vscode.commands.executeCommand('codexSubagent.register');
     const config = await fs.readFile(path.join(process.env.CODEX_HOME, 'config.toml'), 'utf8');
     assert.ok(config.includes('mcp_servers.codex_subagent'));
@@ -152,7 +153,7 @@ exports.run = async () => {
       provider: { models: async () => [fake], countTokens: async () => 10, async *stream(_model, messages) {
         if (messages.at(-1).parts[0].type === 'result') { yield { type: 'text', text: 'done' }; }
         else { yield { type: 'call', id: 'write', name: 'write_file', input: { path: 'saved.txt', content: 'worker text', expectedHash: hash('initial') } }; }
-      } }, settings: () => defaults, defaultModel: () => fake.id,
+      } }, settings: () => ({ ...defaults, models: { [fake.id]: { allowWrite: true, numSessions: 1 } } }),
       files: { canWrite: () => true, allowShell: () => false, readOpenText: file => openText(file)?.getText(), applyChange: applyEditorChange }, onChange() {}, onError() {} });
     try {
       await broker.start();

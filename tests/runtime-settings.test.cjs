@@ -30,7 +30,7 @@ async function fixture(t) {
       models: async () => [model], countTokens: async () => 10,
       async *stream(selected, messages) { requests.push({ model: selected, messages }); await gate.promise; yield { type: 'text', text: 'done' }; }
     },
-    settings, defaultModel: () => model.id,
+    settings,
     files: { canWrite: () => true, allowShell: () => false },
     onChange() {}, onError(message) { errors.push(message); }
   };

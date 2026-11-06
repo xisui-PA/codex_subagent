@@ -60,6 +60,21 @@ export class FileTools implements WorkspaceTools {
     scoped.writes = this.writes;
     return scoped;
   }
+  /**
+   * Explicit privileged view used ONLY for a user-initiated Revert of an
+   * already-recorded worker change. Model write policy gates inference and
+   * worker tool calls, never the user's own undo, so this view ignores the
+   * aggregate write switch while keeping every other protection: it reuses the
+   * same roots, write mutex, editor/checkDocument/applyChange and change
+   * snapshot callbacks, hash preconditions, protected paths and symlink checks.
+   * It never grants shell. Never hand this view to inference or tool dispatch.
+   */
+  forUserRevert(session: Session): FileTools {
+    const scoped = this.forSession(session);
+    const revert = new FileTools(scoped.roots, { ...this.options, canWrite: () => true, allowShell: () => false });
+    revert.writes = this.writes;
+    return revert;
+  }
   static async create(roots: string[], options: FileToolOptions): Promise<FileTools> {
     return new FileTools(await Promise.all(roots.map(root => fs.realpath(root))), options);
   }
@@ -125,9 +140,12 @@ export class FileTools implements WorkspaceTools {
     }
     return new TextDecoder('utf-8', { fatal: true }).decode(data);
   }
-  // Recheck the global write switch and the caller's latest policy after any
-  // wait. Only the engine supplies the sixth argument; user-driven reverts and
-  // direct callers omit it, so for them just the global switch applies.
+  // Recheck the effective aggregate write capability and the caller's latest
+  // policy after any wait. Only the engine supplies the sixth argument. Trusted
+  // user reverts run through the explicit forUserRevert view, whose canWrite
+  // override already isolates them from model policy; every other caller,
+  // including direct worker callers that omit the callback, stays gated by the
+  // aggregate switch.
   private confirmWrite(authorize?: () => void): void {
     if (!this.options.canWrite()) {
       throw new WorkerError('permission_denied', 'Workspace writes are disabled.');
@@ -307,8 +325,8 @@ export class FileTools implements WorkspaceTools {
       if (!approved) {
         throw new WorkerError('command_denied', 'User declined the command.');
       }
-      // The dialog can stay open indefinitely. Recheck the global switch and
-      // the caller's latest policy immediately before spawning, so a
+      // The dialog can stay open indefinitely. Recheck the effective policy and
+      // the caller's latest model policy immediately before spawning, so a
       // revocation made while it was open still blocks the command.
       this.confirmShell(authorize);
       return this.command(args.command, cwd, args.timeoutMs, signal);

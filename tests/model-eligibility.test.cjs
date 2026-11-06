@@ -20,9 +20,11 @@ test('eligible models follow exact configured pool order and drop unconfigured o
   assert.equal(readOnly.guidance, undefined);
   assert.deepEqual(readOnly.models[0].policy, { allowWrite: true, numSessions: 2 });
 
-  // Legacy empty pool keeps the enabled order; nothing configured is required.
-  assert.deepEqual(eligibleModels({ permission: 'workspace-write', available, pool: {} }).models.map(model => model.id), ['model/c', 'model/a', 'model/b']);
-  assert.deepEqual(eligibleModels({ permission: 'read-only', available }).models.map(model => model.id), ['model/c', 'model/a', 'model/b']);
+  // The pool keys are the enabled models, so an empty pool offers nothing for
+  // ANY permission (no read-only fallback).
+  assert.deepEqual(eligibleModels({ permission: 'workspace-write', available, pool: {} }).models, []);
+  assert.deepEqual(eligibleModels({ permission: 'read-only', available, pool: {} }).models, []);
+  assert.deepEqual(eligibleModels({ permission: 'read-only', available }).models, []);
 });
 
 test('workspace-write sessions exclude allowWrite:false entries but read-only keeps them', () => {
@@ -60,4 +62,8 @@ test('empty eligibility always returns actionable guidance', () => {
 
   const legacyEmpty = eligibleModels({ permission: 'workspace-write', available: [], pool: { 'model/b': {} } });
   assert.match(legacyEmpty.guidance, /Enable Model/);
+
+  const emptyPoolWrite = eligibleModels({ permission: 'workspace-write', available, pool: {} });
+  assert.match(emptyPoolWrite.guidance, /codexSubagent\.models/);
+  assert.match(emptyPoolWrite.guidance, /read-only/);
 });

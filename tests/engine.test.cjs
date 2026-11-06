@@ -6,7 +6,7 @@ const { WorkerEngine, defaults } = require('../.test-build/engine');
 const { SessionStore } = require('../.test-build/storage');
 const { WorkerError } = require('../.test-build/types');
 const { invoke } = require('../.test-build/api');
-const { model, deferred, until, fixture, finished } = require('./helpers.cjs');
+const { deferred, until, fixture, finished } = require('./helpers.cjs');
 const spawn = (engine, requestId = 'spawn', task = 'Investigate', extra = {}) => engine.spawn({ requestId, task, permission: 'read-only', ...extra });
 
 test('spawn is durably idempotent and conflicting reuse is rejected', async t => {
@@ -39,7 +39,7 @@ test('follow-ups queue behind active work and preserve conversation order', asyn
 
 test('concurrency limit queues workers and queued cancellation does not run', async t => {
   const gate = deferred();
-  const { engine, requests } = await fixture(t, { settings: { maxConcurrent: 1 }, async *stream() { await gate.promise; yield { type: 'text', text: 'ok' }; } });
+  const { engine, requests } = await fixture(t, { settings: { models: { 'byok/qwen': { numSessions: 1 } } }, async *stream() { await gate.promise; yield { type: 'text', text: 'ok' }; } });
   const a = await spawn(engine, 'a');
   const b = await spawn(engine, 'b');
   await until(() => requests.length === 1);
@@ -85,7 +85,7 @@ test('reload preserves sessions and seals uncertain tool results without replay'
     assert.ok(messages.some(m => m.parts.some(p => p.type === 'result' && /Outcome may be unknown/.test(p.text))));
     yield { type: 'text', text: 'Inspected and recovered' };
   };
-  const resumed = new WorkerEngine(reopened, provider, { definitions: () => [], execute: async () => { executions++; return 'unexpected'; } }, () => defaults, () => model.id);
+  const resumed = new WorkerEngine(reopened, provider, { definitions: () => [], execute: async () => { executions++; return 'unexpected'; } }, () => ({ ...defaults, models: { 'byok/qwen': {} } }));
   t.after(async () => { await resumed.shutdown(); await reopened.close(); });
   await resumed.resume(worker.id, 'resume');
   await resumed.resume(worker.id, 'resume');
@@ -375,7 +375,7 @@ test('cancelling a pending shell approval never waits for or executes a late app
 
 test('cancellation during queued-job promotion becomes terminal without scheduling empty jobs', async t => {
   const gate = deferred();
-  const { engine, store, requests } = await fixture(t, { settings: { maxConcurrent: 1 }, async *stream(_m, _h, _t, _s, n) {
+  const { engine, store, requests } = await fixture(t, { settings: { models: { 'byok/qwen': { numSessions: 1 } } }, async *stream(_m, _h, _t, _s, n) {
     if (n === 1) { await gate.promise; } yield { type: 'text', text: 'done' };
   } });
   const a = await spawn(engine, 'occupies-slot'); await until(() => requests.length === 1);

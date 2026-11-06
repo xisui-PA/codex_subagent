@@ -9,6 +9,7 @@ const { WorkerBroker, unpack } = require('../.test-build/runtime');
 const { forward } = require('../.test-build/bridge');
 const { defaults } = require('../.test-build/engine');
 const { model, until } = require('./helpers.cjs');
+const { poolAllows } = require('../.test-build/model-settings');
 const git = promisify(execFile);
 
 async function fixture(t, stream) {
@@ -17,7 +18,7 @@ async function fixture(t, stream) {
   const options = {
     storage: path.join(temporary, 'storage'), registry: path.join(temporary, 'registry'), roots: [root], identity: `folder:${root}`,
     provider: { models: async () => [model], countTokens: async () => 10, stream: stream || (async function* () { yield { type: 'text', text: 'done' }; }) },
-    settings: () => ({ ...defaults, autoCompact: false }), defaultModel: () => model.id,
+    settings: () => ({ ...defaults, autoCompact: false, models: { [model.id]: { allowWrite: true, numSessions: 2 } } }),
     files: { canWrite: () => true, allowShell: () => false }, onChange() {}, onError() {}
   };
   const brokers = [];
@@ -95,6 +96,79 @@ test('change snapshots can be reviewed/reverted and refuse stale-file overwrites
   await fs.writeFile(path.join(root, 'new.txt'), 'worker content');
   assert.ok(unpack(await broker.invoke(root, 'ui_revert', { id: s.id, changeId: s.changes[0].id })).reverted);
   await assert.rejects(fs.stat(path.join(root, 'new.txt')), { code: 'ENOENT' });
+});
+
+// Model write policy gates worker inference/tools, never the user's Revert of a
+// recorded change. These exercise WorkerBroker.ui_revert with the same
+// pool-driven canWrite/allowShell callbacks src/extension.ts wires today.
+test('user Revert survives allowWrite revocation while worker writes stay denied', async t => {
+  const { randomUUID } = require('node:crypto');
+  const models = { [model.id]: { allowWrite: true, numSessions: 2 } };
+  const { root, create } = await fixture(t);
+  const broker = await create({
+    settings: () => ({ ...defaults, autoCompact: false, models }),
+    files: { canWrite: () => poolAllows(models, 'allowWrite'), allowShell: () => poolAllows(models, 'allowShell') },
+  });
+  const worker = unpack(await broker.invoke(root, 'subagent_spawn', { requestId: 'snapshot', task: 'Task', permission: 'workspace-write' }));
+  await done(broker, root, worker.id);
+  const file = path.join(root, 'revoked.txt');
+  await fs.writeFile(file, 'worker edit');
+  const change = { id: randomUUID(), path: file, kind: 'write', before: 'original', after: 'worker edit', state: 'applied', createdAt: new Date().toISOString() };
+  await broker.local.get(root).store.recordChange(worker.id, change);
+  assert.ok((await broker.invoke(root, 'subagent_health', {})).content[0].text.includes('write_file'), 'writable model exposes worker write tools');
+
+  // The user restricts the only writable model in codexSubagent.models.
+  models[model.id] = { ...models[model.id], allowWrite: false };
+  assert.ok(!(await broker.invoke(root, 'subagent_health', {})).content[0].text.includes('write_file'), 'worker write tools must be withdrawn');
+  assert.ok((await broker.invoke(root, 'subagent_spawn', { requestId: 'later-write', task: 'more edits', permission: 'workspace-write' })).isError, 'no workspace-write worker without a writable model');
+  // The privileged revert still enforces the recorded after-image hash.
+  await fs.writeFile(file, 'user edited elsewhere');
+  assert.ok((await broker.invoke(root, 'ui_revert', { id: worker.id, changeId: change.id })).isError, 'revocation must not bypass stale-hash protection');
+  assert.equal(await fs.readFile(file, 'utf8'), 'user edited elsewhere');
+  await fs.writeFile(file, 'worker edit');
+  assert.equal(unpack(await broker.invoke(root, 'ui_revert', { id: worker.id, changeId: change.id })).reverted, true, 'user undo must still work');
+  assert.equal(await fs.readFile(file, 'utf8'), 'original');
+});
+
+test('user Revert survives the last model leaving the pool and invalid model settings', async t => {
+  const { randomUUID } = require('node:crypto');
+  let models = { [model.id]: { allowWrite: true, numSessions: 2 } };
+  let settingsBroken = false;
+  // Mirrors src/extension.ts: strict pool parse for engine settings, aggregate
+  // poolAllows for the FileTools switches, malformed settings => no access.
+  const { parseModelSettings } = require('../.test-build/model-settings');
+  const brokerFiles = {
+    canWrite: () => { try { return poolAllows(parseModelSettings(models), 'allowWrite'); } catch { return false; } },
+    allowShell: () => { try { return poolAllows(parseModelSettings(models), 'allowShell'); } catch { return false; } },
+  };
+  const { root, create } = await fixture(t);
+  const broker = await create({
+    settings: () => ({ ...defaults, autoCompact: false, models: parseModelSettings(settingsBroken ? 'invalid' : models) }),
+    files: brokerFiles,
+  });
+  const worker = unpack(await broker.invoke(root, 'subagent_spawn', { requestId: 'snapshot', task: 'Task', permission: 'workspace-write' }));
+  await done(broker, root, worker.id);
+  const file = path.join(root, 'undo.txt');
+
+  // The last enabled model is removed: nothing is enabled for ANY permission.
+  models = {};
+  assert.ok((await broker.invoke(root, 'subagent_spawn', { requestId: 'no-pool', task: 'read', permission: 'read-only' })).isError, 'no worker may run with an empty pool');
+  assert.ok(!(await broker.invoke(root, 'subagent_health', {})).content[0].text.includes('write_file'), 'worker write tools must be withdrawn');
+  await fs.writeFile(file, 'worker edit');
+  const change = { id: randomUUID(), path: file, kind: 'write', before: 'original', after: 'worker edit', state: 'applied', createdAt: new Date().toISOString() };
+  await broker.local.get(root).store.recordChange(worker.id, change);
+  assert.equal(unpack(await broker.invoke(root, 'ui_revert', { id: worker.id, changeId: change.id })).reverted, true, 'user undo must work with an empty pool');
+  assert.equal(await fs.readFile(file, 'utf8'), 'original');
+
+  // Malformed user models setting: the aggregate switch reports no access and
+  // the engine settings callback throws; the recorded change is still revertible.
+  await fs.writeFile(file, 'second worker edit');
+  settingsBroken = true;
+  const second = { id: randomUUID(), path: file, kind: 'delete', before: 'second worker edit', after: null, state: 'applied', createdAt: new Date().toISOString() };
+  await broker.local.get(root).store.recordChange(worker.id, second);
+  await fs.unlink(file);
+  assert.equal(unpack(await broker.invoke(root, 'ui_revert', { id: worker.id, changeId: second.id })).reverted, true, 'user undo must work with malformed settings');
+  assert.equal(await fs.readFile(file, 'utf8'), 'second worker edit', 'reverting a recorded delete restores the file');
 });
 
 test('explicit and nested worktree roots are honored from a main-checkout MCP client', async t => {
