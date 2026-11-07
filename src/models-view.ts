@@ -94,12 +94,12 @@ export class ModelsTree implements vscode.TreeDataProvider<ModelNode> {
     const item = new vscode.TreeItem(node.kind === 'model' ? node.name : node.kind === 'status' ? node.text : node.kind === 'field' ? node.field.label : node.key);
     if (node.kind === 'model') {
       item.id = `model:${node.id}`;
-      item.collapsibleState = vscode.TreeItemCollapsibleState.Expanded;
+      item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
       item.contextValue = 'modelEntry';
       // The display label is the VS Code model name; the exact configured ID
       // stays the stable identity and command argument, shown in the tooltip.
       item.tooltip = `Enabled worker model (exact ID)\n${node.id}`;
-      item.iconPath = new vscode.ThemeIcon('brain');
+      item.iconPath = new vscode.ThemeIcon('hubot');
       item.command = { command: 'codexSubagent.configureModel', title: 'Configure Model Options', arguments: [node.id] };
     } else if (node.kind === 'field') {
       item.id = `field:${node.modelId}:${node.field.key}`;
