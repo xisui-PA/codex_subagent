@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { parseModelSettings } from './model-settings';
 import { ModelPolicy } from './types';
+import { UserModelSettings, userModelSettings } from './user-model-settings';
 
 /**
  * Snapshot of the strict, global (User) codexSubagent.models pool as displayed
@@ -73,10 +74,42 @@ function optionValue(value: unknown): string {
  * trusted filesystem workspace. A malformed pool is surfaced as a visible
  * error with recovery access instead of failing activation.
  */
-export class ModelsTree implements vscode.TreeDataProvider<ModelNode> {
+export class ModelsTree implements vscode.TreeDataProvider<ModelNode>, vscode.TreeDragAndDropController<ModelNode> {
+  private static readonly mimeType = 'application/vnd.code.tree.codexsubagent.models';
+  readonly dragMimeTypes = [ModelsTree.mimeType];
+  readonly dropMimeTypes = [ModelsTree.mimeType];
   private readonly change = new vscode.EventEmitter<ModelNode | undefined | null | void>();
   readonly onDidChangeTreeData = this.change.event;
   private snapshot: ModelsPoolSnapshot = { modelIds: [], policies: {}, empty: true };
+
+  constructor(
+    private readonly settings: UserModelSettings = userModelSettings,
+    private readonly moveModels?: (ids: readonly string[], before: string | undefined, token: vscode.CancellationToken) => Promise<void>
+  ) {}
+
+  handleDrag(source: readonly ModelNode[], dataTransfer: vscode.DataTransfer, token: vscode.CancellationToken): void {
+    if (!this.moveModels || token.isCancellationRequested || !source.length || source.some(node => node.kind !== 'model')) {
+      return;
+    }
+    dataTransfer.set(ModelsTree.mimeType, new vscode.DataTransferItem(source.map(node => (node as ModelEntryNode).id)));
+  }
+
+  /** A row drop inserts before that model; dropping in empty space appends. */
+  async handleDrop(target: ModelNode | undefined, dataTransfer: vscode.DataTransfer, token: vscode.CancellationToken): Promise<void> {
+    if (!this.moveModels || token.isCancellationRequested || (target && target.kind !== 'model')) {
+      return;
+    }
+    const ids: unknown = dataTransfer.get(ModelsTree.mimeType)?.value;
+    if (!Array.isArray(ids) || !ids.length || !ids.every((id): id is string => typeof id === 'string')) {
+      return;
+    }
+    try {
+      await this.moveModels(ids, target?.id, token);
+      this.refresh();
+    } catch (error) {
+      void vscode.window.showErrorMessage(`Could not reorder worker models: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 
   /** Latest parsed pool snapshot (also used to drive the view's empty context). */
   get pool(): ModelsPoolSnapshot {
@@ -85,7 +118,7 @@ export class ModelsTree implements vscode.TreeDataProvider<ModelNode> {
 
   /** Re-read the User-level pool and notify the view. */
   refresh(): void {
-    const raw = vscode.workspace.getConfiguration('codexSubagent').inspect<unknown>('models')?.globalValue;
+    const raw = this.settings.read();
     this.snapshot = snapshotPool(raw, error => error);
     this.change.fire();
   }
@@ -98,7 +131,7 @@ export class ModelsTree implements vscode.TreeDataProvider<ModelNode> {
       item.contextValue = 'modelEntry';
       // The display label is the VS Code model name; the exact configured ID
       // stays the stable identity and command argument, shown in the tooltip.
-      item.tooltip = `Enabled worker model (exact ID)\n${node.id}`;
+      item.tooltip = `Enabled worker model (exact ID)\n${node.id}\nDrag onto another model to place it before that model, or into empty space to move it to the end.`;
       item.iconPath = new vscode.ThemeIcon('brain');
       item.command = { command: 'codexSubagent.configureModel', title: 'Configure Model Options', arguments: [node.id] };
     } else if (node.kind === 'field') {

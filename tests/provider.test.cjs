@@ -77,6 +77,70 @@ function context() {
 }
 const enabledIds = () => new VscodeProvider(context()).enabled();
 const poolValue = () => config.get('models') || {};
+
+test('moving models persists priority while preserving policies and options', async () => {
+  const pool = {
+    first: { numSessions: 3, modelOptions: { temperature: 1 } },
+    middle: { allowWrite: false }, last: { turnTimeoutSeconds: 1200 }
+  };
+  config.set('models', pool);
+  const provider = new VscodeProvider(context());
+  await provider.moveModels(['last'], 'first');
+  assert.deepEqual(Object.keys(poolValue()), ['last', 'first', 'middle']);
+  assert.deepEqual(poolValue(), pool, 'only property order changes');
+  await provider.moveModels(['last']);
+  assert.deepEqual(Object.keys(poolValue()), ['first', 'middle', 'last']);
+  await provider.moveModels(['last', 'middle'], 'first');
+  assert.deepEqual(Object.keys(poolValue()), ['middle', 'last', 'first'], 'multi-drag retains current relative order');
+});
+
+test('stale or no-op moves do not resurrect models or write settings', async () => {
+  config.set('models', { first: {}, last: {} });
+  const original = poolValue();
+  const provider = new VscodeProvider(context());
+  await provider.moveModels(['removed'], 'first');
+  await provider.moveModels(['first'], 'removed');
+  await provider.moveModels(['first'], 'first');
+  await provider.moveModels(['last']);
+  await provider.moveModels(['last'], 'first', { isCancellationRequested: true });
+  assert.equal(poolValue(), original);
+  const proto = Object.fromEntries([['__proto__', { allowWrite: false }], ['last', {}]]);
+  config.set('models', proto);
+  await provider.moveModels(['last'], '__proto__');
+  assert.deepEqual(Object.keys(poolValue()), ['last', '__proto__']);
+  assert.equal(Object.hasOwn(poolValue(), '__proto__'), true);
+});
+
+test('a drag queued behind a policy edit keeps that edit and any intervening removal', async () => {
+  config.set('models', { first: {}, middle: {}, last: {} });
+  const provider = new VscodeProvider(context());
+  const gate = deferred();
+  updateGate = gate.promise;
+  const edit = provider.setModelOptions('last', { reasoning: 'high' });
+  const removal = provider.disable('middle');
+  const move = provider.moveModels(['last', 'middle'], 'first');
+  gate.resolve();
+  await Promise.all([edit, removal, move]);
+  updateGate = null;
+  assert.deepEqual(Object.keys(poolValue()), ['last', 'first']);
+  assert.deepEqual(poolValue().last.modelOptions, { reasoning: 'high' });
+});
+
+test('a queued drag cancelled before the settings lock is available never writes', async () => {
+  config.set('models', { first: {}, last: {} });
+  const provider = new VscodeProvider(context());
+  const gate = deferred();
+  updateGate = gate.promise;
+  const edit = provider.setModelOptions('first', { temperature: 0.5 });
+  const token = { isCancellationRequested: false };
+  const move = provider.moveModels(['last'], 'first', token);
+  token.isCancellationRequested = true;
+  gate.resolve();
+  await Promise.all([edit, move]);
+  updateGate = null;
+  assert.deepEqual(Object.keys(poolValue()), ['first', 'last']);
+});
+
 const probeSend = () => async (messages, options, token) => {
   calls.push({ messages, options, token });
   const probe = options.tools?.[0]?.name === 'worker_probe';
