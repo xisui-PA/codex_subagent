@@ -13,6 +13,14 @@ Check subagent_health and subagent_models before delegation.
 Give workers explicit context and acceptance criteria. Review their
 changes and test results before reporting completion.
 
+Size tasks conservatively using model metadata and observed performance.
+Prefer one bounded, reviewable outcome per task; resolve uncertain
+prerequisites first. Keep context focused, compacting or starting a fresh
+session when history grows. Increase scope after successful comparable work.
+
+Wait until a worker finishes its assigned work before reviewing or modifying
+that worker's changes.
+
 Respect each worker model's configured turnTimeoutSeconds when deciding
 how long to wait. High timeout settings call for longer coordinator
 patience; a short polling timeout or sparse output does not mean a
@@ -21,6 +29,14 @@ models merely for slow progress while it is within that timeout.
 Continue bounded polling, renew parent leases, and keep the user
 informed. Intervene earlier only for explicit user direction, a concrete
 failure, or changed task requirements.
+
+Poll with subagent_wait, omitting timeoutMs to use the derived default of
+max(60s, effective turn timeout in seconds / 10), using the largest interval
+across a mixed batch. A shorter explicit timeoutMs (including 0) is honored;
+a value above the derived limit is rejected. Inspect the returned worker
+views rather than adding redundant status calls; repeat the wait for workers
+that remain queued or running. Client request timeouts and parent leases must
+cover the wait plus a margin.
 
 Use the smallest number of workers needed, keeping delegated implementation
 and its tests in the same worker session by default. Start dependent stages

@@ -124,6 +124,8 @@ Give each conversation a unique `ownerId` and optional readable `ownerLabel`. Sp
 
 Default `parentPolicy: "keep"` preserves work across disconnects. For unattended cancellation, use `parentPolicy: "cancel-on-expiry"` and a `leaseSeconds` value. Renew with `subagent_parent` / `action: "heartbeat"`; explicitly cancel a group using `action: "stop"`. Leases are checked about every five seconds. The relay emits MCP logging notifications for tracked workers that stop; clients may display these without injecting them into model context, so polling remains available.
 
+Poll with `subagent_wait`, omitting `timeoutMs` to use the derived default of max(60s, one tenth of the effective model turn timeout), using the largest interval across a mixed batch. A shorter explicit `timeoutMs` (including 0) is honored; a value above the derived limit is rejected. The returned worker views already contain status and output; inspect `subagent_status` only for additional history. The relay checks tracked workers for completion every five seconds. The bridge allows up to the wait plus a margin (370s when `timeoutMs` is omitted); external client request timeouts and parent leases must cover the requested wait plus a margin.
+
 Native Codex parent-stop events and native agent UI integration are not exposed to this extension. A transport disconnect is not treated as proof of cancellation. Explicit stop/lease policies handle that boundary while retaining recoverable work.
 
 | MCP tool | Purpose |

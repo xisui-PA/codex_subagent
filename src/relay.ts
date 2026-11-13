@@ -55,7 +55,7 @@ async function main(): Promise<void> {
     })().finally(() => {
       polling = false;
     });
-  }, 2000);
+  }, 5000);
   timer.unref();
   process.stdin.on('end', () => {
     clearInterval(timer);
