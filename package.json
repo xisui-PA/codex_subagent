@@ -192,7 +192,7 @@
         {
           "id": "codexSubagent.models",
           "name": "Models",
-          "icon": "$(brain)",
+          "icon": "$(hubot)",
           "visibility": "visible"
         }
       ]
