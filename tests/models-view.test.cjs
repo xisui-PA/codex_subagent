@@ -40,6 +40,7 @@ const vscode = {
   EventEmitter,
   TreeItem,
   ThemeIcon,
+  DataTransferItem: class { constructor(value) { this.value = value; } },
   TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
   commands: {
     executeCommand: async () => undefined,
@@ -50,6 +51,7 @@ const vscode = {
   workspace: {
     getConfiguration: () => ({ inspect: key => inspectImpl(key) }),
   },
+  window: { showErrorMessage: async () => undefined },
 };
 const originalLoad = Module._load;
 Module._load = function (name, ...rest) { return name === 'vscode' ? vscode : originalLoad.call(this, name, ...rest); };
@@ -292,4 +294,64 @@ test('package.json wires the container, both views, welcome and Models title act
   assert.deepEqual(titleCommands.sort(), ['codexSubagent.configureModel', 'codexSubagent.enableModel', 'codexSubagent.openModelSettings']);
   const context = manifest.contributes.menus['view/item/context'].find(entry => entry.command === 'codexSubagent.configureModel' && entry.when.includes('viewItem == modelEntry'));
   assert.ok(context, 'per-model Configure Model Options context action');
+});
+
+test('dragging model rows and dropping on a model requests insertion before it; empty space appends', async () => {
+  const moves = [];
+  const tree = new ModelsTree(undefined, async (...args) => { moves.push(args); });
+  const token = { isCancellationRequested: false };
+  const transfer = new Map();
+  const a = { kind: 'model', id: 'pool/a' }, b = { kind: 'model', id: 'pool/b' };
+  tree.handleDrag([b], transfer, token);
+  assert.deepEqual(transfer.get(tree.dragMimeTypes[0]).value, ['pool/b']);
+  await tree.handleDrop(a, transfer, token);
+  assert.deepEqual(moves[0], [['pool/b'], 'pool/a', token]);
+  await tree.handleDrop(undefined, transfer, token);
+  assert.deepEqual(moves[1], [['pool/b'], undefined, token]);
+  tree.dispose();
+});
+
+test('fields/options/status rows, cancelled drags, and foreign data cannot request reordering', async () => {
+  let moves = 0;
+  const tree = new ModelsTree(undefined, async () => { moves++; });
+  const token = { isCancellationRequested: false };
+  const cancelled = { isCancellationRequested: true };
+  const model = { kind: 'model', id: 'pool/a' };
+  for (const row of [{ kind: 'field' }, { kind: 'option' }, { kind: 'status' }]) {
+    const transfer = new Map();
+    tree.handleDrag([row], transfer, token);
+    assert.equal(transfer.size, 0);
+    tree.handleDrag([model, row], transfer, token);
+    assert.equal(transfer.size, 0);
+    tree.handleDrag([model], transfer, token);
+    await tree.handleDrop(row, transfer, token);
+  }
+  const transfer = new Map();
+  tree.handleDrag([model], transfer, cancelled);
+  assert.equal(transfer.size, 0);
+  tree.handleDrag([model], transfer, token);
+  await tree.handleDrop(undefined, transfer, cancelled);
+  for (const value of [undefined, 'pool/a', {}, [1], []]) {
+    await tree.handleDrop(undefined, new Map([[tree.dropMimeTypes[0], { value }]]), token);
+  }
+  assert.equal(moves, 0);
+  tree.dispose();
+});
+
+test('a failed drop reports the error and leaves the displayed order unchanged', async () => {
+  inspected = { 'pool/a': {}, 'pool/b': {} };
+  const tree = new ModelsTree(undefined, async () => { throw new Error('Settings are read-only'); });
+  tree.refresh();
+  let refreshes = 0;
+  tree.onDidChangeTreeData(() => refreshes++);
+  const errors = [];
+  vscode.window = { showErrorMessage: async message => { errors.push(message); } };
+  const transfer = new Map();
+  const token = { isCancellationRequested: false };
+  tree.handleDrag([{ kind: 'model', id: 'pool/b' }], transfer, token);
+  await tree.handleDrop({ kind: 'model', id: 'pool/a' }, transfer, token);
+  assert.deepEqual(tree.pool.modelIds, ['pool/a', 'pool/b']);
+  assert.equal(refreshes, 0);
+  assert.match(errors[0], /Could not reorder.*Settings are read-only/);
+  tree.dispose();
 });

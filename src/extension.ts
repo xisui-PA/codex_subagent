@@ -18,6 +18,7 @@ import { WorkerBroker, unpack } from './runtime';
 import { Mutex } from './storage';
 import { ChangeContent, failure, Message, Model, ModelPolicy, Session, SessionHeader, WorkerError } from './types';
 import { VscodeProvider } from './vscode-provider';
+import { UserModelSettingsCache } from './user-model-settings';
 
 let cleanup: (() => Promise<void>) | undefined;
 interface WorkerNode { kind: 'worker'; session: SessionHeader }
@@ -68,7 +69,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
   const tree = new WorkerTree();
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 10);
   status.command = 'codexSubagent.workers.focus'; status.text = '$(hubot) Workers'; status.show();
-  const models = new ModelsTree();
+  const settings = new UserModelSettingsCache(context);
+  context.subscriptions.push(settings);
+  await settings.reload();
+  const provider = new VscodeProvider(context, settings);
+  const models = new ModelsTree(settings, (ids, before, token) => provider.moveModels(ids, before, token));
   // Re-read the User-level pool, drive the welcome context key, and refresh.
   const syncModels = (): void => {
     models.refresh();
@@ -77,8 +82,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
   syncModels();
   context.subscriptions.push(log, tree, models, status,
     vscode.window.registerTreeDataProvider('codexSubagent.workers', tree),
-    vscode.window.registerTreeDataProvider('codexSubagent.models', models));
-  const provider = new VscodeProvider(context);
+    vscode.window.createTreeView('codexSubagent.models', { treeDataProvider: models, dragAndDropController: models, canSelectMany: true }));
   const approvals = new CommandApprovals();
   context.subscriptions.push(approvals);
   const registry = path.join(context.globalStorageUri.fsPath, 'bridges');
@@ -115,7 +119,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     return broker;
   };
   // Only user-level (global) settings are honored for pool routing/permissions.
-  const modelPool = (): Record<string, ModelPolicy> => parseModelSettings(vscode.workspace.getConfiguration('codexSubagent').inspect<unknown>('models')?.globalValue);
+  const modelPool = (): Record<string, ModelPolicy> => parseModelSettings(settings.read());
   const configuredPool = (): Record<string, ModelPolicy> => {
     try {
       return modelPool();
@@ -210,7 +214,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
         storage: context.globalStorageUri.fsPath, registry, roots: realRoots, identity, provider,
         settings: () => ({
           ...defaults,
-          models: parseModelSettings(vscode.workspace.getConfiguration('codexSubagent').inspect<unknown>('models')?.globalValue)
+          models: modelPool()
         }),
         files: {
           // No global write/shell switches remain. FileTools receives tools when
@@ -619,6 +623,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     }
   });
 
+  context.subscriptions.push(settings.onDidChange(() => {
+    syncModels();
+    try {
+      broker?.settingsChanged();
+    } catch (error) {
+      report(error);
+    }
+    void refresh();
+  }));
   try {
     relay = await prepareRuntime(context.globalStorageUri.fsPath, context.asAbsolutePath('dist/relay.js'));
     await repairRegistration(configPath(), process.execPath, relay, registry);
@@ -634,21 +647,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     void configure().catch(report);
   }), vscode.workspace.onDidGrantWorkspaceTrust(() => {
     void configure().catch(report);
-  }), vscode.workspace.onDidChangeConfiguration(event => {
-    // Every window receives user-level configuration changes. Only the owning
-    // window has local runtimes; the others have nothing to reschedule.
-    if (!event.affectsConfiguration('codexSubagent')) {
-      return;
-    }
-    // The Models view depends only on the User-level pool, so it refreshes in
-    // every window, broker or workspace availability or not.
-    syncModels();
-    try {
-      broker?.settingsChanged();
-    } catch (error) {
-      report(error);
-    }
-    void refresh();
   }));
   const timer = setInterval(() => {
     void refresh();

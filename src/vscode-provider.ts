@@ -3,6 +3,7 @@ import { Message, Model, ModelPolicy, Part, Provider, WorkerError } from './type
 import { abortable } from './async';
 import { Mutex } from './storage';
 import { parseModelSettings } from './model-settings';
+import { UserModelSettings, userModelSettings } from './user-model-settings';
 
 export function metadata(model: vscode.LanguageModelChat): Model {
   return { id: model.id, name: model.name, vendor: model.vendor, family: model.family, version: model.version, maxInputTokens: model.maxInputTokens };
@@ -38,7 +39,7 @@ function providerError(error: unknown): WorkerError {
 }
 
 export class VscodeProvider implements Provider {
-  constructor(private readonly context: vscode.ExtensionContext) {}
+  constructor(private readonly context: vscode.ExtensionContext, private readonly settings: UserModelSettings = userModelSettings) {}
   /**
    * The user-level codexSubagent.models object is the sole enabled-model source:
    * each key is an exact enabled model ID, in pool priority order. Workspace
@@ -46,7 +47,7 @@ export class VscodeProvider implements Provider {
    * is read. Malformed settings fail loudly rather than silently enabling models.
    */
   enabled(): string[] {
-    return Object.keys(parseModelSettings(vscode.workspace.getConfiguration('codexSubagent').inspect<unknown>('models')?.globalValue));
+    return Object.keys(this.pool());
   }
   /**
    * VS Code's inspect().globalValue is a locally mirrored snapshot: it can keep
@@ -61,7 +62,7 @@ export class VscodeProvider implements Provider {
   private static readonly settingsLock = new Mutex();
   /** Latest user pool with its exact keys and values, for safe read-modify-write. */
   private pool(): Record<string, ModelPolicy> {
-    return parseModelSettings(vscode.workspace.getConfiguration('codexSubagent').inspect<unknown>('models')?.globalValue);
+    return parseModelSettings(this.settings.read());
   }
   private static ownKeys(pool: Record<string, ModelPolicy>): [string, ModelPolicy][] {
     // Object.fromEntries/entries keep an exact ID such as '__proto__' as an own
@@ -76,7 +77,30 @@ export class VscodeProvider implements Provider {
         return;
       }
       // Await the write so the next queued mutation reads the committed pool.
-      await vscode.workspace.getConfiguration('codexSubagent').update('models', Object.fromEntries(VscodeProvider.ownKeys(next)), vscode.ConfigurationTarget.Global);
+      await this.settings.update(Object.fromEntries(VscodeProvider.ownKeys(next)));
+    });
+  }
+  /** Move existing models before a row, or to the end, using the latest policies. */
+  async moveModels(ids: readonly string[], before?: string, token?: vscode.CancellationToken): Promise<void> {
+    await this.mutatePool(pool => {
+      if (token?.isCancellationRequested || (before !== undefined && !Object.hasOwn(pool, before))) {
+        return undefined;
+      }
+      const selected = new Set(ids);
+      const entries = Object.entries(pool);
+      // Preserve the pool's relative order for multi-selection drags. Removed
+      // models stay removed; a stale tree must never recreate an entry.
+      const moving = entries.filter(([id]) => selected.has(id));
+      if (!moving.length || (before !== undefined && selected.has(before))) {
+        return undefined;
+      }
+      const remaining = entries.filter(([id]) => !selected.has(id));
+      const index = before === undefined ? remaining.length : remaining.findIndex(([id]) => id === before);
+      remaining.splice(index, 0, ...moving);
+      if (remaining.every(([id], i) => id === entries[i][0])) {
+        return undefined;
+      }
+      return Object.fromEntries(remaining);
     });
   }
   async models(): Promise<Model[]> {

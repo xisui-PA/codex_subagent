@@ -5,6 +5,17 @@ import { abortable } from './async';
 import { effectiveSettings } from './model-settings';
 import { failure, Message, Model, ModelPolicy, Part, Provider, Session, Settings, Turn, WorkerError, WorkspaceTools } from './types';
 
+export const MIN_WAIT_MS = 60_000;
+export const MAX_MODEL_TURN_TIMEOUT_MS = 3_600_000;
+export const MAX_WAIT_MS = Math.max(MIN_WAIT_MS, MAX_MODEL_TURN_TIMEOUT_MS / 10);
+/**
+ * Derived subagent_wait limit for one model: one tenth of its effective turn
+ * timeout, never below the 60s minimum. Configured turnTimeoutSeconds spans
+ * 10-3600 (built-in default 600s), so derived limits span 60s-360s.
+ */
+export function waitLimitFor(turnTimeoutMs: number): number {
+  return Math.max(MIN_WAIT_MS, Math.round(turnTimeoutMs / 10));
+}
 export interface SpawnInput {
   requestId: string; task: string; model?: string; title?: string; instructions?: string;
   permission: Session['permission'];
@@ -613,8 +624,24 @@ export class WorkerEngine {
       this.onChange();
     });
   }
-  async wait(ids: string[], timeoutMs: number, signal?: AbortSignal): Promise<Session[]> {
-    const until = Date.now() + timeoutMs;
+  /**
+   * Derived wait limit for a batch: the largest max(60s, effective turn
+   * timeout / 10) among the requested workers. The API layer
+   * rejects explicit waits above this limit, so short explicit waits and the
+   * dynamic default never hold the transport for more than one tenth of the
+   * slowest requested model's turn (60s floor).
+   */
+  waitLimit(ids: string[]): number {
+    let limit = MIN_WAIT_MS;
+    for (const id of ids) {
+      limit = Math.max(limit, waitLimitFor(this.settingsFor(this.store.get(id).model.id).turnTimeoutMs));
+    }
+    return limit;
+  }
+  async wait(ids: string[], timeoutMs?: number, signal?: AbortSignal): Promise<Session[]> {
+    const limit = this.waitLimit(ids);
+    const resolved = timeoutMs === undefined ? limit : Math.min(timeoutMs, limit);
+    const until = Date.now() + resolved;
     while (true) {
       const sessions = ids.map(id => this.session(id));
       if (sessions.some(s => !['queued', 'running'].includes(s.state) && !this.active.has(s.id)) || Date.now() >= until) {
