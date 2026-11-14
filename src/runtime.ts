@@ -5,8 +5,14 @@ import { z } from 'zod';
 import { invoke, ToolResult } from './api';
 import { BridgeHost, forward } from './bridge';
 import { WorkerEngine } from './engine';
+import { TaskBoard } from './task-board';
+import type { BoardActor } from './task-board-types';
+import { invokeBoard, isBoardTool, workerBoardTools } from './task-board-tools';
+import type { BoardPort } from './task-board-tools';
+import { summarizeBoard } from './task-board-summary';
+import type { BoardWorkspaceStatus } from './task-board-summary';
 import { Mutex, sessionHeader, SessionStore } from './storage';
-import { failure, Provider, Session, SessionHeader, Settings, WorkerError } from './types';
+import { failure, Provider, Session, SessionHeader, Settings, WorkerError, WorkspaceTools } from './types';
 import { FileToolOptions, FileTools } from './workspace-tools';
 import { contains, prepareWorkspaces, registeredWorktrees, rememberWorkspaceRoots, rootMetadata, worktreeRoot, workspaceCatalog, workspaceDirectory } from './workspaces';
 
@@ -14,8 +20,10 @@ export interface RuntimeOptions {
   storage: string; registry: string; roots: string[]; identity: string; provider: Provider;
   settings: () => Settings; files: FileToolOptions;
   onChange: () => void; onError: (message: string) => void;
+  /** Opt-in task board gate; absent or false keeps every board surface off. Read on every call. */
+  taskBoardEnabled?: () => boolean;
 }
-interface Local { root: string; roots: string[]; store: SessionStore; engine: WorkerEngine; files: FileTools; host: BridgeHost }
+interface Local { root: string; roots: string[]; store: SessionStore; engine: WorkerEngine; files: FileTools; host: BridgeHost; board: BoardHost }
 const identifier = z.string().regex(/^[a-f0-9]{32}$/);
 const changeIdentifier = z.string().uuid();
 export function unpack<T>(result: ToolResult): T {
@@ -25,6 +33,132 @@ export function unpack<T>(result: ToolResult): T {
   }
   return value;
 }
+/**
+ * Lazy, single-flight board handle for one canonical root. The board lives in
+ * the root's own store directory under the same owner lock as the sessions, so
+ * it is opened on demand, cached once (concurrent callers share one promise),
+ * and closed before the store releases ownership. A malformed board is reported
+ * and cached: board calls and the UI keep failing closed while standalone
+ * workers keep running from the session store. Recovering a broken board needs
+ * an explicit host restart; nothing here repairs or resets board data.
+ *
+ * It is also the BoardPort the adapters call. Worker membership filtering reads
+ * the loaded board synchronously or through the pending open; every call is
+ * gated by the live feature flag and by this host closing (not just the broker).
+ */
+class BoardHost implements BoardPort {
+  private board?: TaskBoard;
+  private opening?: Promise<TaskBoard>;
+  private failure?: string;
+  /** Set the instant close() starts, so no new open/read/write can begin retirement. */
+  private closing = false;
+  private drained?: Promise<void>;
+
+  constructor(
+    private readonly directory: string,
+    private readonly root: string,
+    private readonly worker: (id: string) => Session | undefined,
+    private readonly enabled: () => boolean,
+    private readonly guard: () => void
+  ) {}
+
+  /** Host-stopping / feature-off gate shared by open, reads and the commit guard. */
+  private assertUsable(): void {
+    if (this.closing) {
+      throw new WorkerError('host_stopping', 'The board is closing; the call was not applied.', true);
+    }
+    if (!this.enabled()) {
+      throw new WorkerError('feature_disabled', 'The task board is disabled; enable codexSubagent.taskBoard.enabled in User Settings.');
+    }
+  }
+
+  /**
+   * Guard handed to the board's commit: this host closing is as fatal as the
+   * broker stopping, because the root owner lock is released once close drains.
+   */
+  private commitGuard(): void {
+    this.assertUsable();
+    this.guard();
+  }
+
+  get error(): string | undefined {
+    return this.failure;
+  }
+
+  async open(): Promise<TaskBoard> {
+    this.assertUsable();
+    if (!this.opening) {
+      const board = new TaskBoard(this.directory, this.root, this.worker, () => this.commitGuard());
+      this.opening = board.open().then(() => {
+        this.board = board;
+        return board;
+      }, error => {
+        this.failure = `${failure(error).code}: ${failure(error).message}`;
+        throw error;
+      });
+    }
+    return this.opening;
+  }
+
+  /**
+   * Idempotent retirement: refuse new work immediately, then drain the SAME
+   * pending open and close that board before the root owner lock is released.
+   */
+  close(): Promise<void> {
+    this.closing = true;
+    this.drained ??= (async () => {
+      const pending = this.opening;
+      const board = pending ? await pending.catch(() => undefined) : this.board;
+      this.opening = undefined;
+      this.board = undefined;
+      await board?.close();
+    })();
+    return this.drained;
+  }
+
+  /**
+   * Worker tool filtering needs membership synchronously. Once the board is open
+   * this is a raw synchronous read of the real array; before that it resolves
+   * through the single-flight open, so an unopened board is never reported as
+   * empty. A disabled, failed or closing host rejects instead of answering [].
+   */
+  listTeams(actor: BoardActor): unknown {
+    this.assertUsable();
+    if (this.board) {
+      return this.board.listTeams(actor);
+    }
+    return this.open().then(board => board.listTeams(actor));
+  }
+
+  async getTeam(actor: BoardActor, id: string): Promise<unknown> {
+    return (await this.open()).getTeam(actor, id);
+  }
+
+  async createTeam(actor: BoardActor, input: unknown): Promise<unknown> {
+    return (await this.open()).createTeam(actor, input as Parameters<TaskBoard['createTeam']>[1]);
+  }
+
+  async updateTeam(actor: BoardActor, input: unknown): Promise<unknown> {
+    return (await this.open()).updateTeam(actor, input as Parameters<TaskBoard['updateTeam']>[1]);
+  }
+
+  async createTask(actor: BoardActor, input: unknown): Promise<unknown> {
+    return (await this.open()).createTask(actor, input);
+  }
+
+  async getTask(actor: BoardActor, id: string): Promise<unknown> {
+    return (await this.open()).getTask(actor, id);
+  }
+
+  async listTasks(actor: BoardActor, teamId?: string): Promise<unknown> {
+    return (await this.open()).listTasks(actor, teamId);
+  }
+
+  async updateTask(actor: BoardActor, input: unknown, authorize?: () => void): Promise<unknown> {
+    return (await this.open()).updateTask(actor, input, authorize);
+  }
+}
+
 export class WorkerBroker {
   private readonly local = new Map<string, Local>();
   private readonly scopes = new Set<string>();
@@ -111,6 +245,63 @@ export class WorkerBroker {
   async catalog(): Promise<{ identity: string; roots: string[]; directory: string }[]> {
     return workspaceCatalog(this.options.storage);
   }
+  /**
+   * Structured tool failure for gates that run before the tool try/catch, so a
+   * direct broker/invoke caller sees the same shape as the MCP bridge.
+   */
+  private boardFailure(code: string, message: string, retryable = false): ToolResult {
+    return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: failure(new WorkerError(code, message, retryable)) }) }] };
+  }
+
+  /** Live board gate: settings can flip at any time, so this is read on every call. */
+  private boardEnabled(): boolean {
+    return this.options.taskBoardEnabled?.() === true;
+  }
+
+  /**
+   * Guard handed to the board itself and re-checked inside its commit, so a
+   * queued or replayed write cannot apply after the feature was disabled or the
+   * host began stopping.
+   */
+  private boardGuard(): void {
+    if (this.closed) {
+      throw new WorkerError('host_stopping', 'The host is stopping; the board write was not applied.', true);
+    }
+    if (!this.boardEnabled()) {
+      throw new WorkerError('feature_disabled', 'The task board was disabled before this write applied.');
+    }
+  }
+
+  /** Worker ids resolve through the same store; only a missing session means "no worker". */
+  private workerResolver(store: SessionStore): (id: string) => Session | undefined {
+    return (id: string) => {
+      try {
+        return store.get(id);
+      } catch (error) {
+        if (failure(error).code === 'not_found') {
+          return undefined;
+        }
+        throw error;
+      }
+    };
+  }
+
+  /**
+   * Private tools for one worker: file tools stay exactly as the engine built
+   * them, so write/shell policy and the authorize callback are unchanged, and
+   * the board adds only session-bound, membership-checked metadata tools.
+   */
+  private workerTools(files: FileTools, board: BoardHost): WorkspaceTools {
+    return {
+      get workspaceRoot() {
+        return files.workspaceRoot;
+      },
+      definitions: permission => files.definitions(permission),
+      execute: (name, input, permission, signal, session, authorize) => files.execute(name, input, permission, signal, session, authorize),
+      forSession: session => workerBoardTools(board, session, () => this.boardEnabled(), this.options.onChange, files.forSession(session))
+    };
+  }
+
   private async ensure(root: string): Promise<Local | undefined> {
     if (!this.closed && this.local.has(root)) {
       return this.local.get(root);
@@ -158,16 +349,24 @@ export class WorkerBroker {
       }).catch(async error => {
         await store.close(); throw error;
       });
-      const engine = new WorkerEngine(store, this.options.provider, files, this.options.settings);
+      const board = new BoardHost(directory, root, this.workerResolver(store), () => this.boardEnabled(), () => this.boardGuard());
+      // An enabled board loads before any worker turn runs. Board trouble is
+      // reported and cached but never blocks the standalone worker host.
+      if (this.boardEnabled()) {
+        await board.open().catch(error => this.options.onError(`board ${root}: ${failure(error).message}`));
+      }
+      const engine = new WorkerEngine(store, this.options.provider, this.workerTools(files, board), this.options.settings);
       engine.onChange = this.options.onChange;
       engine.onError = (id, error) => this.options.onError(`${id}: ${failure(error).message}`);
       const host = new BridgeHost();
-      const local: Local = { root, roots, store, engine, files, host };
+      const local: Local = { root, roots, store, engine, files, host, board };
       this.local.set(root, local);
       try {
         await host.start(this.options.registry, roots, (name, args, signal, cwd) => this.invoke(cwd || root, name, args, signal));
       } catch (error) {
-        this.local.delete(root); await engine.shutdown(); await store.close(); throw error;
+        this.local.delete(root);
+        const closing = board.close();
+        await engine.shutdown(); await closing; await store.close(); throw error;
       }
       return local;
     });
@@ -207,6 +406,10 @@ export class WorkerBroker {
     if (this.closed) {
       throw new WorkerError('host_stopping', 'Workspace host is stopping. Retry after another window takes ownership.', true);
     }
+    if (isBoardTool(name) && !this.boardEnabled()) {
+      // Structured failure before routing: a disabled board never opens a store or a bridge.
+      return this.boardFailure('feature_disabled', 'The task board is disabled; enable codexSubagent.taskBoard.enabled in User Settings.');
+    }
     if (args && typeof args === 'object' && 'workspaceRoot' in args) {
       cwd = z.string().min(1).max(8000).parse(args.workspaceRoot);
       const { workspaceRoot: _scope, ...rest } = args as Record<string, unknown>; void _scope; args = rest;
@@ -231,6 +434,29 @@ export class WorkerBroker {
     const { engine, store, files } = route.local;
     const respond = (value: unknown): ToolResult => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
     try {
+      if (isBoardTool(name)) {
+        // Board tools are record-only metadata: they never touch worker sessions,
+        // dispatch inference or automatically accept work; explicit acceptance stays
+        // a coordinator call. The flag is checked here (so even bad
+        // ids answer feature_disabled) and again inside the board's own commit
+        // guard, and the domain still checks live membership and assignment.
+        if (!this.boardEnabled()) {
+          throw new WorkerError('feature_disabled', 'The task board is disabled; enable codexSubagent.taskBoard.enabled in User Settings.');
+        }
+        const result = await invokeBoard(await route.local.board.open(), name, args);
+        if (!result.isError && /_create$|_update$/.test(name)) {
+          this.options.onChange();
+        }
+        return result;
+      }
+      if (name === 'ui_board_snapshot') {
+        // Trusted read-only UI view: bounded summaries only, never the raw board.
+        z.object({}).strict().parse(args ?? {});
+        if (!this.boardEnabled()) {
+          throw new WorkerError('feature_disabled', 'The task board is disabled; enable codexSubagent.taskBoard.enabled in User Settings.');
+        }
+        return respond(summarizeBoard((await route.local.board.open()).snapshot()));
+      }
       if (name === 'ui_parent_scope') {
         return invoke(engine, 'subagent_parent', args, signal);
       }
@@ -302,7 +528,7 @@ export class WorkerBroker {
         }));
       }
       if (name === 'subagent_health') {
-        return respond({ ready: true, root: route.root, workspaceRoots: route.local.roots, models: await engine.models(), capabilities: files.definitions('workspace-write').map(t => t.name), diagnostics: store.diagnostics, sessionsDirectory: store.directory });
+        return respond({ ready: true, root: route.root, workspaceRoots: route.local.roots, models: await engine.models(), capabilities: files.definitions('workspace-write').map(t => t.name), diagnostics: store.diagnostics, sessionsDirectory: store.directory, taskBoard: { enabled: this.boardEnabled(), ...(route.local.board.error ? { error: route.local.board.error } : {}) } });
       }
       return invoke(engine, name, args, signal, route.workspaceRoot);
     } catch (error) {
@@ -383,6 +609,28 @@ export class WorkerBroker {
       }
     });
   }
+  /**
+   * Bounded board summaries for the Task Board view: one row per live canonical
+   * root, read through that root's exact owner. A failing board contributes an
+   * error row so other roots and legacy workers keep refreshing. Removed roots
+   * are never opened offline and saved history is left untouched.
+   */
+  async boardStatus(): Promise<BoardWorkspaceStatus[]> {
+    if (this.closed || !this.boardEnabled()) {
+      return [];
+    }
+    await this.discoverWorktrees();
+    const statuses: BoardWorkspaceStatus[] = [];
+    for (const root of [...this.scopes]) {
+      try {
+        statuses.push(unpack<BoardWorkspaceStatus>(await this.invoke(root, 'ui_board_snapshot', {})));
+      } catch (error) {
+        const problem = failure(error);
+        statuses.push({ workspaceRoot: root, teams: [], tasks: [], error: `${problem.code}: ${problem.message}` });
+      }
+    }
+    return statuses;
+  }
   private async retire(root: string): Promise<void> {
     await this.mutex.run(async () => {
       const local = this.local.get(root);
@@ -390,7 +638,9 @@ export class WorkerBroker {
         // Scope validation no longer permits this root. Withdraw its bridge so
         // history requests cannot forward back to the same retiring owner.
         await local.host.close();
-        await local.engine.shutdown(); await local.store.close();
+        const closing = local.board.close();
+        await local.engine.shutdown(); await closing;
+        await local.store.close();
         this.local.delete(root);
       }
       this.scopes.delete(root);
@@ -402,7 +652,8 @@ export class WorkerBroker {
     for (const local of this.local.values()) {
       // Keep the exact owner discoverable while effects drain. Incoming requests
       // receive host_stopping instead of falling back to an unrelated checkout.
-      await local.engine.shutdown(); await local.host.close(); await local.store.close();
+      const closing = local.board.close();
+      await local.engine.shutdown(); await local.host.close(); await closing; await local.store.close();
     }
     this.local.clear();
   }

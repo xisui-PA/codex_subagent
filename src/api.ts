@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { WorkerEngine } from './engine';
+import { boardMcpTools } from './task-board-tools';
 import { failure, Session, WorkerError } from './types';
 
 const id = z.string().regex(/^[a-f0-9]{32}$/);
@@ -35,7 +36,7 @@ const descriptions: Record<keyof typeof schemas, string> = {
   subagent_parent: 'Heartbeat an ownerId lease or explicitly stop all of that parent’s running/queued workers. For cancel-on-expiry workers send periodic heartbeats. Native Codex stop events are unavailable to this MCP server.',
   subagent_health: 'Check worker host health, model availability and actual workspace capabilities before delegation.'
 };
-export const mcpTools = Object.entries(schemas).map(([name, schema]) => {
+const legacyTools = Object.entries(schemas).map(([name, schema]) => {
   const json = z.toJSONSchema(schema);
   return {
     name, description: descriptions[name as keyof typeof schemas],
@@ -43,6 +44,8 @@ export const mcpTools = Object.entries(schemas).map(([name, schema]) => {
     annotations: { readOnlyHint: ['subagent_models', 'subagent_status', 'subagent_wait', 'subagent_list', 'subagent_health'].includes(name), destructiveHint: name === 'subagent_delete', idempotentHint: name !== 'subagent_compact', openWorldHint: ['subagent_spawn', 'subagent_resume', 'subagent_send', 'subagent_compact'].includes(name) }
   };
 });
+/** Legacy worker-control tools, then the opt-in board tools (codexSubagent.taskBoard.enabled). invoke() is unchanged. */
+export const mcpTools = [...legacyTools, ...boardMcpTools];
 export const mcpInstructions = 'Use subagent_health and subagent_models before delegation. To target a registered Git worktree explicitly supply workspaceRoot; retain the returned root on subsequent controls and group wait IDs by that root. Choose a unique ownerId for this parent conversation and retain it with worker IDs/requestIds; pass it on every mutating control. Spawn is asynchronous. Poll with subagent_wait, omitting timeoutMs to use max(60s, one tenth of the effective model turn timeout), using the largest interval across a mixed batch. Shorter explicit timeoutMs values are allowed; values above the derived limit are rejected. Wait results already contain worker status and output; only inspect status for additional history or output. Remove stopped workers from subsequent waits. Ensure client request timeouts and parent leases cover the wait plus a margin. For work that should stop when unattended use parentPolicy cancel-on-expiry and renew with subagent_parent heartbeat; explicitly call subagent_parent stop when cancelling a parent task. MCP disconnects alone do not prove a parent stopped. Native stop events are unavailable. Retry ambiguous mutations with the SAME requestId and arguments. Reloaded work is interrupted and resumes explicitly. Context/history rollover is automatic and archival messages remain available through status pagination. Workers have explicit context and private workspace tools; parent tools, approvals and sandbox are not inherited. Check completed results before reporting success.';
 
 export function view(session: Session, offset = 0, limit = 12_000, turnId?: string, attempt?: number): Record<string, unknown> {

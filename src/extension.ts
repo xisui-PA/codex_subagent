@@ -13,6 +13,7 @@ import { applyEditorChange, openText } from './editor';
 import { WorkerPanel, PanelMessage } from './panel';
 import { eligibleModels, parseModelSettings, poolAllows } from './model-settings';
 import { ModelsTree } from './models-view';
+import { TaskBoardTree } from './task-board-view';
 import { prepareRuntime, register, repairRegistration } from './registration';
 import { WorkerBroker, unpack } from './runtime';
 import { Mutex } from './storage';
@@ -83,6 +84,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
   context.subscriptions.push(log, tree, models, status,
     vscode.window.registerTreeDataProvider('codexSubagent.workers', tree),
     vscode.window.createTreeView('codexSubagent.models', { treeDataProvider: models, dragAndDropController: models, canSelectMany: true }));
+  // Task board: opt-in and read-only, driven only by the User-level setting.
+  // inspect().globalValue is deliberate: the effective value could come from a
+  // repository, and a checkout must never enable the board.
+  const boardTree = new TaskBoardTree();
+  const boardEnabled = (): boolean => {
+    try {
+      return vscode.workspace.getConfiguration('codexSubagent').inspect<boolean>('taskBoard.enabled')?.globalValue === true;
+    } catch {
+      return false;
+    }
+  };
+  const syncBoardContext = (): void => {
+    void vscode.commands.executeCommand('setContext', 'codexSubagent.taskBoardEnabled', boardEnabled());
+  };
+  // Board rows are bounded host summaries. Failures stay in the log and clear the
+  // view; they never touch the workers tree or its status bar item.
+  const refreshBoard = async (): Promise<void> => {
+    if (!broker || !alive || !boardEnabled()) {
+      boardTree.refresh([]);
+      return;
+    }
+    try {
+      boardTree.refresh(await broker.boardStatus());
+    } catch (error) {
+      log.appendLine(`Task board: ${failure(error).message}`);
+      boardTree.refresh([]);
+    }
+  };
+  syncBoardContext();
+  context.subscriptions.push(boardTree, vscode.window.registerTreeDataProvider('codexSubagent.taskBoard', boardTree));
   const approvals = new CommandApprovals();
   context.subscriptions.push(approvals);
   const registry = path.join(context.globalStorageUri.fsPath, 'bridges');
@@ -130,6 +161,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
   const configuredPoolAllows = (field: 'allowWrite' | 'allowShell'): boolean => poolAllows(configuredPool(), field);
   const refresh = async (): Promise<void> => {
     if (!broker || refreshing || !alive) {
+      if (!broker || !alive) {
+        boardTree.refresh([]);
+      }
       return;
     }
     refreshing = true;
@@ -189,6 +223,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
           entry.panel.error(failure(error).message);
         }
       }
+      // Isolated from worker refresh: a board failure never changes worker status.
+      await refreshBoard();
     } catch (error) {
       status.text = '$(warning) Workers'; status.tooltip = failure(error).message; log.appendLine(`Host refresh: ${failure(error).message}`);
     } finally {
@@ -205,13 +241,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     }
     if (!vscode.workspace.isTrusted || !roots().length || roots().length !== vscode.workspace.workspaceFolders?.length) {
       startupError = 'Open a trusted filesystem workspace to run workers. Setup, logs and diagnostics remain available.';
-      status.tooltip = startupError; tree.refresh([]); return;
+      status.tooltip = startupError; tree.refresh([]); boardTree.refresh([]); return;
     }
     try {
       const realRoots = await Promise.all(roots().map(root => fs.realpath(root)));
       const identity = vscode.workspace.workspaceFile ? `workspace:${vscode.workspace.workspaceFile.toString()}` : `folder:${realRoots[0]}`;
       const next = new WorkerBroker({
         storage: context.globalStorageUri.fsPath, registry, roots: realRoots, identity, provider,
+        taskBoardEnabled: boardEnabled,
         settings: () => ({
           ...defaults,
           models: modelPool()
@@ -238,6 +275,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
       await refresh();
     } catch (error) {
       startupError = failure(error).message; status.text = '$(warning) Workers'; status.tooltip = startupError; log.appendLine(startupError);
+      boardTree.refresh([]);
     }
   });
   const selected = async (arg?: unknown): Promise<Session | undefined> => {
@@ -279,6 +317,66 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     snapshots.set(before.toString(), c.before || ''); snapshots.set(after.toString(), c.after || '');
     await vscode.commands.executeCommand('vscode.diff', before, after, `Worker change: ${path.basename(c.path)}`);
   };
+
+  // Full board records open through a custom read-only scheme: the document
+  // cannot be saved back, so nothing implies editing board data.
+  const boardRecords = new Map<string, string>();
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider('codex-task-board-record', {
+      provideTextDocumentContent: uri => boardRecords.get(uri.toString()) || ''
+    }),
+    vscode.workspace.onDidCloseTextDocument(document => {
+      if (document.uri.scheme === 'codex-task-board-record') {
+        boardRecords.delete(document.uri.toString());
+      }
+    })
+  );
+  const openRecord = async (target: { workspaceRoot: string; teamId: string; taskId: string }): Promise<void> => {
+    const current = requireBroker();
+    const rows = await current.boardStatus();
+    const canonical = rows.find(row => row.workspaceRoot === target.workspaceRoot)
+      || rows.find(row => path.resolve(row.workspaceRoot) === path.resolve(target.workspaceRoot));
+    const team = canonical?.teams.find(entry => entry.id === target.teamId);
+    if (!canonical || !team) {
+      throw new WorkerError('not_found', 'That board record is no longer on this workspace board. Refresh the Task Board and try again.');
+    }
+    // The coordinator identity comes from the board record itself; UI arguments
+    // never supply an actor.
+    const ownerId = team.coordinatorOwnerId;
+    const teamRecord = unpack(await current.invoke(canonical.workspaceRoot, 'subagent_team_get', { ownerId, id: target.teamId }));
+    const taskRecord = unpack(await current.invoke(canonical.workspaceRoot, 'subagent_task_get', { ownerId, id: target.taskId }));
+    const uri = vscode.Uri.parse(`codex-task-board-record:/${randomUUID()}/task-${target.taskId}.json`);
+    boardRecords.set(uri.toString(), JSON.stringify({ workspaceRoot: canonical.workspaceRoot, team: teamRecord, task: taskRecord }, null, 2));
+    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(uri), { preview: false });
+  };
+  command('openBoardRecord', async (...args: unknown[]) => {
+    if (!boardEnabled()) {
+      throw new WorkerError('feature_disabled', 'The task board is disabled; enable codexSubagent.taskBoard.enabled in User Settings.');
+    }
+    const [arg] = args;
+    const requested = arg && typeof arg === 'object' ? arg as { workspaceRoot?: unknown; teamId?: unknown; taskId?: unknown } : undefined;
+    const workspaceRoot = typeof requested?.workspaceRoot === 'string' ? requested.workspaceRoot : undefined;
+    const teamId = typeof requested?.teamId === 'string' ? requested.teamId : undefined;
+    const taskId = typeof requested?.taskId === 'string' ? requested.taskId : undefined;
+    if (workspaceRoot && teamId && taskId) {
+      await openRecord({ workspaceRoot, teamId, taskId });
+      return;
+    }
+    // Palette calls carry no ids: offer the tasks the host already summarized.
+    const choices = (await requireBroker().boardStatus())
+      .filter(row => !workspaceRoot || row.workspaceRoot === workspaceRoot)
+      .flatMap(row => row.tasks
+        .filter(task => !teamId || task.teamId === teamId)
+        .map(task => ({ label: task.titlePreview, description: `${task.state} · rev ${task.revision}`, detail: row.workspaceRoot, workspaceRoot: row.workspaceRoot, teamId: task.teamId, taskId: task.id })));
+    if (!choices.length) {
+      void vscode.window.showInformationMessage('No task board records are available. Enable codexSubagent.taskBoard.enabled and create a team and task first.');
+      return;
+    }
+    const choice = await vscode.window.showQuickPick(choices, { title: 'Open a task board record' });
+    if (choice) {
+      await openRecord(choice);
+    }
+  });
 
   // Commands are registered before any host startup or model-provider access.
   command('showLog', async () => log.show());
@@ -631,6 +729,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
       report(error);
     }
     void refresh();
+  }));
+  // Opting in or out changes only the board: no broker restart, no model or
+  // permission reconfiguration, and running workers are never interrupted.
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
+    if (!event.affectsConfiguration('codexSubagent.taskBoard.enabled')) {
+      return;
+    }
+    syncBoardContext();
+    void refreshBoard();
   }));
   try {
     relay = await prepareRuntime(context.globalStorageUri.fsPath, context.asAbsolutePath('dist/relay.js'));

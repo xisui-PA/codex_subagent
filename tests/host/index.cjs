@@ -23,6 +23,26 @@ exports.run = async () => {
     const health = JSON.parse((await api.invoke('subagent_health', {})).content[0].text);
     assert.equal(health.ready, true); assert.ok(health.capabilities.includes('read_file'));
     assert.ok(!health.capabilities.includes('write_file'));
+    // Task board: off by default, opt-in via the User-level setting only.
+    assert.equal(health.taskBoard.enabled, false, 'The task board must be off unless opted in');
+    const boardError = async name => JSON.parse((await api.invoke(name, { ownerId: 'host-smoke' })).content[0].text).error;
+    assert.match((await boardError('subagent_team_list')).code, /feature_disabled/, 'Disabled board calls must be refused');
+    const boardSetting = vscode.workspace.getConfiguration('codexSubagent');
+    await boardSetting.update('taskBoard.enabled', true, vscode.ConfigurationTarget.Global);
+    assert.equal(JSON.parse((await api.invoke('subagent_health', {})).content[0].text).taskBoard.enabled, true, 'The opt-in must reach the host live');
+    const boardTeam = JSON.parse((await api.invoke('subagent_team_create', { ownerId: 'host-smoke', requestId: randomUUID(), name: 'Host smoke team', description: 'Host smoke board' })).content[0].text);
+    const boardTask = JSON.parse((await api.invoke('subagent_task_create', { ownerId: 'host-smoke', requestId: randomUUID(), teamId: boardTeam.id, title: 'Host smoke task', description: 'Host smoke work', acceptanceCriteria: ['literal <script> criterion'] })).content[0].text);
+    await vscode.commands.executeCommand('codexSubagent.openBoardRecord', { workspaceRoot: await fs.realpath(process.env.CODEX_TEST_WORKSPACE), teamId: boardTeam.id, taskId: boardTask.id });
+    const record = vscode.window.activeTextEditor.document;
+    assert.equal(record.uri.scheme, 'codex-task-board-record', 'Full records open through the read-only board scheme');
+    const recordJson = JSON.parse(record.getText());
+    assert.equal(recordJson.task.id, boardTask.id);
+    assert.deepEqual(recordJson.task.acceptanceCriteria, ['literal <script> criterion'], 'Full criteria stay literal in the record');
+    assert.equal(recordJson.task.history.lastSequence >= 1, true, 'The full record keeps its transition history');
+    assert.equal(recordJson.team.coordinatorOwnerId, 'host-smoke', 'The record came from the trusted coordinator identity');
+    await boardSetting.update('taskBoard.enabled', false, vscode.ConfigurationTarget.Global);
+    const afterDisable = JSON.parse((await api.invoke('subagent_task_get', { ownerId: 'host-smoke', id: boardTask.id })).content[0].text).error;
+    assert.match(afterDisable.code, /feature_disabled/, 'Disabling must refuse board calls again');
     await vscode.workspace.getConfiguration('codexSubagent').update('models', { fake: { allowWrite: true } }, vscode.ConfigurationTarget.Global);
     assert.ok(JSON.parse((await api.invoke('subagent_health', {})).content[0].text).capabilities.includes('write_file'));
     await vscode.workspace.getConfiguration('codexSubagent').update('models', {}, vscode.ConfigurationTarget.Global);
@@ -128,11 +148,23 @@ exports.run = async () => {
     const { openText } = require(path.join(process.env.CODEX_TEST_REPOSITORY, '.test-build', 'editor.js'));
     const root = await fs.realpath(process.env.CODEX_TEST_WORKSPACE);
     const formatted = path.join(root, 'saved.txt'); await fs.writeFile(formatted, 'initial');
-    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(formatted)));
+    // Compare VS Code identities, never a raw Node path: Uri.fsPath normalizes
+    // Windows drive-letter case, so a realpath string would not match.
+    const formattedUri = vscode.Uri.file(formatted);
+    const formattedDocument = await vscode.workspace.openTextDocument(formattedUri);
+    await vscode.window.showTextDocument(formattedDocument);
+    // The editor may use CRLF; derive the newline once and reuse it everywhere.
+    const newline = formattedDocument.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    let participantRuns = 0;
     const participant = vscode.workspace.onWillSaveTextDocument(event => {
-      if (event.document.uri.fsPath === formatted && !event.document.getText().endsWith('\nsave participant')) {
-        event.waitUntil(Promise.resolve([vscode.TextEdit.insert(event.document.positionAt(event.document.getText().length), '\nsave participant')]));
+      if (event.document.uri.toString() !== formattedUri.toString()) {
+        return;
       }
+      if (event.document.getText().endsWith(`${newline}save participant`)) {
+        return;
+      }
+      participantRuns++;
+      event.waitUntil(Promise.resolve([vscode.TextEdit.insert(event.document.positionAt(event.document.getText().length), `${newline}save participant`)]));
     });
     const fake = { id: 'fake', name: 'Fake', vendor: 'test', family: 'test', version: '1', maxInputTokens: 100000 };
     // Use real VS Code response classes with a fake transport. Modern built-in
@@ -161,7 +193,8 @@ exports.run = async () => {
       const waited = unpack(await broker.invoke(root, 'subagent_wait', { ids: [spawned.id], timeoutMs: 5000 }));
       assert.equal(waited.workers[0].state, 'completed');
       const session = await broker.session(root, spawned.id);
-      const expected = 'worker text\nsave participant';
+      const expected = `worker text${newline}save participant`;
+      assert.equal(participantRuns >= 1, true, 'The save participant must actually run');
       assert.equal(await fs.readFile(formatted, 'utf8'), expected);
       assert.equal(JSON.parse(session.messages.find(m => m.parts[0].type === 'result').parts[0].text).hash, hash(expected));
       const snapshot = unpack(await broker.invoke(root, 'ui_change', { id: spawned.id, changeId: session.changes[0].id }));

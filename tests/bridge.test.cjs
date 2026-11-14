@@ -50,10 +50,11 @@ test('relay uses the correct workspace and reconnects after host restart', async
 });
 
 test('real MCP stdio client initializes, discovers tools, spawns and reads a worker', async t => {
-  const { root, registry, engine } = await hostFixture(t);
   const client = new Client({ name: 'integration-test', version: '1.0.0' });
-  const transport = new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/relay.js'), '--registry', registry], cwd: root, stderr: 'pipe' });
+  // Close the relay before fixture cleanup removes its working directory.
   t.after(() => client.close());
+  const { root, registry, engine } = await hostFixture(t);
+  const transport = new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/relay.js'), '--registry', registry], cwd: root, stderr: 'pipe' });
   await client.connect(transport);
   const tools = await client.listTools();
   assert.ok(tools.tools.some(tool => tool.name === 'subagent_spawn'));
@@ -71,10 +72,11 @@ test('real MCP stdio client initializes, discovers tools, spawns and reads a wor
 });
 
 test('MCP can initialize before VS Code starts and reports a recoverable missing host', async t => {
-  const { root } = await fixture(t);
   const client = new Client({ name: 'offline-test', version: '1.0.0' });
-  const transport = new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/relay.js'), '--registry', path.join(root, 'missing')], cwd: root, stderr: 'pipe' });
+  // Hooks run in registration order; the relay must release cwd first on Windows.
   t.after(() => client.close());
+  const { root } = await fixture(t);
+  const transport = new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/relay.js'), '--registry', path.join(root, 'missing')], cwd: root, stderr: 'pipe' });
   await client.connect(transport);
   assert.ok((await client.listTools()).tools.length > 0);
   const result = await client.callTool({ name: 'subagent_list', arguments: {} });
