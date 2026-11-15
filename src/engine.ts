@@ -514,18 +514,18 @@ export class WorkerEngine {
       this.onChange(); return this.store.get(id);
     });
   }
-  async edit<T>(id: string, action: (session: Session, signal: AbortSignal) => Promise<T>): Promise<T> {
+  async edit<T>(id: string, action: (session: Session, signal: AbortSignal) => Promise<T>, maintenance?: { kind: 'isolation'; activity: string }): Promise<T> {
     const { execution } = await this.mutex.run(async () => {
       if (this.stopped) {
         throw new WorkerError('host_stopping', 'Extension is shutting down.', true);
       }
       const original = this.session(id);
       if (this.active.has(id) || ['running', 'queued'].includes(original.state)) {
-        throw new WorkerError('worker_busy', 'Stop the worker and wait for maintenance before reverting its changes.');
+        throw new WorkerError('worker_busy', maintenance ? 'Stop the worker and wait for maintenance before binding a private view.' : 'Stop the worker and wait for maintenance before reverting its changes.');
       }
       await this.store.change(id, s => {
-        s.maintenance = { kind: 'revert', previousState: original.state };
-        s.state = 'running'; s.activity = 'Reverting change'; s.maintenanceError = undefined;
+        s.maintenance = { kind: maintenance?.kind ?? 'revert', previousState: original.state };
+        s.state = 'running'; s.activity = maintenance?.activity ?? 'Reverting change'; s.maintenanceError = undefined;
         if (s.parentPolicy === 'cancel-on-expiry') {
           s.parentExpiresAt = Date.now() + (s.parentLeaseSeconds || 120) * 1000;
         }
@@ -546,7 +546,7 @@ export class WorkerEngine {
         try {
           await this.store.change(id, s => {
             s.state = original.state; s.maintenance = undefined;
-            s.activity = problem ? 'Revert stopped; inspect saved changes' : 'Change reverted';
+            s.activity = maintenance ? (problem ? 'Private view binding stopped; inspect and retry' : 'Private view bound') : (problem ? 'Revert stopped; inspect saved changes' : 'Change reverted');
             s.maintenanceError = problem;
           });
         } catch (error) {

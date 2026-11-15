@@ -57,3 +57,28 @@ Before completely abandoning or replacing a worker model for the remaining
 work, explain the observed failures and the proposed model change, then ask
 the user for approval. The mere availability of another model, or a single
 failed turn, is not approval to abandon the current model.
+
+## Line endings and exact-text edits
+
+Before exact-text patches, check the target's working-tree line endings.
+Use `git ls-files --eol -- <path>` and, when relevant,
+`git config --show-origin --get core.autocrlf`. This checkout can have LF
+in the index and CRLF in the working tree because `core.autocrlf=true`.
+Git blob text and rendered tool output do not prove the current file's EOL.
+
+Read the current file through the same worker view used for editing, and
+use its returned full-file hash. Preserve the existing encoding, BOM and
+line-ending style. For a uniform LF or CRLF file, construct replacement
+text in that style; do not convert the whole file just to make a patch match.
+Mixed endings require an exact match or an explicit, scoped normalization.
+
+If a patch reports no match, inspect the actual bytes/EOL and refresh the
+read/hash before retrying. Do not repeat the same failed patch, weaken hash
+preconditions, or substitute live workspace content for an isolated view.
+The isolated patch adapter accepts LF/CRLF differences only after the raw
+hash matches; legacy tools may require exact line endings. VS Code editor
+edits can preserve the document's existing EOL even when input text uses LF.
+
+Give workers these EOL details in patch tasks. Do not change Git EOL
+settings or repository-wide formatting to work around a local mismatch.
+Review the diff for unintended newline churn and run `git diff --check`.

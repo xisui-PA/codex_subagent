@@ -56,7 +56,7 @@ The **Models** view shows the strict User-settings `codexSubagent.models` pool i
 - **Export Transcript** saves the conversation and archival history. **Clean Up Saved Workers** supports bulk deletion. Deletion removes archives, change snapshots, and operation keys too.
 - **Browse Saved Workspaces** reveals other saved transcript stores.
 
-Review before/after diffs and revert individual changes in the panel. Revert checks current content and refuses to overwrite later user edits. Worker edits use WorkspaceEdit and native editor undo. Already-dirty buffers are readable/editable and stay unsaved; previously clean files are saved. Returned hashes and change snapshots include formatting and other save participants. Shell commands see disk contents, so save dirty buffers before validation.
+Review before/after diffs and revert individual changes in the panel. Revert checks current content and refuses to overwrite later user edits. Legacy worker edits use WorkspaceEdit and native editor undo. Already-dirty buffers are readable/editable and stay unsaved; previously clean files are saved. Returned hashes and change snapshots include formatting and other save participants. Legacy shell commands see disk contents, so save dirty buffers before validation. Opt-in isolated workers use the private file view described below.
 
 Revert is tracked as worker maintenance. Conflicting follow-ups, deletion and other edits are blocked until it settles, and shutdown retains store ownership while it finishes. A restart during Revert preserves the task’s prior state and flags uncertain file effects for inspection.
 
@@ -175,6 +175,12 @@ Both listings are paged the same way: `subagent_team_list` and `subagent_task_li
 The **Task Board** view reads bounded status summaries, not full records: each summary carries ids, title, state, assignment, revision, short progress/description, the first few acceptance criteria, blockers, reference and validation previews with their full counts, every dependency edge by id and kind, and history counts. Reference URIs, full-length text and transition entries are intentionally absent. Clicking a task opens its full record through `codexSubagent.openBoardRecord`, which is where the complete text, history entries and URIs are shown; Codex reads the same full records with `subagent_task_get`/`subagent_team_get` (and the paged list results). Nothing in the view creates, accepts or integrates work.
 
 Capacity is explicit rather than silently evicting: at most 64 teams and 512 tasks per board, 32 members per team, 20 acceptance criteria and 32 dependencies per task, 8 candidate refs, 8 agreed contracts, 16 validations, 16 blockers, and 100 retained history entries per record with `lastSequence`/`trimmed` metadata, so a trimmed history stays visible. Field sizes are bounded too (160-character task titles, 4000-character task descriptions and progress, 500-character criteria and blockers, 2048-character ref URIs, 300-character reasons, 2000-character team descriptions, 64-character request IDs, 32-character 32-hex record IDs). Idempotency records are durable and keyed per actor, request ID and fingerprint; reaching 1000 recorded requests is a capacity error, never silent eviction.
+
+## Isolated team file views (opt-in)
+
+Enable both `codexSubagent.taskBoard.enabled` and `codexSubagent.isolatedViews.enabled` in **User Settings** to use immutable shared snapshots with private worker overlays. Capture once, explicitly bind a stopped owned team member, then resume it. Unbound turns retain legacy behavior; bound workers never fall back to live files when their view is unavailable. Their shell tools return an explicit unavailable result until physical runners exist.
+
+Workers can seal immutable submissions for review. Later edits leave earlier submissions unchanged; explicit retention pins and cleanup manage their lifetime. Board acceptance still does not imply integration, and board references do not pin stored content automatically. See [isolated file views](docs/isolated-views.md) for tools, capture rules, supported layouts, limits, recovery and subsequent-stage contracts.
 
 ## Preservation and workspaces
 

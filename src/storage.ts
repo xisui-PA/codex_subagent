@@ -9,7 +9,7 @@ const partSchema = z.discriminatedUnion('type', [callSchema, z.object({ type: z.
 const stateSchema = z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']);
 const failureSchema = z.object({ code: z.string(), message: z.string(), retryable: z.boolean() });
 const sessionSchema = z.object({
-  schema: z.literal(1), id: z.string().regex(/^[a-f0-9]{32}$/), title: z.string(), instructions: z.string(),
+  schema: z.union([z.literal(1), z.literal(2)]), id: z.string().regex(/^[a-f0-9]{32}$/), title: z.string(), instructions: z.string(),
   model: z.object({ id: z.string(), name: z.string(), vendor: z.string(), family: z.string(), version: z.string(), maxInputTokens: z.number().positive() }),
   permission: z.enum(['read-only', 'workspace-write']), state: stateSchema,
   messages: z.array(z.object({ role: z.enum(['user', 'assistant']), parts: z.array(partSchema) })),
@@ -18,15 +18,19 @@ const sessionSchema = z.object({
   summary: z.object({ text: z.string(), through: z.number().int().nonnegative() }).optional(), revision: z.number().int().nonnegative(), createdAt: z.string(), updatedAt: z.string()
   , ownerId: z.string().optional(), ownerLabel: z.string().optional(), parentPolicy: z.enum(['keep', 'cancel-on-expiry']).optional(), parentExpiresAt: z.number().optional(), parentLeaseSeconds: z.number().optional(), maintenanceError: failureSchema.optional(), workspaceRoot: z.string().optional(), activity: z.string().optional(),
   messageBase: z.number().int().nonnegative().optional(), archives: z.array(z.object({ id: z.string().uuid(), firstMessage: z.number().int().nonnegative(), messageCount: z.number().int().nonnegative(), createdAt: z.string() })).optional(),
-  maintenance: z.object({ kind: z.literal('revert'), previousState: stateSchema }).optional(),
+  maintenance: z.object({ kind: z.enum(['revert', 'isolation']), previousState: stateSchema }).optional(),
+  isolatedView: z.strictObject({ teamId: z.string().regex(/^[a-f0-9]{32}$/), snapshotId: z.string().regex(/^[a-f0-9]{64}$/), overlayId: z.string().regex(/^[a-f0-9]{64}$/) }).optional(),
   changes: z.array(z.object({ id: z.string().uuid(), path: z.string(), target: z.string().optional(), kind: z.enum(['write', 'delete', 'rename']), state: z.enum(['pending', 'applied', 'reverted']), createdAt: z.string() })).optional()
-});
+}).refine(session => session.schema === 1 ? session.isolatedView === undefined
+  : session.isolatedView !== undefined && !!session.ownerId && session.ownerId.length <= 200
+    && !!session.workspaceRoot && path.isAbsolute(session.workspaceRoot),
+'Schema 2 requires a permanent private view marker, owner and original absolute root; schema 1 cannot carry a marker.');
 
 export function digest(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
-export async function atomicWrite(file: string, text: string, mode = 0o600): Promise<void> {
+export async function atomicWrite(file: string, text: string, mode = 0o600, beforeRename?: () => void): Promise<void> {
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${randomUUID()}.tmp`;
   try {
@@ -36,6 +40,7 @@ export async function atomicWrite(file: string, text: string, mode = 0o600): Pro
     } finally {
       await handle.close();
     }
+    beforeRename?.();
     await fs.rename(temporary, file);
     // Flush the rename too. Some platforms do not support directory fsync.
     try {
@@ -167,10 +172,13 @@ export class SessionStore {
           this.sessions.set(s.id, s);
           if (s.state === 'running' || s.state === 'queued') {
             await this.change(s.id, draft => {
-              if (draft.maintenance?.kind === 'revert') {
+              if (draft.maintenance) {
+                const isolated = draft.maintenance.kind === 'isolation';
                 draft.state = draft.maintenance.previousState;
-                draft.activity = 'Revert interrupted; inspect saved changes';
-                draft.maintenanceError = { code: 'edit_interrupted', message: 'A Revert was interrupted by host restart. Inspect its pending change snapshot and current file contents before repeating it.', retryable: true };
+                draft.activity = isolated ? 'Private view binding interrupted; inspect and retry' : 'Revert interrupted; inspect saved changes';
+                draft.maintenanceError = { code: 'edit_interrupted', message: isolated
+                  ? 'Private view maintenance was interrupted. Inspect the saved binding and retry the same request; marked workers cannot use live workspace files.'
+                  : 'A Revert was interrupted by host restart. Inspect its pending change snapshot and current file contents before repeating it.', retryable: true };
                 draft.maintenance = undefined;
                 return;
               }
@@ -244,16 +252,17 @@ export class SessionStore {
       this.sessions.set(session.id, structuredClone(session));
     });
   }
-  async change(id: string, update: (draft: Session) => void): Promise<Session> {
+  async change(id: string, update: (draft: Session) => void, authorize?: () => void): Promise<Session> {
     return this.mutex.run(async () => {
       if (!this.lock) {
         throw new WorkerError('store_closed', 'Session store is not owned by this host.');
       }
+      authorize?.();
       const draft = this.get(id);
       update(draft);
       draft.revision++;
       draft.updatedAt = new Date().toISOString();
-      await atomicWrite(path.join(this.directory, `${id}.json`), JSON.stringify(draft));
+      await atomicWrite(path.join(this.directory, `${id}.json`), JSON.stringify(draft), 0o600, authorize);
       this.sessions.set(id, draft);
       return structuredClone(draft);
     });
@@ -380,5 +389,5 @@ export class SessionStore {
 
 export function sessionHeader(s: Session): SessionHeader {
   const turn = [...s.turns].reverse().find(t => t.started) || s.turns.at(-1);
-  return { id: s.id, title: s.title, model: { ...s.model }, permission: s.permission, state: s.state, revision: s.revision, createdAt: s.createdAt, updatedAt: s.updatedAt, ownerId: s.ownerId, ownerLabel: s.ownerLabel, workspaceRoot: s.workspaceRoot, activity: s.activity, parentPolicy: s.parentPolicy, parentExpiresAt: s.parentExpiresAt, lastTurnId: turn?.id, lastAttempt: turn?.attempts };
+  return { id: s.id, title: s.title, model: { ...s.model }, permission: s.permission, state: s.state, revision: s.revision, createdAt: s.createdAt, updatedAt: s.updatedAt, ownerId: s.ownerId, ownerLabel: s.ownerLabel, workspaceRoot: s.workspaceRoot, activity: s.activity, parentPolicy: s.parentPolicy, parentExpiresAt: s.parentExpiresAt, isolatedView: s.isolatedView ? { ...s.isolatedView } : undefined, lastTurnId: turn?.id, lastAttempt: turn?.attempts };
 }

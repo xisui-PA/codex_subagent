@@ -27,7 +27,7 @@ test('path traversal, symlinks and protected config writes are rejected', async 
   const { root } = await fixture(t);
   const tools = await FileTools.create([root], { canWrite: () => true, allowShell: () => false });
   await assert.rejects(tools.execute('read_file', { path: '../outside' }, 'read-only', signal()), { code: 'outside_workspace' });
-  await fs.symlink(root, path.join(root, 'link'));
+  await fs.symlink(root, path.join(root, 'link'), process.platform === 'win32' ? 'junction' : 'dir');
   await assert.rejects(tools.execute('list_files', { path: 'link' }, 'read-only', signal()), { code: 'symlink' });
   await fs.mkdir(path.join(root, '.vscode'));
   await assert.rejects(tools.execute('write_file', { path: '.vscode/settings.json', content: '{}', expectedHash: 'new' }, 'workspace-write', signal()), { code: 'protected_path' });

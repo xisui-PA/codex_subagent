@@ -12,6 +12,7 @@ test('registration preserves comments/unrelated settings and is repeatable', () 
   assert.equal(configuration(updated, '/Code App/bin/node', '/ext/relay.js', '/private/data'), updated, 'Activation repair must not rewrite unchanged config or accumulate blank lines');
   assert.ok(updated.startsWith(original));
   assert.equal(parse(updated).mcp_servers.codex_subagent.command, '/Code App/bin/node');
+  assert.ok(parse(updated).mcp_servers.codex_subagent.tool_timeout_sec >= 370, 'client timeout must cover the maximum worker wait plus transport margin');
   const again = configuration(updated, '/new/node', '/ext/relay.js', '/private/data');
   assert.equal((again.match(/\[mcp_servers.codex_subagent\]/g) || []).length, 1);
   assert.equal(parse(again).model, 'unchanged');

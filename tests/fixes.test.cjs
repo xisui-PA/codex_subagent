@@ -24,7 +24,16 @@ test('registration preserves symlinks and stable relay refreshes after upgrades'
   const { root } = await fixture(t);
   const target = path.join(root, 'dotfiles.toml');
   const file = path.join(root, 'config.toml');
-  await fs.writeFile(target, '# preserve\nmodel="original"\n'); await fs.symlink(target, file);
+  await fs.writeFile(target, '# preserve\nmodel="original"\n');
+  try {
+    await fs.symlink(target, file);
+  } catch (error) {
+    if (process.platform === 'win32' && ['EPERM', 'EACCES', 'ENOSYS'].includes(error.code)) {
+      t.skip('File symlink creation requires privileges unavailable on this Windows host.');
+      return;
+    }
+    throw error;
+  }
   const bundle = path.join(root, 'bundle.js'); await fs.writeFile(bundle, 'version one');
   const stable = await prepareRuntime(path.join(root, 'global'), bundle);
   await register(file, 'node', stable, '/registry');
@@ -37,6 +46,23 @@ test('registration preserves symlinks and stable relay refreshes after upgrades'
   assert.match(await fs.readFile(target, 'utf8'), /node-new/);
   await register(file, '', '', '', true);
   assert.ok((await fs.lstat(file)).isSymbolicLink());
+});
+
+test('stable relay upgrades and registration repair work without symlink privileges', async t => {
+  const { root } = await fixture(t);
+  const file = path.join(root, 'config.toml');
+  const bundle = path.join(root, 'bundle.js');
+  await fs.writeFile(file, '# preserve\nmodel="original"\n');
+  await fs.writeFile(bundle, 'version one');
+  const stable = await prepareRuntime(path.join(root, 'global'), bundle);
+  await register(file, 'node', stable, '/registry');
+  await fs.writeFile(bundle, 'version two');
+  assert.equal(await prepareRuntime(path.join(root, 'global'), bundle), stable);
+  assert.equal(await fs.readFile(stable, 'utf8'), 'version two');
+  assert.ok(await repairRegistration(file, 'node-new', stable, '/registry'));
+  assert.match(await fs.readFile(file, 'utf8'), /node-new/);
+  await register(file, '', '', '', true);
+  assert.match(await fs.readFile(file, 'utf8'), /model="original"/);
 });
 
 test('workspace-write spawn fails up front when write tools are unavailable', async t => {

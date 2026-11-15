@@ -95,6 +95,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
       return false;
     }
   };
+  const isolatedViewsEnabled = (): boolean => {
+    try {
+      return vscode.workspace.getConfiguration('codexSubagent').inspect<boolean>('isolatedViews.enabled')?.globalValue === true;
+    } catch {
+      return false;
+    }
+  };
   const syncBoardContext = (): void => {
     void vscode.commands.executeCommand('setContext', 'codexSubagent.taskBoardEnabled', boardEnabled());
   };
@@ -249,6 +256,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
       const next = new WorkerBroker({
         storage: context.globalStorageUri.fsPath, registry, roots: realRoots, identity, provider,
         taskBoardEnabled: boardEnabled,
+        isolatedViewsEnabled,
+        openDocuments: () => vscode.workspace.textDocuments.filter(document => document.isDirty
+          && (document.uri.scheme === 'file' || (document.isUntitled && path.isAbsolute(document.uri.fsPath))))
+          .map(document => ({ path: document.uri.fsPath, text: document.getText(), version: document.version })),
         settings: () => ({
           ...defaults,
           models: modelPool()

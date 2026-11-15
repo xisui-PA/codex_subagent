@@ -14,6 +14,9 @@ import type { BoardWorkspaceStatus } from './task-board-summary';
 import { Mutex, sessionHeader, SessionStore } from './storage';
 import { failure, Provider, Session, SessionHeader, Settings, WorkerError, WorkspaceTools } from './types';
 import { FileToolOptions, FileTools } from './workspace-tools';
+import { IsolatedViewHost } from './isolated-view-host';
+import { isIsolatedViewTool, isOfflineViewTool } from './isolated-view-tools';
+import type { OpenDocument } from './snapshot-content';
 import { contains, prepareWorkspaces, registeredWorktrees, rememberWorkspaceRoots, rootMetadata, worktreeRoot, workspaceCatalog, workspaceDirectory } from './workspaces';
 
 export interface RuntimeOptions {
@@ -22,8 +25,11 @@ export interface RuntimeOptions {
   onChange: () => void; onError: (message: string) => void;
   /** Opt-in task board gate; absent or false keeps every board surface off. Read on every call. */
   taskBoardEnabled?: () => boolean;
+  isolatedViewsEnabled?: () => boolean;
+  /** Fresh owning-window dirty document enumeration, queried at each capture boundary. */
+  openDocuments?: () => OpenDocument[];
 }
-interface Local { root: string; roots: string[]; store: SessionStore; engine: WorkerEngine; files: FileTools; host: BridgeHost; board: BoardHost }
+interface Local { root: string; roots: string[]; store: SessionStore; engine: WorkerEngine; files: FileTools; host: BridgeHost; board: BoardHost; isolation: IsolatedViewHost }
 const identifier = z.string().regex(/^[a-f0-9]{32}$/);
 const changeIdentifier = z.string().uuid();
 export function unpack<T>(result: ToolResult): T {
@@ -132,6 +138,18 @@ class BoardHost implements BoardPort {
 
   async getTeam(actor: BoardActor, id: string): Promise<unknown> {
     return (await this.open()).getTeam(actor, id);
+  }
+
+  /** Synchronous live authorization used immediately before private publication. */
+  assertTeam(ownerId: string, teamId: string, workerId?: string): void {
+    this.assertUsable();
+    if (!this.board) {
+      throw new WorkerError('unavailable', 'The task board has not loaded.');
+    }
+    const team = this.board.getTeam({ kind: 'coordinator', ownerId }, teamId);
+    if (workerId && !team.memberWorkerIds.includes(workerId)) {
+      throw new WorkerError('permission_denied', 'This worker is no longer a member of the private view team.');
+    }
   }
 
   async createTeam(actor: BoardActor, input: unknown): Promise<unknown> {
@@ -291,14 +309,27 @@ export class WorkerBroker {
    * them, so write/shell policy and the authorize callback are unchanged, and
    * the board adds only session-bound, membership-checked metadata tools.
    */
-  private workerTools(files: FileTools, board: BoardHost): WorkspaceTools {
+  private viewsEnabled(): boolean {
+    return this.boardEnabled() && this.options.isolatedViewsEnabled?.() === true;
+  }
+
+  private isolationHost(root: string, store: SessionStore, board: BoardHost): IsolatedViewHost {
+    return new IsolatedViewHost(root, store, board, { enabled: () => this.viewsEnabled(), guard: () => {
+      if (this.closed) {
+        throw new WorkerError('host_stopping', 'The private view host is stopping.', true);
+      }
+    }, canWrite: this.options.files.canWrite, settings: this.options.settings, openDocuments: this.options.openDocuments });
+  }
+
+  private workerTools(files: FileTools, board: BoardHost, isolation: IsolatedViewHost): WorkspaceTools {
+    const scoped = (session: Session): WorkspaceTools => session.schema === 2 || session.isolatedView ? isolation.scoped(session) : files.forSession(session);
     return {
       get workspaceRoot() {
         return files.workspaceRoot;
       },
       definitions: permission => files.definitions(permission),
-      execute: (name, input, permission, signal, session, authorize) => files.execute(name, input, permission, signal, session, authorize),
-      forSession: session => workerBoardTools(board, session, () => this.boardEnabled(), this.options.onChange, files.forSession(session))
+      execute: (name, input, permission, signal, session, authorize) => (session ? scoped(session) : files).execute(name, input, permission, signal, session, authorize),
+      forSession: session => workerBoardTools(board, session, () => this.boardEnabled(), this.options.onChange, scoped(session))
     };
   }
 
@@ -355,17 +386,18 @@ export class WorkerBroker {
       if (this.boardEnabled()) {
         await board.open().catch(error => this.options.onError(`board ${root}: ${failure(error).message}`));
       }
-      const engine = new WorkerEngine(store, this.options.provider, this.workerTools(files, board), this.options.settings);
+      const isolation = this.isolationHost(root, store, board);
+      const engine = new WorkerEngine(store, this.options.provider, this.workerTools(files, board, isolation), this.options.settings);
       engine.onChange = this.options.onChange;
       engine.onError = (id, error) => this.options.onError(`${id}: ${failure(error).message}`);
       const host = new BridgeHost();
-      const local: Local = { root, roots, store, engine, files, host, board };
+      const local: Local = { root, roots, store, engine, files, host, board, isolation };
       this.local.set(root, local);
       try {
         await host.start(this.options.registry, roots, (name, args, signal, cwd) => this.invoke(cwd || root, name, args, signal));
       } catch (error) {
         this.local.delete(root);
-        const closing = board.close();
+        const closing = Promise.all([board.close(), isolation.close()]);
         await engine.shutdown(); await closing; await store.close(); throw error;
       }
       return local;
@@ -410,6 +442,9 @@ export class WorkerBroker {
       // Structured failure before routing: a disabled board never opens a store or a bridge.
       return this.boardFailure('feature_disabled', 'The task board is disabled; enable codexSubagent.taskBoard.enabled in User Settings.');
     }
+    if (isIsolatedViewTool(name) && !this.viewsEnabled()) {
+      return this.boardFailure('feature_disabled', 'Private views require User Settings codexSubagent.taskBoard.enabled and codexSubagent.isolatedViews.enabled.');
+    }
     if (args && typeof args === 'object' && 'workspaceRoot' in args) {
       cwd = z.string().min(1).max(8000).parse(args.workspaceRoot);
       const { workspaceRoot: _scope, ...rest } = args as Record<string, unknown>; void _scope; args = rest;
@@ -418,6 +453,12 @@ export class WorkerBroker {
     try {
       route = await this.route(cwd);
     } catch (error) {
+      if (isOfflineViewTool(name)) {
+        return this.savedInvoke(cwd, name, args, signal);
+      }
+      if (isIsolatedViewTool(name)) {
+        throw new WorkerError('workspace_changed', 'Restore the original open workspace root before capturing, binding or sealing a worker view. Saved submissions and retention remain administrable.');
+      }
       // Persisted history is still administrable after a folder is removed.
       // File-affecting operations never use this fallback.
       if (args && typeof args === 'object' && 'id' in args && ['ui_session', 'ui_change', 'subagent_status', 'subagent_cancel', 'subagent_delete', 'subagent_compact', 'subagent_discard_queued'].includes(name)) {
@@ -434,6 +475,18 @@ export class WorkerBroker {
     const { engine, store, files } = route.local;
     const respond = (value: unknown): ToolResult => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
     try {
+      if (isIsolatedViewTool(name)) {
+        const result = await route.local.isolation.invoke(name, args, engine, signal);
+        this.options.onChange();
+        return result;
+      }
+      if (['subagent_resume', 'subagent_send'].includes(name) && args && typeof args === 'object' && 'id' in args) {
+        const session = engine.session(identifier.parse(args.id));
+        if (session.schema === 2 || session.isolatedView) {
+          engine.assertOwner(session.id, 'ownerId' in args ? z.string().optional().parse(args.ownerId) : undefined);
+          await route.local.isolation.assertWorkerUsable(session, signal);
+        }
+      }
       if (isBoardTool(name)) {
         // Board tools are record-only metadata: they never touch worker sessions,
         // dispatch inference or automatically accept work; explicit acceptance stays
@@ -594,7 +647,12 @@ export class WorkerBroker {
       const store = new SessionStore(await workspaceDirectory(this.options.storage, root));
       await store.open();
       const engine = new WorkerEngine(store, this.options.provider, await FileTools.create([], this.options.files), this.options.settings);
+      const board = new BoardHost(store.directory, root, this.workerResolver(store), () => this.boardEnabled(), () => this.boardGuard());
+      const isolation = this.isolationHost(root, store, board);
       try {
+        if (isOfflineViewTool(name) && isIsolatedViewTool(name)) {
+          return await isolation.invoke(name, args, engine, signal);
+        }
         if (name === 'ui_session' || name === 'ui_change') {
           const a = z.object({ id: identifier, changeId: changeIdentifier.optional() }).strict().parse(args);
           const value = name === 'ui_session' ? { ...engine.session(a.id), storeDirectory: store.directory } : await store.readChange(a.id, changeIdentifier.parse(a.changeId));
@@ -605,7 +663,8 @@ export class WorkerBroker {
         }
         return await invoke(engine, name, args, signal);
       } finally {
-        await engine.shutdown(); await store.close();
+        const closing = Promise.all([isolation.close(), board.close()]);
+        await engine.shutdown(); await closing; await store.close();
       }
     });
   }
@@ -638,7 +697,7 @@ export class WorkerBroker {
         // Scope validation no longer permits this root. Withdraw its bridge so
         // history requests cannot forward back to the same retiring owner.
         await local.host.close();
-        const closing = local.board.close();
+        const closing = Promise.all([local.board.close(), local.isolation.close()]);
         await local.engine.shutdown(); await closing;
         await local.store.close();
         this.local.delete(root);
@@ -652,7 +711,7 @@ export class WorkerBroker {
     for (const local of this.local.values()) {
       // Keep the exact owner discoverable while effects drain. Incoming requests
       // receive host_stopping instead of falling back to an unrelated checkout.
-      const closing = local.board.close();
+      const closing = Promise.all([local.board.close(), local.isolation.close()]);
       await local.engine.shutdown(); await local.host.close(); await closing; await local.store.close();
     }
     this.local.clear();

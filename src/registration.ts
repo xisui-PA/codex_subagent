@@ -24,7 +24,8 @@ export function configuration(existing: string, executable: string, relay: strin
   }
   // JSON basic strings are valid TOML basic strings for these paths.
   const quote = (text: string): string => JSON.stringify(text);
-  base += `${base.endsWith('\n') || !base ? '' : '\n'}\n${begin}\n[mcp_servers.codex_subagent]\ncommand = ${quote(executable)}\nargs = [${quote(relay)}, "--registry", ${quote(registry)}]\nenv = { ELECTRON_RUN_AS_NODE = "1" }\nstartup_timeout_sec = 10\ntool_timeout_sec = 45\n${end}\n`;
+  // Cover the maximum derived wait (360s) plus transport/host margin.
+  base += `${base.endsWith('\n') || !base ? '' : '\n'}\n${begin}\n[mcp_servers.codex_subagent]\ncommand = ${quote(executable)}\nargs = [${quote(relay)}, "--registry", ${quote(registry)}]\nenv = { ELECTRON_RUN_AS_NODE = "1" }\nstartup_timeout_sec = 10\ntool_timeout_sec = 420\n${end}\n`;
   parse(base);
   return base;
 }

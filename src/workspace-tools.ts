@@ -18,6 +18,8 @@ const schemas = {
   rename_file: z.object({ path: z.string().min(1), target: z.string().min(1), expectedHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict(),
   run_command: z.object({ command: z.string().min(1).max(4000), path: z.string().default('.'), timeoutMs: z.number().int().min(1000).max(120_000).default(60_000) }).strict()
 };
+export const fileToolSchemas = schemas;
+
 const descriptions: Record<keyof typeof schemas, string> = {
   read_file: 'Read a UTF-8 workspace file in character pages. Returns SHA-256 of the full file for optimistic writes; use nextOffset for more.',
   list_files: 'List a workspace directory (one level), with pagination. Symlinks are not followed.',
@@ -27,7 +29,7 @@ const descriptions: Record<keyof typeof schemas, string> = {
   patch_file: 'Replace exactly one occurrence of oldText with newText in a file, using its current SHA-256 hash. Ambiguous or stale edits fail. Changes are reviewable in VS Code.',
   delete_file: 'Delete a workspace file only if its current hash matches expectedHash. A recoverable before-image is saved for the worker change review.',
   rename_file: 'Rename a workspace file to a new path. Requires its current expectedHash and a nonexistent destination. The parent directory must exist.',
-  run_command: 'Run a shell command only after the user approves it in VS Code, either one-time or for the active workspace session. No Codex sandbox or approval is inherited. Output is bounded; cancelled commands may have partial side effects.'
+  run_command: 'Run a shell command only after the user approves it in VS Code, either one-time or for the active workspace session. Windows uses cmd.exe (ComSpec); other platforms use /bin/sh. No Codex sandbox or approval is inherited. Output is bounded; cancelled commands may have partial side effects.'
 };
 const hash = (text: string): string => createHash('sha256').update(text).digest('hex');
 const skipped = new Set(['node_modules', 'dist', 'build', 'coverage', 'vendor']);
