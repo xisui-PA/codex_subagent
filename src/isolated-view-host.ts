@@ -10,10 +10,15 @@ import type { IsolatedViewIdentity, IsolatedViewPort } from './isolated-view-por
 import type { OpenDocument } from './snapshot-content';
 import type { TaskBoard } from './task-board';
 import { captureProject } from './project-snapshot';
+import { RunnerExecution } from './runner-execution';
+import type { RunnerCommandResult } from './runner-results';
+import type { RunnerPoolCleanupResult, RunnerPoolStatus } from './runner-pool';
 import { digest, SessionStore } from './storage';
 import { Session, Settings, WorkerError, WorkspaceTools } from './types';
 import type { WorkerEngine } from './engine';
 import type { ToolResult } from './api';
+import { fileToolSchemas } from './workspace-tools';
+import type { CommandApprovalContext } from './workspace-tools';
 
 interface IsolationBoard {
   open(): Promise<TaskBoard>;
@@ -22,10 +27,71 @@ interface IsolationBoard {
 const sealSchema = z.strictObject({ requestId: z.string().min(1).max(200), expectedRevision: z.number().int().min(0).max(1024) });
 const sameBinding = (a: IsolatedViewBinding, b: IsolatedViewBinding): boolean => a.overlayId === b.overlayId && a.snapshotId === b.snapshotId && a.teamId === b.teamId;
 
+/**
+ * Live physical-runner configuration. `enabled` is read on every decision point
+ * (offered definition, pre-spawn policy, pre-approval, actual spawn); capacity
+ * and queue length are read once, when the runner manager for this canonical
+ * root is opened, because they describe a fixed set of slots that a restart -
+ * not a live edit - changes.
+ */
+export interface RunnerHostConfig {
+  readonly enabled: boolean;
+  readonly capacity: number;
+  readonly maxQueue: number;
+}
+
+const RUNNER_DEFAULTS: RunnerHostConfig = { enabled: false, capacity: 2, maxQueue: 32 };
+/** Accepted slot bounds; the same numbers package.json advertises. */
+export const RUNNER_CAPACITY_RANGE = { min: 1, max: 8, fallback: 2 } as const;
+export const RUNNER_QUEUE_RANGE = { min: 0, max: 256, fallback: 32 } as const;
+const PREVIEW_CHARS = 512;
+
+const preview = (value: string | undefined): string | undefined =>
+  (value === undefined ? undefined : value.length <= PREVIEW_CHARS ? value : value.slice(0, PREVIEW_CHARS));
+
+const boundedInteger = (value: unknown, range: { min: number; max: number; fallback: number }): number =>
+  (typeof value === 'number' && Number.isInteger(value) && value >= range.min && value <= range.max ? value : range.fallback);
+
+/**
+ * Reads the runner settings from a `WorkspaceConfiguration.inspect` surface.
+ * Only the User-level `globalValue` counts: a workspace or folder value can
+ * never enable execution or widen the resource bounds of a checkout, and an
+ * out-of-range value falls back to the documented default.
+ */
+export function readRunnerHostConfig(inspect: (key: string) => unknown): RunnerHostConfig {
+  const globalValue = (key: string): unknown => {
+    const entry = inspect(key);
+    return entry !== null && typeof entry === 'object' ? (entry as { globalValue?: unknown }).globalValue : undefined;
+  };
+  return {
+    enabled: globalValue('isolatedViews.runners.enabled') === true,
+    capacity: boundedInteger(globalValue('isolatedViews.runners.capacity'), RUNNER_CAPACITY_RANGE),
+    maxQueue: boundedInteger(globalValue('isolatedViews.runners.maxQueue'), RUNNER_QUEUE_RANGE)
+  };
+}
+
+/** Bounded, owner-scoped projection of one runner lease; never a raw record. */
+interface RunnerLeaseRow {
+  readonly id: string;
+  readonly slot: number;
+  readonly state: string;
+  readonly phase: string;
+  readonly retained: boolean;
+  readonly hasProcessIdentity: boolean;
+  readonly owner: { readonly workerId: string; readonly workerCreatedAt: string };
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly diagnostic?: string;
+}
+
+type RunnerStatusArgs = { ownerId: string; teamId: string; kind: 'leases' | 'queue' | 'results'; offset: number; limit: number };
+
 /** Lazy lifecycle handle, always drained before its SessionStore owner unlocks. */
 export class IsolatedViewHost {
   private views?: IsolatedViews;
   private opening?: Promise<IsolatedViews>;
+  private runners?: RunnerExecution;
+  private openingRunners?: Promise<RunnerExecution>;
   private closing = false;
   private drained?: Promise<void>;
   constructor(
@@ -38,6 +104,12 @@ export class IsolatedViewHost {
       canWrite: () => boolean;
       settings: () => Settings;
       openDocuments?: () => OpenDocument[];
+      /** Live physical-runner configuration; absent keeps runner execution off. */
+      runners?: () => RunnerHostConfig;
+      /** Global shell switch, read live; absent means new runners may not run. */
+      allowShell?: () => boolean;
+      /** Existing five-argument approval callback; the adapter adds runner context. */
+      approveCommand?: (command: string, cwd: string, signal: AbortSignal, workspaceRoot: string, context?: CommandApprovalContext) => Promise<boolean>;
     }
   ) {}
 
@@ -112,11 +184,130 @@ export class IsolatedViewHost {
 
   close(): Promise<void> {
     this.closing = true;
-    this.drained ??= (async () => {
+    if (this.drained) {
+      return this.drained;
+    }
+    // Order matters. The physical runner manager is drained FIRST: an in-flight
+    // open (including a failed one) is awaited, then close() aborts queued and
+    // running commands, waits for their durable result write and lease release,
+    // and only then is private view storage closed. A rejection here propagates,
+    // so the caller keeps the SessionStore owner lock instead of unlocking under
+    // work that may still be running.
+    const pending = (async () => {
+      const runners = this.openingRunners
+        ? await this.openingRunners.then(manager => manager, () => undefined)
+        : this.runners;
+      await runners?.close();
       const views = this.opening ? await this.opening.catch(() => undefined) : this.views;
       await views?.close();
     })();
+    this.drained = pending.catch((error: unknown) => {
+      this.drained = undefined;
+      throw error;
+    });
     return this.drained;
+  }
+
+  // -- physical runners --------------------------------------------------------
+
+  /** Live configuration; an absent callback means runners stay off. */
+  private runnerConfig(): RunnerHostConfig {
+    return this.options.runners?.() ?? RUNNER_DEFAULTS;
+  }
+
+  private runnerEnabled(): boolean {
+    return this.options.runners !== undefined && this.runnerConfig().enabled;
+  }
+
+  private shellAllowed(): boolean {
+    return this.options.allowShell?.() === true;
+  }
+
+  /** Enabled, shell-capable and with an approval surface to ask. */
+  private runnerAvailable(): boolean {
+    return this.runnerEnabled() && this.shellAllowed() && this.options.approveCommand !== undefined;
+  }
+
+  /** Host lifetime only: the execution flag never hides existing metadata. */
+  private runnerLifetimeGuard = (): void => {
+    if (this.closing) {
+      throw new WorkerError('host_stopping', 'The runner manager is stopping; no command was started.', true);
+    }
+  };
+
+  /** Runner storage sits beside the session store, never inside the project. */
+  private get runnerDirectory(): string {
+    return path.join(this.store.directory, 'runners');
+  }
+
+  /**
+   * Absent only when nothing exists (ENOENT). Any existing entry - including a
+   * file, link or junction that the manager must refuse - is reported as present
+   * so the manager opens and fails closed; other filesystem errors surface
+   * instead of being disguised as successful emptiness.
+   */
+  private async runnerDirectoryPresent(): Promise<boolean> {
+    try {
+      await fs.lstat(this.runnerDirectory);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Single-flight open of this root's manager. Construction reads capacity and
+   * queue length once, so only a restart changes them. A failed initializer is
+   * cached too: every awaiter - including Host.close() - stays on the same
+   * settled promise instead of racing a fresh opening, and the partially opened
+   * manager is drained before the failure is reported.
+   */
+  private async openRunners(): Promise<RunnerExecution> {
+    this.runnerLifetimeGuard();
+    if (!this.openingRunners) {
+      const config = this.runnerConfig();
+      const manager = new RunnerExecution(this.runnerDirectory, this.root, {
+        capacity: config.capacity,
+        maxQueue: config.maxQueue,
+        guard: this.runnerLifetimeGuard,
+        // Always callable: without an approval surface it simply declines, so
+        // observation and reconciliation never depend on one. Execution is
+        // gated separately, where a missing surface is a hard error.
+        approveCommand: async (request, signal) => {
+          const approve = this.options.approveCommand;
+          return approve === undefined
+            ? false
+            : approve(request.command, request.cwd, signal, request.logicalRoot, {
+              kind: 'isolated-runner', executionRoot: request.executionRoot, inputVersion: request.inputVersion
+            });
+        }
+      });
+      this.openingRunners = (async () => {
+        try {
+          await manager.open();
+        } catch (error) {
+          await manager.close().catch(() => undefined);
+          throw error;
+        }
+        this.runners = manager;
+        return manager;
+      })();
+    }
+    return this.openingRunners;
+  }
+
+  /** Existing manager, a cached failed open, or existing state worth opening. */
+  private async runnerStore(): Promise<RunnerExecution | undefined> {
+    if (this.runners) {
+      return this.runners;
+    }
+    if (this.openingRunners) {
+      return this.openingRunners;
+    }
+    return await this.runnerDirectoryPresent() ? this.openRunners() : undefined;
   }
 
   /** A current Session identity and live membership check, suitable for preRename. */
@@ -162,7 +353,13 @@ export class IsolatedViewHost {
       status: async (...args) => (await this.open()).status(...args)
     };
     const guard = this.workerGuard(session);
-    const files = new IsolatedWorkspaceTools(this.root, port, binding, identity, session.permission, { canWrite: this.options.canWrite, guard });
+    const runner = {
+      enabled: () => this.runnerEnabled(),
+      available: () => this.runnerAvailable(),
+      execute: (input: unknown, signal: AbortSignal, authorize?: () => void): Promise<string> =>
+        this.runBoundCommand(session, binding, identity, port, input, signal, authorize)
+    };
+    const files = new IsolatedWorkspaceTools(this.root, port, binding, identity, session.permission, { canWrite: this.options.canWrite, guard, runner });
     return {
       workspaceRoot: this.root,
       definitions: permission => {
@@ -181,37 +378,241 @@ export class IsolatedViewHost {
     };
   }
 
-  async assertWorkerUsable(session: Session, signal?: AbortSignal): Promise<void> {
-    this.commitGuard();
-    await this.board.open();
-    // Control operations use the engine's exact model selection/recovery
-    // policy. Checking the old model here would prevent explicit migration
-    // from a revoked model before the engine can select its enabled target.
-    const guard = this.workerGuard(session, undefined, signal, false);
-    guard();
-    const identity = { ownerId: session.ownerId!, workerId: session.id, workerCreatedAt: session.createdAt };
-    await (await this.open()).status(session.isolatedView!, identity, guard);
+  /**
+   * The live policy chain for one bound command. It is deliberately built
+   * WITHOUT the command's abort signal: the runner rechecks it after an approval
+   * and again at the actual spawn, and a cancelled command must be able to
+   * recheck policy (for instance to import partial changes) rather than be
+   * reported as a denial.
+   */
+  private runnerAuthorize(session: Session, engineAuthorize?: () => void): () => void {
+    return () => {
+      if (!this.runnerEnabled()) {
+        throw new WorkerError('feature_disabled', 'Physical runner execution is disabled; enable codexSubagent.isolatedViews.runners.enabled in User Settings.');
+      }
+      // Host lifetime, parent feature flags, the engine's live model check, the
+      // CURRENT Session identity and permanent binding, and team membership.
+      this.workerGuard(session, engineAuthorize)();
+      const current = this.store.get(session.id);
+      if (current.permission !== 'workspace-write' || session.permission !== 'workspace-write' || !this.options.canWrite()) {
+        throw new WorkerError('permission_denied', 'Shell execution requires a workspace-write worker.');
+      }
+      if (!this.shellAllowed()) {
+        throw new WorkerError('permission_denied', 'Shell commands are disabled by the global model policy.');
+      }
+      if (this.options.approveCommand === undefined) {
+        throw new WorkerError('permission_denied', 'Shell execution requires a command approval surface.');
+      }
+      const policy = this.options.settings().models?.[current.model.id];
+      if (policy?.allowShell === false) {
+        throw new WorkerError('permission_denied', `Model '${current.model.id}' no longer allows shell commands.`);
+      }
+    };
   }
 
-  private async presence(id: string): Promise<WorkerViewPresence> {
-    try {
-      const session = this.store.get(id);
-      return { state: 'present', workerCreatedAt: session.createdAt, binding: session.isolatedView };
-    } catch (error) {
-      if (!(error instanceof WorkerError) || error.code !== 'not_found') {
-        throw error;
+  /** Runs one approved command through the physical runner for this worker. */
+  private async runBoundCommand(
+    session: Session,
+    binding: IsolatedViewBinding,
+    identity: IsolatedViewIdentity,
+    port: IsolatedViewPort,
+    input: unknown,
+    signal: AbortSignal,
+    engineAuthorize?: () => void
+  ): Promise<string> {
+    const args = fileToolSchemas.run_command.parse(input);
+    const authorize = this.runnerAuthorize(session, engineAuthorize);
+    authorize();
+    const manager = await this.openRunners();
+    // The open is an await: recheck the live policy before the command is
+    // queued, and let the runner itself recheck again after approval.
+    authorize();
+    const result = await manager.execute(binding, identity, port, { command: args.command, path: args.path, timeoutMs: args.timeoutMs }, signal, authorize);
+    if (result.outcome === 'denied') {
+      throw new WorkerError('command_denied', `${result.diagnostic ?? 'The command was not approved.'} Runner result ${result.id} is recorded.`);
+    }
+    // The complete immutable record (command, setup identity, URN, versions,
+    // exit/output fields) is returned as stored; the two convenience booleans
+    // are derived here only because they are the tool-call vocabulary.
+    return JSON.stringify({ ...result, resultId: result.id, timedOut: result.outcome === 'timed_out', cancelled: result.outcome === 'cancelled' });
+  }
+
+  // -- runner observation and reconciliation -----------------------------------
+
+  private runnerSummary(manager: RunnerExecution | undefined, enabled: boolean): Record<string, unknown> {
+    const config = this.runnerConfig();
+    let status: ReturnType<RunnerExecution['status']> | undefined;
+    let error: string | undefined;
+    if (manager) {
+      try {
+        status = manager.status();
+      } catch (problem) {
+        error = problem instanceof Error ? problem.message : String(problem);
       }
     }
-    try {
-      // Unloaded/quarantined/corrupt existing files are UNKNOWN, not deleted.
-      await fs.lstat(path.join(this.store.directory, `${id}.json`));
-      return { state: 'unknown' };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return { state: 'missing' };
+    const pool = status?.pool ?? null;
+    return {
+      enabled,
+      open: status?.open === true,
+      capacity: pool?.capacity ?? config.capacity,
+      maxQueue: pool?.maxQueue ?? config.maxQueue,
+      activeCount: pool === null ? 0 : pool.slots.filter(slot => slot.state === 'active').length,
+      quarantinedCount: pool === null ? 0 : pool.slots.filter(slot => slot.state === 'quarantined').length,
+      queueLength: pool?.queue.length ?? 0,
+      resultCount: status?.results?.results ?? 0,
+      pendingCount: status?.results?.pending ?? 0,
+      ...(error === undefined ? {} : { error })
+    };
+  }
+
+  private page<T>(rows: readonly T[], offset: number, limit: number): { items: T[]; nextOffset: number | null } {
+    const items = rows.slice(offset, offset + limit);
+    const end = offset + items.length;
+    return { items, nextOffset: end < rows.length ? end : null };
+  }
+
+  /**
+   * Owner+team scoped, bounded runner state. Never returns another owner's
+   * identity, a raw lease journal or a full command output, and reading it never
+   * starts, kills or replays anything.
+   */
+  private async runnerStatus(args: RunnerStatusArgs): Promise<unknown> {
+    // Never creates storage that does not exist: an unused feature leaves no trace.
+    const manager = await this.runnerStore();
+    const scope = { ownerId: args.ownerId, teamId: args.teamId };
+    this.board.assertTeam(scope.ownerId, scope.teamId);
+    const summary = this.runnerSummary(manager, this.runnerEnabled());
+    let pool: RunnerPoolStatus | null = null;
+    if (manager) {
+      try {
+        pool = manager.status().pool;
+      } catch {
+        pool = null;
       }
-      return { state: 'unknown' };
     }
+    if (args.kind === 'results') {
+      if (!manager) {
+        return { kind: args.kind, summary, items: [], total: 0, nextOffset: null };
+      }
+      const results = manager.results.list(scope, args.offset, args.limit);
+      return {
+        kind: args.kind,
+        summary,
+        items: results.results.map(result => ({
+          id: result.id,
+          uri: result.uri,
+          workerId: result.attempt.owner.workerId,
+          workerCreatedAt: result.attempt.owner.workerCreatedAt,
+          outcome: result.outcome,
+          import: result.import,
+          version: result.version,
+          exitCode: result.exitCode,
+          signal: result.signal,
+          truncated: result.truncated,
+          drained: result.drained,
+          startedAt: result.attempt.startedAt,
+          completedAt: result.completedAt,
+          inputVersion: result.attempt.inputVersion,
+          afterVersion: result.afterVersion,
+          outputPreview: preview(result.output),
+          diagnosticPreview: preview(result.diagnostic)
+        })),
+        total: results.total,
+        nextOffset: results.nextOffset
+      };
+    }
+    const owned = pool === null ? [] : pool.leases
+      .filter(record => record.owner.ownerId === scope.ownerId && record.owner.teamId === scope.teamId)
+      .sort((a, b) => a.sequence - b.sequence);
+    const rows: (RunnerLeaseRow | { position: number; workerId: string; workerCreatedAt: string })[] = args.kind === 'queue'
+      ? (pool === null ? [] : pool.queue
+        .filter(entry => entry.owner.ownerId === scope.ownerId && entry.owner.teamId === scope.teamId)
+        .map(entry => ({ position: entry.position, workerId: entry.owner.workerId, workerCreatedAt: entry.owner.workerCreatedAt })))
+      : owned.map(record => ({
+        id: record.leaseId,
+        slot: record.slot,
+        state: record.state,
+        phase: record.phase,
+        retained: record.preserve,
+        hasProcessIdentity: record.process !== null,
+        owner: { workerId: record.owner.workerId, workerCreatedAt: record.owner.workerCreatedAt },
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+        ...(record.diagnostic === undefined ? {} : { diagnostic: preview(record.diagnostic) })
+      }));
+    return { kind: args.kind, summary, ...this.page(rows, args.offset, args.limit) };
+  }
+
+  /**
+   * One immutable result plus a clearly SEPARATE freshness reading. The stored
+   * record is returned untouched; `currentRevision`/`inputIsCurrent` are null
+   * whenever the live private view is not available (it is never opened just for
+   * this read), so a released, missing or corrupt overlay is never reported as
+   * current and no success is ever claimed from a stale command.
+   */
+  private async runnerResult(args: { ownerId: string; teamId: string; id: string }): Promise<unknown> {
+    const manager = await this.runnerStore();
+    this.board.assertTeam(args.ownerId, args.teamId);
+    if (!manager) {
+      throw new WorkerError('runner_results_not_found', 'No runner result store exists for this workspace yet.');
+    }
+    const result = manager.results.get(args.id, { ownerId: args.ownerId, teamId: args.teamId });
+    const derived = await this.runnerRevision(result);
+    return {
+      result,
+      version: result.version,
+      currentRevision: derived.revision,
+      inputIsCurrent: derived.current,
+      stale: derived.current === null ? null : !derived.current
+    };
+  }
+
+  private async runnerRevision(result: RunnerCommandResult): Promise<{ revision: number | null; current: boolean | null }> {
+    if (!this.views) {
+      // The private index is deliberately not loaded for a runner read.
+      return { revision: null, current: null };
+    }
+    const owner = result.attempt.owner;
+    const binding = { teamId: owner.teamId, snapshotId: result.attempt.inputVersion.snapshotId, overlayId: result.attempt.inputVersion.overlayId };
+    const identity = { ownerId: owner.ownerId, workerId: owner.workerId, workerCreatedAt: owner.workerCreatedAt };
+    try {
+      const overlay = await this.views.status(binding, identity, this.runnerLifetimeGuard);
+      if (overlay.released || overlay.overlayId !== binding.overlayId || overlay.snapshotId !== binding.snapshotId) {
+        return { revision: null, current: null };
+      }
+      return { revision: overlay.revision, current: overlay.revision === result.attempt.inputVersion.revision };
+    } catch {
+      return { revision: null, current: null };
+    }
+  }
+
+  /**
+   * Explicit, scoped, naturally idempotent reconciliation. No requestId is
+   * needed and no command is ever executed or replayed; the pool retains every
+   * unknown or unprovable identity. This is the only runner tool that may discard
+   * runner directories and drain processes this run still owns.
+   */
+  private async runnerCleanup(args: { ownerId: string; teamId: string }): Promise<unknown> {
+    const manager = await this.runnerStore();
+    // Re-assert membership after the awaited open, immediately before acting.
+    this.board.assertTeam(args.ownerId, args.teamId);
+    if (!manager) {
+      return {
+        complete: true, opened: false, discarded: [], discardedCount: 0,
+        retained: [], retainedCount: 0, unknownEntries: [], unknownCount: 0
+      };
+    }
+    const result: RunnerPoolCleanupResult = await manager.cleanup({ ownerId: args.ownerId, teamId: args.teamId });
+    return {
+      complete: true,
+      opened: true,
+      discarded: result.discarded.slice(0, 20),
+      discardedCount: result.discarded.length,
+      retained: result.retained.slice(0, 20).map(entry => ({ leaseId: entry.leaseId, reason: preview(entry.reason) })),
+      retainedCount: result.retained.length,
+      unknownEntries: result.unknownEntries.slice(0, 20),
+      unknownCount: result.unknownEntries.length
+    };
   }
 
   async invoke(name: IsolatedViewToolName, input: unknown, engine: WorkerEngine, signal?: AbortSignal): Promise<ToolResult> {
@@ -225,6 +626,25 @@ export class IsolatedViewHost {
       this.board.assertTeam(args.ownerId, args.teamId);
     };
     guard();
+    // Runner observation and reconciliation are answered from the runner store
+    // alone. They branch BEFORE private view storage is opened, so existing
+    // metadata, results and cleanup stay available when the private file index
+    // is missing, unloaded or corrupt, and they never load it just to read.
+    if (name === 'subagent_runner_status') {
+      const a = isolatedViewSchemas.subagent_runner_status.parse(input);
+      this.board.assertTeam(a.ownerId, a.teamId);
+      return viewResponse(await this.runnerStatus(a));
+    }
+    if (name === 'subagent_runner_result') {
+      const a = isolatedViewSchemas.subagent_runner_result.parse(input);
+      this.board.assertTeam(a.ownerId, a.teamId);
+      return viewResponse(await this.runnerResult(a));
+    }
+    if (name === 'subagent_runner_cleanup') {
+      const a = isolatedViewSchemas.subagent_runner_cleanup.parse(input);
+      this.board.assertTeam(a.ownerId, a.teamId);
+      return viewResponse(await this.runnerCleanup(a));
+    }
     const views = await this.open();
     if (name === 'subagent_snapshot_create') {
       const a = isolatedViewSchemas.subagent_snapshot_create.parse(input);
@@ -296,5 +716,38 @@ export class IsolatedViewHost {
       return viewResponse(await views.release(isolatedViewSchemas.subagent_view_release.parse(input), guard, id => this.presence(id)));
     }
     return viewResponse(await views.cleanup(isolatedViewSchemas.subagent_view_cleanup.parse(input), id => this.presence(id), guard));
+  }
+
+  async assertWorkerUsable(session: Session, signal?: AbortSignal): Promise<void> {
+    this.commitGuard();
+    await this.board.open();
+    // Control operations use the engine's exact model selection/recovery
+    // policy. Checking the old model here would prevent explicit migration
+    // from a revoked model before the engine can select its enabled target.
+    const guard = this.workerGuard(session, undefined, signal, false);
+    guard();
+    const identity = { ownerId: session.ownerId!, workerId: session.id, workerCreatedAt: session.createdAt };
+    await (await this.open()).status(session.isolatedView!, identity, guard);
+  }
+
+  private async presence(id: string): Promise<WorkerViewPresence> {
+    try {
+      const session = this.store.get(id);
+      return { state: 'present', workerCreatedAt: session.createdAt, binding: session.isolatedView };
+    } catch (error) {
+      if (!(error instanceof WorkerError) || error.code !== 'not_found') {
+        throw error;
+      }
+    }
+    try {
+      // Unloaded/quarantined/corrupt existing files are UNKNOWN, not deleted.
+      await fs.lstat(path.join(this.store.directory, `${id}.json`));
+      return { state: 'unknown' };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { state: 'missing' };
+      }
+      return { state: 'unknown' };
+    }
   }
 }

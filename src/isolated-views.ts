@@ -5,7 +5,7 @@
 import { promises as fs, lstatSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { ContentStore } from './snapshot-content';
+import { ContentStore, isFileMode } from './snapshot-content';
 import { LayeredTree } from './layered-tree';
 import type { SnapshotEntry, SnapshotManifest } from './snapshot-content';
 import type { SnapshotBacking, CapturedProject, PendingCapture, StoredSnapshot, OverlayRecord, OverlayRevision, SealedSubmission, ViewPin, ViewReceipt, IsolatedViewBinding } from './isolated-view-types';
@@ -1328,7 +1328,7 @@ export class IsolatedViews implements IsolatedViewPort {
       let fileEntrySize: number | undefined;
       switch (entry.type) {
         case 'file': {
-          if (Object.keys(entry).some(k => !['type', 'hash', 'size'].includes(k))) {
+          if (Object.keys(entry).some(k => !['type', 'hash', 'size', 'mode'].includes(k))) {
             invalid(`The manifest file entry ${JSON.stringify(key)} has unknown fields.`);
           }
           if (typeof entry.hash !== 'string' || !HEX64.test(entry.hash)) {
@@ -1336,6 +1336,12 @@ export class IsolatedViews implements IsolatedViewPort {
           }
           if (typeof entry.size !== 'number' || !Number.isSafeInteger(entry.size) || entry.size < 0) {
             invalid(`The manifest file entry ${JSON.stringify(key)} has a bad size.`);
+          }
+          // Optional executable mode metadata (legacy manifests omit it and
+          // read as 0o644); anything other than the two recorded modes is
+          // corrupt rather than silently dropped.
+          if (entry.mode !== undefined && !isFileMode(entry.mode)) {
+            invalid(`The manifest file entry ${JSON.stringify(key)} has a bad mode.`);
           }
           fileEntrySize = entry.size;
           files += 1;

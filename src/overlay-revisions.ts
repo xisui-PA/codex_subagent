@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { ContentStore, SnapshotManifest } from './snapshot-content';
+import { ContentStore, SnapshotManifest, isFileMode } from './snapshot-content';
 import { LayeredTree, Delta } from './layered-tree';
 import type { OverlayRevision } from './isolated-view-types';
 import type { IsolatedViewState } from './isolated-view-port';
@@ -40,6 +40,18 @@ export function parseOverlayRevision(bytes: Buffer): OverlayRevision {
     }
     if (value !== null && (!value || typeof value !== 'object' || !['file', 'directory'].includes((value as { type: string }).type))) {
       corrupt('Overlay changes support only ordinary files, directories and tombstones.');
+    }
+    // Optional executable mode metadata belongs to ordinary FILE changes only:
+    // absent is the documented 0o644 default for legacy revisions, and any
+    // other value (or a mode on a directory/tombstone) fails closed here
+    // instead of surviving into a materialized tree.
+    if (value !== null && typeof value === 'object') {
+      const change = value as { type?: unknown; mode?: unknown };
+      if ('mode' in change) {
+        if (change.type !== 'file' || !isFileMode(change.mode)) {
+          corrupt('Overlay changes carry an invalid file mode.');
+        }
+      }
     }
   }
   return record as unknown as OverlayRevision;

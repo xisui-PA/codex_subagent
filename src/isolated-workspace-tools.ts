@@ -120,10 +120,35 @@ export class IsolatedWorkspaceTools implements WorkspaceTools {
     private readonly binding: IsolatedViewBinding,
     private readonly identity: IsolatedViewIdentity,
     private readonly permission: Session['permission'],
-    private readonly options: { canWrite: () => boolean; guard?: () => void }
+    private readonly options: {
+      canWrite: () => boolean;
+      guard?: () => void;
+      /**
+       * Physical runner delegation. Absent keeps the exact legacy behavior:
+       * command execution is unavailable and never touches the main workspace.
+       * `enabled` is the live feature flag; `available` additionally requires a
+       * live shell policy and an approval surface, and decides whether the tool
+       * is offered at all.
+       */
+      runner?: {
+        enabled: () => boolean;
+        available: () => boolean;
+        execute: (input: unknown, signal: AbortSignal, authorize?: () => void) => Promise<string>;
+      };
+    }
   ) {}
 
+  /** Read-only or policy-revoked workers are never offered command execution. */
+  private writeAllowed(permission: Session['permission']): boolean {
+    return permission === 'workspace-write' && this.permission === 'workspace-write' && this.options.canWrite();
+  }
+
   definitions(permission: Session['permission']): Tool[] {
+    const seam = this.options.runner;
+    const offered = seam?.available() === true;
+    // The legacy adapter (no seam at all) keeps its exact old definition: the
+    // command stays visible and every call reports isolated_shell_unavailable.
+    // A real runner is offered only to a writable worker while it is usable.
     const descriptions: Record<FileToolName, string> = {
       read_file: 'Read UTF-8 content from this private revision; returns its full raw SHA-256 and line endings.',
       list_files: 'List the merged snapshot and private changes, including deletions and renames, with pagination.',
@@ -133,10 +158,14 @@ export class IsolatedWorkspaceTools implements WorkspaceTools {
       create_directory: 'Create a private directory. The parent must exist; protected paths are refused.',
       delete_file: 'Delete a private-view file only when its full raw hash matches expectedHash.',
       rename_file: 'Rename a private-view file without copying its bytes. Requires the current raw hash and an absent destination.',
-      run_command: 'Unavailable for isolated views until physical runners exist. This never executes in the main workspace.'
+      run_command: offered
+        ? 'Run one shell command in a private materialized copy of this exact revision after approval. Changed files are imported back into this private overlay; the main workspace is never modified. Output is bounded and the command is never replayed.'
+        : 'Unavailable: shell execution for isolated workers requires User Settings codexSubagent.isolatedViews.runners.enabled, a writable shell-enabled model and command approval. It never executes in the main workspace.'
     };
     return (Object.keys(fileToolSchemas) as FileToolName[]).filter(name =>
-      !mutations.has(name) || (permission === 'workspace-write' && this.permission === 'workspace-write' && this.options.canWrite())
+      name === 'run_command'
+        ? seam === undefined || (offered && this.writeAllowed(permission))
+        : !mutations.has(name) || this.writeAllowed(permission)
     ).map(name => ({ name, description: descriptions[name], inputSchema: z.toJSONSchema(fileToolSchemas[name]) }));
   }
 
@@ -145,14 +174,26 @@ export class IsolatedWorkspaceTools implements WorkspaceTools {
       signal.throwIfAborted();
       this.options.guard?.();
       authorize?.();
-      if (mutations.has(name) && (permission !== 'workspace-write' || this.permission !== 'workspace-write' || !this.options.canWrite())) {
+      if (mutations.has(name) && !this.writeAllowed(permission)) {
         throw new WorkerError('permission_denied', 'Private view writes are disabled.');
       }
     };
     guard();
     if (name === 'run_command') {
       fileToolSchemas.run_command.parse(input);
-      throw new WorkerError('isolated_shell_unavailable', 'Shell execution is unavailable for isolated workers until physical runners exist.');
+      if (this.options.runner?.enabled() !== true) {
+        throw new WorkerError('isolated_shell_unavailable', 'Shell execution is unavailable for isolated workers. It requires User Settings codexSubagent.isolatedViews.runners.enabled; commands still follow the existing approval model and never run in the main workspace.');
+      }
+      if (!this.writeAllowed(permission)) {
+        throw new WorkerError('permission_denied', 'Shell execution requires a workspace-write worker whose model still allows writes and shell.');
+      }
+      if (!this.options.runner.available()) {
+        throw new WorkerError('permission_denied', 'Shell commands are currently disabled by the shell policy or by an unavailable approval prompt.');
+      }
+      // The authorize chain passed on is deliberately NOT bound to this
+      // command's abort signal: the runner rechecks live policy after an
+      // approval or a cancellation, and being cancelled is not a policy denial.
+      return this.options.runner.execute(input, signal, authorize);
     }
     if (!mutations.has(name)) {
       return this.port.withView(this.binding, this.identity, view => executeViewRead(name, input, view, guard), guard);

@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto';
 import { lstat, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
+import { DEFAULT_FILE_MODE, EXECUTABLE_FILE_MODE, type FileMode } from './snapshot-content';
 import { WorkerError } from './types';
 
 export interface GitTrackedEntry {
@@ -32,6 +33,24 @@ export interface GitSelection {
   readonly untracked: readonly string[];
   readonly head: string | null;
   readonly fingerprint: string;
+}
+
+/**
+ * Executable-bit metadata for one stage-0 index mode: `100755` is executable
+ * and `100644` is not. Other modes (symlinks, gitlinks, unmerged stages) have
+ * no ordinary file mode and return undefined, so callers fall back to the
+ * mode observed on disk. This is the faithful source only where the platform
+ * cannot represent execute bits on disk (Windows); POSIX captures use the
+ * working-tree mode instead.
+ */
+export function fileModeFromGitMode(mode: string): FileMode | undefined {
+  if (mode === '100755') {
+    return EXECUTABLE_FILE_MODE;
+  }
+  if (mode === '100644') {
+    return DEFAULT_FILE_MODE;
+  }
+  return undefined;
 }
 
 export interface GitSnapshotRefRecord {

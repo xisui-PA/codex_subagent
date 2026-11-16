@@ -34,11 +34,69 @@ const descriptions: Record<keyof typeof schemas, string> = {
 const hash = (text: string): string => createHash('sha256').update(text).digest('hex');
 const skipped = new Set(['node_modules', 'dist', 'build', 'coverage', 'vendor']);
 
+/**
+ * The exact OS launch for one already-approved shell command.
+ *
+ * Windows uses Node's own CMD convention (see `normalizeSpawnArguments`): the
+ * whole command is a SINGLE `/d /s /c` argument wrapped in double quotes, and
+ * `windowsVerbatimArguments` stops Node's C-runtime escaping from prefixing the
+ * command's own quotes with backslashes. Without both, `start "" /b app` reaches
+ * cmd.exe as `start \"\" /b app`, so cmd tries to run a program literally named
+ * `\` and Windows shows a "cannot find" dialog. The approved command is never
+ * split, re-quoted, sanitized or otherwise rewritten: quotes, `&`, `|`, `>` and
+ * `%VAR%` reach cmd exactly as approved. `windowsHide` keeps an accidental
+ * console window from appearing. A `ComSpec` that is not cmd.exe keeps its
+ * previous unquoted form, because `/d /s /c` and this quoting are cmd-specific.
+ */
+export function shellLaunchSpec(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+  comspec: string | undefined = process.env.ComSpec
+): { file: string; args: string[]; options: { detached: boolean; windowsHide?: boolean; windowsVerbatimArguments?: boolean } } {
+  if (platform !== 'win32') {
+    // Unchanged POSIX launch: a detached /bin/sh group.
+    return { file: '/bin/sh', args: ['-c', command], options: { detached: true } };
+  }
+  const file = comspec || 'cmd.exe';
+  if (!/^(?:.*\\)?cmd(?:\.exe)?$/i.test(file)) {
+    return { file, args: ['/d', '/s', '/c', command], options: { detached: false, windowsHide: true } };
+  }
+  return {
+    file,
+    args: ['/d', '/s', '/c', `"${command}"`],
+    options: { detached: false, windowsHide: true, windowsVerbatimArguments: true }
+  };
+}
+
+/**
+ * Immutable, caller-supplied context for a command that runs inside a recorded
+ * isolated view. A trusted caller captures it BEFORE the approval prompt from
+ * the lease and its captured input, never from editable model arguments, so the
+ * reviewed identity (logical project, physical execution root, exact input
+ * revision) is exactly the identity that runs. A legacy workspace command has
+ * no context, and a four-argument approveCommand callback keeps exact legacy
+ * behavior.
+ */
+export interface CommandApprovalContext {
+  readonly kind: 'isolated-runner';
+  readonly executionRoot: string;
+  readonly inputVersion: {
+    readonly snapshotId: string;
+    readonly overlayId: string;
+    readonly revision: number;
+  };
+}
+
 export interface FileToolOptions {
   canWrite: () => boolean;
   allowShell: () => boolean;
   checkDocument?: (file: string) => void;
-  approveCommand?: (command: string, cwd: string, signal: AbortSignal, workspaceRoot: string) => Promise<boolean>;
+  /**
+   * Optional user approval for one shell command. The fifth argument carries
+   * the isolated-runner identity when the caller runs inside a recorded
+   * private view; a four-argument callback keeps exact legacy behavior.
+   */
+  approveCommand?: (command: string, cwd: string, signal: AbortSignal, workspaceRoot: string, context?: CommandApprovalContext) => Promise<boolean>;
   readOpenText?: (file: string) => string | undefined;
   applyChange?: (change: ChangeContent, expectedHash: string) => Promise<void>;
   recordChange?: (session: Session, change: ChangeContent) => Promise<void>;
@@ -371,7 +429,11 @@ export class FileTools implements WorkspaceTools {
   private command(command: string, cwd: string, timeoutMs: number, signal: AbortSignal): Promise<string> {
     return new Promise((resolve, reject) => {
       const windows = process.platform === 'win32';
-      const child = spawn(windows ? (process.env.ComSpec || 'cmd.exe') : '/bin/sh', windows ? ['/d', '/s', '/c', command] : ['-c', command], { cwd, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'] });
+      // The launcher is pure and per-call: an approved command is handed to the
+      // platform shell verbatim, never re-escaped. Confirm/approval ordering above
+      // is unchanged, and this is still the only spawn site.
+      const launch = shellLaunchSpec(command);
+      const child = spawn(launch.file, launch.args, { cwd, ...launch.options, stdio: ['ignore', 'pipe', 'pipe'] });
       let output = '';
       let truncated = false;
       let timedOut = false;

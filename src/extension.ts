@@ -16,6 +16,8 @@ import { ModelsTree } from './models-view';
 import { TaskBoardTree } from './task-board-view';
 import { prepareRuntime, register, repairRegistration } from './registration';
 import { WorkerBroker, unpack } from './runtime';
+import { readRunnerHostConfig } from './isolated-view-host';
+import type { RunnerHostConfig } from './isolated-view-host';
 import { Mutex } from './storage';
 import { ChangeContent, failure, Message, Model, ModelPolicy, Session, SessionHeader, WorkerError } from './types';
 import { VscodeProvider } from './vscode-provider';
@@ -100,6 +102,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
       return vscode.workspace.getConfiguration('codexSubagent').inspect<boolean>('isolatedViews.enabled')?.globalValue === true;
     } catch {
       return false;
+    }
+  };
+  // Physical runners: User level only, exactly like the flags above. The shared
+  // reader inspects globalValue exclusively, so a repository value can never
+  // enable execution or widen the slot/queue bounds of a checkout.
+  const runnerHostConfig = (): RunnerHostConfig => {
+    try {
+      return readRunnerHostConfig(key => vscode.workspace.getConfiguration('codexSubagent').inspect(key));
+    } catch {
+      return { enabled: false, capacity: 2, maxQueue: 32 };
     }
   };
   const syncBoardContext = (): void => {
@@ -257,6 +269,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
         storage: context.globalStorageUri.fsPath, registry, roots: realRoots, identity, provider,
         taskBoardEnabled: boardEnabled,
         isolatedViewsEnabled,
+        runners: runnerHostConfig,
         openDocuments: () => vscode.workspace.textDocuments.filter(document => document.isDirty
           && (document.uri.scheme === 'file' || (document.isUntitled && path.isAbsolute(document.uri.fsPath))))
           .map(document => ({ path: document.uri.fsPath, text: document.getText(), version: document.version })),
@@ -271,7 +284,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
           canWrite: () => configuredPoolAllows('allowWrite'),
           allowShell: () => configuredPoolAllows('allowShell'),
           readOpenText: file => openText(file)?.getText(), applyChange: applyEditorChange,
-          approveCommand: async (text, cwd, signal, workspaceRoot) => approvals.request(text, cwd, signal, workspaceRoot)
+          approveCommand: async (text, cwd, signal, workspaceRoot, context) => approvals.request(text, cwd, signal, workspaceRoot, context)
         }, onChange: () => {
           void refresh();
         }, onError: message => report(new WorkerError('checkpoint_failed', message))

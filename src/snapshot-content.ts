@@ -60,10 +60,54 @@ import { WorkerError } from './types';
 //  - Manifest keys are canonical POSIX root-relative paths in a
 //    prototype-less object; case-colliding paths fail with
 //    `snapshot_case_conflict`.
+//  - Every captured ordinary file records its executable bit as OPTIONAL
+//    `mode` metadata: 0o755 when any execute bit is set, 0o644 otherwise.
+//    Raw bytes are always stored verbatim, so encodings are never transcoded
+//    or re-normalized. Manifests persisted before this field existed omit
+//    `mode`; readers MUST treat an omitted mode as DEFAULT_FILE_MODE (0o644,
+//    never executable), which is the documented legacy default. Editor
+//    overrides keep the underlying captured mode when it is known and use
+//    the default for editor-only files; a caller that knows a better mode
+//    (a Git index mode, on Windows where the disk cannot represent execute
+//    bits) supplies it through CaptureOptions.fileMode.
 // ---------------------------------------------------------------------------
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const sha256 = (value: Buffer | string): string => createHash('sha256').update(value).digest('hex');
+
+/** Mode recorded for a captured file without any execute bit set. */
+export const DEFAULT_FILE_MODE = 0o644;
+/** Mode recorded for a captured file with at least one execute bit set. */
+export const EXECUTABLE_FILE_MODE = 0o755;
+/** The only two modes snapshot metadata records (executable bit only). */
+export type FileMode = typeof DEFAULT_FILE_MODE | typeof EXECUTABLE_FILE_MODE;
+
+/** Strict validator for persisted or supplied mode metadata. */
+export const isFileMode = (value: unknown): value is FileMode => value === DEFAULT_FILE_MODE || value === EXECUTABLE_FILE_MODE;
+
+/**
+ * Effective mode of a captured file entry. Entries persisted before mode
+ * metadata existed omit `mode` and are documented as 0o644 (never
+ * executable), so materialization is defined for every historical snapshot.
+ */
+export const fileModeOf = (entry: { readonly mode?: FileMode }): FileMode => entry.mode ?? DEFAULT_FILE_MODE;
+
+/**
+ * Map raw POSIX permission bits (as reported by `stat().mode`) to the recorded
+ * mode: executable when ANY of the owner/group/other execute bits is set.
+ * Written with division rather than bitwise operators (the repository forbids
+ * bitwise ones). Windows reports no POSIX execute bits, so a Windows disk
+ * capture is never executable.
+ */
+export function fileModeFromPermissions(mode: number): FileMode {
+  const permissions = mode % 0o1000;
+  return [permissions, Math.floor(permissions / 8), Math.floor(permissions / 64)].some(triplet => triplet % 8 % 2 === 1)
+    ? EXECUTABLE_FILE_MODE
+    : DEFAULT_FILE_MODE;
+}
+
+/** Mode observed for a stat'ed regular file. */
+const capturedFileMode = (stat: { mode: number }): FileMode => fileModeFromPermissions(stat.mode);
 
 /** Explicit capture capacity caps; callers may tighten, never exceed validation. */
 export interface CaptureLimits {
@@ -117,7 +161,7 @@ export interface OpenDocument {
 }
 
 export type SnapshotEntry =
-  | { type: 'file'; hash: string; size: number }
+  | { type: 'file'; hash: string; size: number; mode?: FileMode }
   | { type: 'directory' }
   | { type: 'unsupported'; detail: string }
   | { type: 'excluded'; detail: string };
@@ -131,7 +175,11 @@ export interface SnapshotManifest {
   fingerprint: string;
   fileCount: number;
   totalBytes: number;
-  /** Canonical POSIX root-relative path -> entry (prototype-less object). */
+  /**
+   * Canonical POSIX root-relative path -> entry (prototype-less object). File
+   * entries carry an optional `mode` (0o644/0o755); an omitted mode is the
+   * documented legacy default DEFAULT_FILE_MODE (0o644, not executable).
+   */
   entries: Record<string, SnapshotEntry>;
 }
 
@@ -155,6 +203,16 @@ export interface CaptureOptions {
   selection?: () => Promise<CaptureSelection>;
   /** Synchronous enumeration of open editor documents (unsaved text included). */
   openDocuments?: () => OpenDocument[];
+  /**
+   * Optional synchronous per-file mode source, consulted for every captured
+   * ordinary file (a Git index mode, for example). Keys are canonical
+   * root-relative POSIX paths; returning undefined falls back to the mode
+   * observed on disk. Anything other than 0o644/0o755 fails closed with
+   * `invalid_capture_mode`. The supplied mode also joins the per-file
+   * consistency signature, so a change between the two scans is retryable
+   * churn rather than a silent mix.
+   */
+  fileMode?: (key: string) => FileMode | undefined;
   /** Deterministic hook after the first scan of each attempt (tests inject churn here). */
   afterScan?: (attempt: number) => void | Promise<void>;
   /** Hook before every visited path is stat'ed (deterministic test swaps). */
@@ -530,8 +588,14 @@ async function planEditorDocuments(root: string, storeDirectory: string, documen
   return accepted;
 }
 
+/** One captured ordinary file: verbatim bytes plus its recorded mode. */
+interface CapturedFile {
+  bytes: Buffer;
+  mode: FileMode;
+}
+
 interface ScanResult {
-  files: Map<string, Buffer>;
+  files: Map<string, CapturedFile>;
   directories: Set<string>;
   unsupported: Map<string, string>;
   excluded: Map<string, string>;
@@ -551,7 +615,7 @@ interface ScanResult {
 
 const fingerprintOf = (scan: ScanResult): string => {
   const canonical = {
-    files: [...scan.files.entries()].sort().map(([key, bytes]) => [key, sha256(bytes)]),
+    files: [...scan.files.entries()].sort().map(([key, file]) => [key, sha256(file.bytes), file.mode]),
     signatures: [...scan.signatures.entries()].sort(),
     directories: [...scan.directories].filter(key => key !== '.').sort(),
     unsupported: [...scan.unsupported.entries()].sort(),
@@ -567,6 +631,7 @@ interface ScanHooks {
   beforeVisit?: (absolutePath: string) => void | Promise<void>;
   beforeRead?: (absolutePath: string) => void | Promise<void>;
   beforeList?: (absolutePath: string) => void | Promise<void>;
+  fileMode?: (key: string) => FileMode | undefined;
   guard?: () => void;
 }
 
@@ -604,6 +669,20 @@ async function scanWorkspace(root: string, store: ContentStore, limits: CaptureL
     if (scan.files.size >= limits.maxFiles) {
       throw new WorkerError('snapshot_capacity', `Capture has ${scan.files.size} files; maxFiles is ${limits.maxFiles}.`);
     }
+  };
+
+  /** Requested (e.g. Git index) mode, validated; the disk mode when absent. */
+  const resolveMode = (relative: string, onDisk: FileMode): FileMode => {
+    hooks.guard?.();
+    const supplied = hooks.fileMode?.(relative);
+    hooks.guard?.();
+    if (supplied === undefined) {
+      return onDisk;
+    }
+    if (!isFileMode(supplied)) {
+      throw new WorkerError('invalid_capture_mode', `The fileMode hook returned an invalid mode ${JSON.stringify(supplied)} for ${relative}.`);
+    }
+    return supplied;
   };
 
   const toRel = (absolute: string): string | undefined => {
@@ -810,7 +889,8 @@ async function scanWorkspace(root: string, store: ContentStore, limits: CaptureL
       throw new WorkerError('snapshot_capacity', `File ${relative} exceeds maxFileBytes ${limits.maxFileBytes}.`);
     }
     const sameFile = (current: LstatResult): boolean => current.isFile() && current.dev === beforeStat.dev && current.ino === beforeStat.ino
-      && current.size === beforeStat.size && current.mtimeMs === beforeStat.mtimeMs && current.ctimeMs === beforeStat.ctimeMs;
+      && current.size === beforeStat.size && current.mtimeMs === beforeStat.mtimeMs && current.ctimeMs === beforeStat.ctimeMs
+      && current.mode === beforeStat.mode;
     hooks.guard?.();
     // O_NOFOLLOW protects the leaf where supported; handle identity also
     // detects parent-junction redirection. O_NONBLOCK avoids waiting on a
@@ -844,10 +924,12 @@ async function scanWorkspace(root: string, store: ContentStore, limits: CaptureL
       throw new CaptureChanged(`File ${relative} changed during its read`);
     }
     // Per-file identity/stat signature (root+component-chain dev/ino plus
-    // size/mtime/ctime) folded into the fingerprint, so a same-byte rewrite
-    // or touch between the two scans is retryable churn, not a false match.
-    scan.signatures.set(relative, `${beforeSignature}|${beforeStat.size}:${beforeStat.mtimeMs}:${beforeStat.ctimeMs}`);
-    scan.files.set(relative, bytes);
+    // size/mtime/ctime/mode) folded into the fingerprint, so a same-byte
+    // rewrite, touch or chmod between the two scans is retryable churn, not a
+    // false match.
+    const mode = resolveMode(relative, capturedFileMode(beforeStat));
+    scan.signatures.set(relative, `${beforeSignature}|${beforeStat.size}:${beforeStat.mtimeMs}:${beforeStat.ctimeMs}:${mode}`);
+    scan.files.set(relative, { bytes, mode });
     addEntry();
   };
 
@@ -863,12 +945,16 @@ async function scanWorkspace(root: string, store: ContentStore, limits: CaptureL
       throw new WorkerError('snapshot_capacity', `Editor document ${relative} exceeds maxFileBytes ${limits.maxFileBytes}.`);
     }
     const previous = scan.files.get(relative);
+    // An editor override keeps the underlying captured mode when it is known
+    // (disk or Git index) and uses the documented default for an editor-only
+    // file, which has no on-disk mode at all.
+    const mode = previous?.mode ?? DEFAULT_FILE_MODE;
     if (previous === undefined) {
       addFileBytes(bytes, relative);
       addEntry();
-    } else if (bytes.length !== previous.length) {
+    } else if (bytes.length !== previous.bytes.length) {
       // Override of already-captured disk bytes: adjust the running total.
-      scan.totalBytes += bytes.length - previous.length;
+      scan.totalBytes += bytes.length - previous.bytes.length;
       if (scan.totalBytes > limits.maxTotalBytes) {
         throw new WorkerError('snapshot_capacity', `Capture is ${scan.totalBytes} bytes total; maxTotalBytes is ${limits.maxTotalBytes}.`);
       }
@@ -884,7 +970,7 @@ async function scanWorkspace(root: string, store: ContentStore, limits: CaptureL
         addEntry();
       }
     }
-    scan.files.set(relative, bytes);
+    scan.files.set(relative, { bytes, mode });
     scan.documents.set(relative, documentVersion(document));
   }
   return scan;
@@ -921,7 +1007,8 @@ async function buildManifest(root: string, store: ContentStore, scan: ScanResult
       entries[key] = { type: 'directory' };
     }
   }
-  for (const [key, bytes] of scan.files) {
+  for (const [key, file] of scan.files) {
+    const { bytes, mode } = file;
     // The capture guard is checked before and after the storage await and
     // immediately before publication: revocation aborts, never a partial
     // success. A pluggable storeContent returns the hash of `bytes` verbatim;
@@ -939,7 +1026,7 @@ async function buildManifest(root: string, store: ContentStore, scan: ScanResult
     if (hash !== expectedHash) {
       throw new WorkerError('snapshot_content_missing', `storeContent returned hash ${JSON.stringify(hash)} which is not the exact SHA-256 of the captured bytes for ${key}; refusing to publish a capture over unverifiable content.`);
     }
-    entries[key] = { type: 'file', hash, size: bytes.length };
+    entries[key] = { type: 'file', hash, size: bytes.length, mode };
   }
   const manifest: SnapshotManifest = {
     schema: 1,
@@ -982,7 +1069,7 @@ export async function captureContent(root: string, store: ContentStore, options:
   guard?.();
   const realRoot = await fs.realpath(resolved);
   guard?.();
-  const hooks: ScanHooks = { beforeVisit: options.beforeVisit, beforeRead: options.beforeRead, beforeList: options.beforeList, guard };
+  const hooks: ScanHooks = { beforeVisit: options.beforeVisit, beforeRead: options.beforeRead, beforeList: options.beforeList, fileMode: options.fileMode, guard };
   const enumerate = (): OpenDocument[] => {
     const raw = options.openDocuments ? options.openDocuments() : [];
     // Clone synchronously before any path checks or namespace planning await.

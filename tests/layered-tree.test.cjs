@@ -10,6 +10,7 @@ function loadBuildDir() {
 
 const buildDir = loadBuildDir();
 const { LayeredTree } = require(path.join(buildDir, 'layered-tree'));
+const { fileModeOf } = require(path.join(buildDir, 'snapshot-content'));
 const { WorkerError } = require(path.join(buildDir, 'types'));
 
 const hashA = 'a'.repeat(64);
@@ -330,4 +331,68 @@ test('filesystem root anchors preserve absolute paths and reject drive-relative 
   for (const invalid of ['', 'relative', 'C:']) {
     assert.throws(() => new LayeredTree(invalid, {}), { code: 'isolation_corrupt' });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Executable mode metadata: validate, freeze and preserve through overlays.
+// ---------------------------------------------------------------------------
+
+test('executable mode metadata roundtrips through overlay writes and renames', () => {
+  const executable = { type: 'file', hash: hashA, size: 10, mode: 0o755 };
+  const base = { 'bin': dir(), 'bin/tool.sh': executable, 'README.md': file(hashB, 20) };
+  const tree = new LayeredTree(unixRoot, base, undefined, options);
+
+  // Persisted mode metadata is validated, preserved and frozen.
+  const stat = tree.stat('bin/tool.sh');
+  assert.equal(stat.mode, 0o755);
+  assert.ok(Object.isFrozen(stat));
+
+  // Overwrites keep the recorded mode unless an explicit mode is supplied.
+  assert.deepEqual(tree.write('bin/tool.sh', hashB, 2, hashA), {
+    'bin/tool.sh': { type: 'file', hash: hashB, size: 2, mode: 0o755 },
+  });
+  assert.deepEqual(tree.write('bin/tool.sh', hashB, 2, hashA, 0o644), {
+    'bin/tool.sh': { type: 'file', hash: hashB, size: 2, mode: 0o644 },
+  });
+
+  // Renames preserve the mode; a legacy entry without one keeps its exact shape.
+  assert.deepEqual(tree.rename('bin/tool.sh', 'bin/copy.sh', hashA), {
+    'bin/tool.sh': null,
+    'bin/copy.sh': { type: 'file', hash: hashA, size: 10, mode: 0o755 },
+  });
+  assert.deepEqual(tree.rename('README.md', 'notes.md', hashB), {
+    'README.md': null,
+    'notes.md': file(hashB, 20),
+  });
+
+  // New files: an explicit mode is recorded; an omitted one stays absent and
+  // resolves to the documented 0o644 default.
+  assert.deepEqual(tree.write('bin/new.sh', hashC, 1, 'new', 0o755), {
+    'bin/new.sh': { type: 'file', hash: hashC, size: 1, mode: 0o755 },
+  });
+  const plain = tree.write('bin/plain.txt', hashC, 1, 'new');
+  assert.deepEqual(plain, { 'bin/plain.txt': file(hashC, 1) });
+  assert.equal(fileModeOf(plain['bin/plain.txt']), 0o644);
+
+  // A successor tree carries every recorded mode through the persisted deltas.
+  const next = new LayeredTree(unixRoot, base, [
+    tree.rename('bin/tool.sh', 'bin/copy.sh', hashA),
+    tree.write('bin/new.sh', hashC, 1, 'new', 0o755),
+  ], options);
+  assert.equal(next.stat('bin/copy.sh').mode, 0o755);
+  assert.equal(next.stat('bin/new.sh').mode, 0o755);
+  assert.equal(fileModeOf(next.stat('README.md')), 0o644);
+
+  // Invalid modes fail closed on persisted data and on planner input.
+  for (const bad of [0o600, 0o777, '755', null]) {
+    assert.throws(() => new LayeredTree(unixRoot, { 'a.sh': { ...file(hashA, 1), mode: bad } }, undefined, options), { code: 'isolation_corrupt' });
+  }
+  assert.throws(() => tree.write('bin/x.sh', hashA, 1, 'new', 0o600), { code: 'invalid_path' });
+  assert.throws(() => tree.write('bin/tool.sh', hashB, 2, hashA, 392), { code: 'invalid_path' });
+
+  // Entries are deep-cloned: mutating the caller's object cannot change the tree.
+  const mutable = { ...executable };
+  const isolated = new LayeredTree(unixRoot, { 'bin': dir(), 'bin/tool.sh': mutable }, undefined, options);
+  mutable.mode = 0o644;
+  assert.equal(isolated.stat('bin/tool.sh').mode, 0o755);
 });

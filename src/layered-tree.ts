@@ -1,4 +1,5 @@
 import type { SnapshotEntry } from './snapshot-content';
+import { isFileMode, type FileMode } from './snapshot-content';
 import { WorkerError } from './types';
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,16 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * File entry with optional mode metadata. `mode` is emitted only when it is
+ * known (explicitly requested or preserved from an existing entry); an omitted
+ * mode means DEFAULT_FILE_MODE (0o644), the documented legacy default, so
+ * entries that never carried a mode keep their exact persisted shape.
+ */
+function fileEntry(hash: string, size: number, mode: FileMode | undefined): SnapshotEntry {
+  return mode === undefined ? { type: 'file', hash, size } : { type: 'file', hash, size, mode };
+}
+
+/**
  * Validate one persisted entry and return a frozen copy, so later mutation of
  * the caller's object cannot change the tree. An ordinary '__proto__' own key
  * is cloned like any other key, never treated as a prototype write.
@@ -57,21 +68,24 @@ function freezeEntry(key: string, raw: unknown): SnapshotEntry {
   if (!isPlainRecord(raw)) {
     fail('isolation_corrupt', `malformed entry for ${key}`);
   }
-  const fields = raw.type === 'file' ? ['type', 'hash', 'size']
+  const fields = raw.type === 'file' ? ['type', 'hash', 'size', 'mode']
     : raw.type === 'directory' ? ['type'] : ['type', 'detail'];
   if (Object.keys(raw).some(field => !fields.includes(field))) {
     fail('isolation_corrupt', `unknown entry field for ${key}`);
   }
   switch (raw.type) {
     case 'file': {
-      const { hash, size } = raw;
+      const { hash, size, mode } = raw;
       if (typeof hash !== 'string' || !HASH_RE.test(hash)) {
         fail('isolation_corrupt', `bad hash for ${key}`);
       }
       if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
         fail('isolation_corrupt', `bad size for ${key}`);
       }
-      return Object.freeze({ type: 'file', hash, size }) as SnapshotEntry;
+      if (mode !== undefined && !isFileMode(mode)) {
+        fail('isolation_corrupt', `bad mode for ${key}`);
+      }
+      return Object.freeze(fileEntry(hash, size, mode)) as SnapshotEntry;
     }
     case 'directory':
       return Object.freeze({ type: 'directory' } as SnapshotEntry);
@@ -234,13 +248,22 @@ export class LayeredTree {
     return out;
   }
 
-  /** Plan a file write (create or overwrite). Parent must be an existing directory. */
-  write(input: string, hash: string, size: number, expectedHash: string | 'new'): Delta {
+  /**
+   * Plan a file write (create or overwrite). Parent must be an existing
+   * directory. `mode` defaults to the existing entry's recorded mode on an
+   * overwrite; a new file (or a legacy entry without a mode) keeps the
+   * optional field absent, which readers resolve to DEFAULT_FILE_MODE
+   * (0o644). An explicit mode is validated and persisted.
+   */
+  write(input: string, hash: string, size: number, expectedHash: string | 'new', mode?: FileMode): Delta {
     if (typeof hash !== 'string' || !HASH_RE.test(hash)) {
       fail('invalid_path', 'hash must be 64 lowercase hex characters');
     }
     if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
       fail('invalid_path', 'size must be a non-negative integer');
+    }
+    if (mode !== undefined && !isFileMode(mode)) {
+      fail('invalid_path', 'mode must be 0o644 or 0o755');
     }
     const rawKey = this.normalize(input, true);
     if (rawKey === '.') {
@@ -249,9 +272,8 @@ export class LayeredTree {
     this.checkParentDir(rawKey);
     const key = this.canonicalizeParent(rawKey);
     const existingKey = this.findExisting(key);
-    const entry: SnapshotEntry = { type: 'file', hash, size };
-    if (existingKey !== undefined) {
-      const existing = this.map[existingKey];
+    const existing = existingKey === undefined ? undefined : this.map[existingKey];
+    if (existingKey !== undefined && existing !== undefined) {
       if (existing.type !== 'file') {
         fail('readonly_path', `cannot overwrite ${existingKey} as a file`);
       }
@@ -261,12 +283,12 @@ export class LayeredTree {
       if (expectedHash !== existing.hash) {
         fail('stale_hash', `stale hash for ${existingKey}`);
       }
-      return { [existingKey]: entry };
+      return { [existingKey]: fileEntry(hash, size, mode ?? existing.mode) };
     }
     if (expectedHash !== 'new') {
       fail('stale_hash', `no such entry: ${key}`);
     }
-    return { [key]: entry };
+    return { [key]: fileEntry(hash, size, mode) };
   }
 
   /** Plan directory creation; idempotent when the directory already exists. */
@@ -333,7 +355,9 @@ export class LayeredTree {
     this.checkParentDir(tgt);
     const canonTgt = this.canonicalizeParent(tgt);
     const tgtExisting = this.findExisting(canonTgt);
-    const entry: SnapshotEntry = { type: 'file', hash: existing.hash, size: existing.size };
+    // A rename preserves the file's recorded mode verbatim; a legacy entry
+    // without a mode stays without one (documented 0o644 default).
+    const entry = fileEntry(existing.hash, existing.size, existing.mode);
     if (tgtExisting !== undefined) {
       if (tgtExisting === srcKey) {
         // Self rename (no-op) or case-only rename: tombstone old key, then

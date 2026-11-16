@@ -11,7 +11,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const {
-  captureProject, readProjectContent, ensureProjectRetention, releaseProjectRetention
+  captureProject, readProjectContent, ensureProjectRetention, releaseProjectRetention, indexModeIsAuthoritative
 } = require('../.test-build/project-snapshot');
 const { ContentStore } = require('../.test-build/snapshot-content');
 const { GitSnapshotObjects } = require('../.test-build/git-snapshot-objects');
@@ -562,4 +562,97 @@ test('capture churn: a staged OID toggle or a layout flip between scans is incon
     gitOk(root, 'config', '--unset', 'core.sparseCheckout');
   }
   assert.equal((await (await GitSnapshotObjects.open(root, ns)).retained()).length, 0, 'still no ref after the layout flip');
+});
+
+// ---------------------------------------------------------------------------
+// Executable mode metadata: the working tree is authoritative on POSIX (an
+// unstaged chmod included), while Windows falls back to the Git index mode
+// because it cannot represent POSIX execute bits on disk.
+// ---------------------------------------------------------------------------
+
+test('Git index modes record executable metadata without touching bytes', async t => {
+  const made = await makeRepo('ps-mode-');
+  t.after(() => fs.rm(made.base, { recursive: true, force: true }));
+  const { root, store } = made;
+  const posix = process.platform !== 'win32';
+  // The mode-source policy is deterministic and testable on any host: only
+  // Windows treats the Git index mode as authoritative.
+  assert.equal(indexModeIsAuthoritative('win32'), true);
+  assert.equal(indexModeIsAuthoritative('linux'), false);
+  assert.equal(indexModeIsAuthoritative('darwin'), false);
+  const scriptBytes = '#!/bin/sh\necho hi\n';
+  await write(root, 'run.sh', scriptBytes);
+  await write(root, 'plain.txt', 'plain\n');
+  await write(root, 'untracked.sh', 'untracked\n');
+  gitOk(root, 'add', 'run.sh', 'plain.txt');
+  // Force the executable bit in the INDEX only (the working tree keeps its
+  // ordinary permissions), which is exactly what a core.fileMode=false
+  // checkout looks like.
+  const oid = gitOk(root, 'ls-files', '--stage', 'run.sh').trim().split(/\s+/)[1];
+  gitOk(root, 'update-index', '--add', '--cacheinfo', `100755,${oid},run.sh`);
+  assert.match(gitOk(root, 'ls-files', '--stage', 'run.sh'), /^100755 /, 'index mode is executable');
+  if (posix) {
+    await fs.chmod(path.join(root, 'untracked.sh'), 0o755);
+  }
+  const ns = id('ns-mode');
+  const storeObj = new ContentStore(store);
+  const project = await captureProject(root, storeObj, { snapshotId: id('snap-mode'), namespace: ns });
+  const entries = project.manifest.entries;
+  assert.equal(entries['plain.txt'].mode, 0o644, 'tracked non-executable file is not executable');
+  if (posix) {
+    // POSIX: the working tree is authoritative, so an index mode the checkout
+    // cannot represent (core.fileMode=false style) never overrides real disk
+    // permissions; the format still loads and stays verifiable.
+    assert.equal(entries['run.sh'].mode, 0o644, 'POSIX records the working-tree mode, not the index mode');
+  } else {
+    assert.equal(entries['run.sh'].mode, 0o755, 'Windows records the tracked executable index mode');
+  }
+  // Untracked files have no index record, so the disk mode is used.
+  assert.equal(entries['untracked.sh'].mode, posix ? 0o755 : 0o644, 'untracked file uses the disk mode');
+  // Mode metadata never alters the captured bytes or their hashes.
+  assert.equal(entries['run.sh'].hash, sha256(scriptBytes));
+  assert.deepEqual(await readProjectContent(project.backing, storeObj, entries['run.sh'].hash), Buffer.from(scriptBytes));
+  // An editor override of a tracked file keeps the underlying recorded mode.
+  const edited = await captureProject(root, storeObj, {
+    snapshotId: id('snap-mode-editor'),
+    namespace: ns,
+    openDocuments: () => [{ path: path.join(root, 'run.sh'), text: '#!/bin/sh\necho edited\n', version: 1 }]
+  });
+  assert.equal(edited.manifest.entries['run.sh'].mode, posix ? 0o644 : 0o755, 'editor override preserves the underlying mode');
+  assert.deepEqual(await readProjectContent(edited.backing, storeObj, edited.manifest.entries['run.sh'].hash), Buffer.from('#!/bin/sh\necho edited\n'));
+});
+
+test('POSIX: an unstaged chmod is captured while the index still says 100644', async t => {
+  if (process.platform === 'win32') {
+    t.skip('POSIX execute bits do not exist on Windows');
+    return;
+  }
+  const made = await makeRepo('ps-chmod-');
+  t.after(() => fs.rm(made.base, { recursive: true, force: true }));
+  const { root, store } = made;
+  const scriptBytes = '#!/bin/sh\necho chmod\n';
+  await write(root, 'tool.sh', scriptBytes);
+  gitOk(root, 'add', 'tool.sh');
+  // The chmod happens AFTER the add, so the index keeps 100644: exactly an
+  // unstaged mode change that a mode-faithful runner must reproduce.
+  await fs.chmod(path.join(root, 'tool.sh'), 0o755);
+  assert.match(gitOk(root, 'ls-files', '--stage', 'tool.sh'), /^100644 /, 'index mode is still non-executable');
+  const ns = id('ns-chmod');
+  const storeObj = new ContentStore(store);
+  const executable = await captureProject(root, storeObj, { snapshotId: id('snap-chmod-a'), namespace: ns });
+  assert.equal(executable.manifest.entries['tool.sh'].mode, 0o755, 'working-tree execute bit is captured');
+  assert.equal(executable.manifest.entries['tool.sh'].hash, sha256(scriptBytes), 'bytes are unchanged by the mode');
+  // An editor override of that executable working-tree file keeps 0o755.
+  const edited = await captureProject(root, storeObj, {
+    snapshotId: id('snap-chmod-editor'),
+    namespace: ns,
+    openDocuments: () => [{ path: path.join(root, 'tool.sh'), text: '#!/bin/sh\necho edited\n', version: 1 }]
+  });
+  assert.equal(edited.manifest.entries['tool.sh'].mode, 0o755, 'override preserves the underlying working-tree mode');
+  // Dropping the bit on disk is captured too, and the earlier capture keeps
+  // its own recorded mode (no live fallback, immutable snapshot metadata).
+  await fs.chmod(path.join(root, 'tool.sh'), 0o644);
+  const plain = await captureProject(root, storeObj, { snapshotId: id('snap-chmod-b'), namespace: ns });
+  assert.equal(plain.manifest.entries['tool.sh'].mode, 0o644, 'removed execute bit is captured');
+  assert.equal(executable.manifest.entries['tool.sh'].mode, 0o755, 'the older snapshot keeps its recorded mode');
 });

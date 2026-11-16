@@ -3,10 +3,12 @@
 This document describes the implemented stage of the opt-in disk-efficient
 team-worker feature: shared immutable project snapshots, private per-worker
 overlay revisions, sealed submissions, retention pins, cleanup, and the MCP
-tool surface. The task-board records remain separate from this file view. Nothing
-in this stage performs physical execution, peer messaging, automatic
-dispatch, or automatic acceptance; a sealed submission is an immutable
-artifact, not proof of validation or integration.
+tool surface. The task-board records remain separate from this file view. This
+stage implements no peer messaging, automatic dispatch or automatic
+acceptance; a sealed submission is an immutable artifact, not proof of
+validation or integration. Bound workers also get an opt-in bounded private
+shell; unbound legacy workers keep their existing shell behavior unchanged.
+See [runner workspaces](runner-workspaces.md).
 
 ## Enabling
 
@@ -139,10 +141,16 @@ revision deltas and serves `read_file`, `write_file`, `patch_file`,
   filters that could hide private files. Each coherent read operation
   reuses Git object-store discovery across files; it still checks
   authorization and reads and verifies the stored bytes on every read.
-- **No shell:** `run_command` is always `isolated_shell_unavailable`; it
-  never executes in the main workspace and never inherits main approval.
-  Existing model/permission denials may reject a call before it reaches
-  that adapter.
+- **Shell for bound workers:** with `codexSubagent.taskBoard.enabled`,
+  `isolatedViews.enabled` and `isolatedViews.runners.enabled` all on, a bound
+  worker's `run_command` runs as bounded private shell in its materialized view,
+  under its own approval prompt and its own grant kind, with a durable result
+  record. It never executes in the main workspace, never inherits legacy
+  approval, and never falls back to legacy routing. With the runner flag off,
+  `run_command` returns `isolated_shell_unavailable` and nothing is created;
+  unbound legacy workers are unaffected. See
+  [runner workspaces](runner-workspaces.md). Existing model/permission denials
+  may still reject a call before that adapter.
 
 ## Disk growth model
 
@@ -218,19 +226,24 @@ history, and board metadata are **not** roots.
 Existing model, permission, owner, lease, and history behavior is preserved
 unchanged.
 
-## Future contracts (not implemented in this stage)
+## Consumer obligations (not automatic behaviour)
 
-- Consumers (runners, validation, integration) will retain the exact
-  sealed artifacts they consume; pinning is the mechanism for that.
+- Consumers (runners, validation, integration) must retain the exact sealed
+  artifacts they consume; pinning is the mechanism for that. A stored runner
+  command result is evidence, not such a pin.
 - Integration must recheck current working-tree and dirty-editor base
   hashes and path protections before applying a sealed change.
 - The synthetic Git retention tree is **not** the project's tree or a
   project commit.
-- To materialize a manifest + deltas faithfully, executable bits and
-  encoding metadata must be added to the stored entries before any
-  mode-faithful physical runner can exist; they are not retained today.
-- No runners, integration, peer messaging, dispatch, or auto-acceptance
-  exist in this stage.
+- Stored entries retain a file mode (optional `644`/`755`, absent defaults to
+  `644`; POSIX disk mode including an unstaged `chmod`, Windows Git index bit),
+  and the physical view materializer applies it. General encoding metadata is
+  not retained: captured editor text is stored as UTF-8, so a runner must not
+  treat a captured editor override as encoding-preserving.
+- Runner execution for bound workers is implemented and opt-in; its slot pool,
+  materialized view, immutable command results, containment and approval prompt
+  are described in [runner workspaces](runner-workspaces.md). Integration, peer
+  messaging, dispatch and auto-acceptance still do not exist.
 
 ## Validation
 
@@ -241,3 +254,7 @@ recovery, scoped cleanup, permission revocation and shutdown/owner-lock
 draining, incomplete-index recovery, and explicit model migration.
 The storage-growth test binds 16 workers to one 1 MiB base and
 checks metadata growth plus deduplication of identical private payloads.
+Runner coverage lives with the runner module: pool, materialization, command
+results, approvals and the execution service each have their own focused
+suite, and POSIX execution cases skip rather than pass where the platform is
+unavailable. Whole-repository totals are reported from a dedicated run.

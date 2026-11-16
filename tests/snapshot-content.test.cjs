@@ -4,7 +4,10 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { ContentStore, captureContent, resolveDocumentKey } = require(path.resolve(__dirname, '..', process.env.CODEX_TEST_BUILD?.trim() || '.test-build', 'snapshot-content'));
+const {
+  ContentStore, captureContent, resolveDocumentKey,
+  DEFAULT_FILE_MODE, EXECUTABLE_FILE_MODE, fileModeOf, fileModeFromPermissions, isFileMode
+} = require(path.resolve(__dirname, '..', process.env.CODEX_TEST_BUILD?.trim() || '.test-build', 'snapshot-content'));
 
 const sha256 = v => crypto.createHash('sha256').update(v).digest('hex');
 const createRoot = async () => fs.mkdtemp(path.join(os.tmpdir(), 'snapshot-content-'));
@@ -444,4 +447,104 @@ test('limits are exact at their bounds; over-default limits and oversized editor
     limits: { maxFileBytes: 5 },
     openDocuments: () => [{ path: path.join(root, 'small.txt'), text: '0123456789', version: 1 }]
   }), { code: 'snapshot_capacity', message: /maxFileBytes/ });
+});
+
+// ---------------------------------------------------------------------------
+// Executable mode metadata (bounded prerequisite for mode-faithful runners).
+// ---------------------------------------------------------------------------
+
+test('captured files record executable mode metadata and never transcode bytes', async t => {
+  const root = await createRoot();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const posix = process.platform !== 'win32';
+  await fs.writeFile(path.join(root, 'plain.txt'), 'plain');
+  await fs.writeFile(path.join(root, 'tool.sh'), '#!/bin/sh\necho hi\n');
+  if (posix) {
+    await fs.chmod(path.join(root, 'tool.sh'), 0o755);
+  }
+  // A BOM + CRLF document proves mode metadata is added without touching the
+  // captured bytes (raw bytes already preserve encodings).
+  const bomCrlf = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('one\r\ntwo\r\n')]);
+  await fs.writeFile(path.join(root, 'bom.txt'), bomCrlf);
+  const store = new ContentStore(path.join(root, 'store'));
+  const manifest = await captureContent(root, store);
+  assert.equal(manifest.entries['plain.txt'].mode, DEFAULT_FILE_MODE);
+  // Windows has no POSIX execute bits, so a disk capture is never executable.
+  assert.equal(manifest.entries['tool.sh'].mode, posix ? EXECUTABLE_FILE_MODE : DEFAULT_FILE_MODE);
+  assert.equal(manifest.entries['bom.txt'].hash, sha256(bomCrlf));
+  assert.equal(manifest.entries['bom.txt'].mode, DEFAULT_FILE_MODE);
+  assert.deepEqual(await store.read(manifest.entries['bom.txt'].hash), bomCrlf);
+  // Every captured file entry carries an explicit mode; legacy manifests omit it.
+  for (const entry of Object.values(manifest.entries)) {
+    if (entry.type === 'file') {
+      assert.equal(isFileMode(entry.mode), true);
+    }
+  }
+});
+
+test('editor overrides preserve the underlying mode; editor-only files use the default', async t => {
+  const root = await createRoot();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const posix = process.platform !== 'win32';
+  await fs.writeFile(path.join(root, 'script.sh'), 'disk script');
+  if (posix) {
+    await fs.chmod(path.join(root, 'script.sh'), 0o755);
+  }
+  const store = new ContentStore(path.join(root, 'store'));
+  const documents = [
+    { path: path.join(root, 'script.sh'), text: 'unsaved script', version: 2 },
+    { path: path.join(root, 'notes', 'new.txt'), text: 'new doc', version: 1 }
+  ];
+  const manifest = await captureContent(root, store, { openDocuments: () => documents });
+  assert.equal(manifest.entries['script.sh'].mode, posix ? EXECUTABLE_FILE_MODE : DEFAULT_FILE_MODE, 'override keeps the underlying mode');
+  assert.deepEqual(await store.read(manifest.entries['script.sh'].hash), Buffer.from('unsaved script'));
+  assert.equal(manifest.entries['notes/new.txt'].mode, DEFAULT_FILE_MODE, 'editor-only file uses the documented default');
+});
+
+test('a caller-supplied mode (Git index) is validated and wins over the disk mode', async t => {
+  const root = await createRoot();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await fs.writeFile(path.join(root, 'tool.sh'), 'tool');
+  await fs.writeFile(path.join(root, 'other.txt'), 'other');
+  const store = new ContentStore(path.join(root, 'store'));
+  // Supplying 0o755 for a disk file without execute bits models a
+  // core.fileMode=false checkout: the recorded metadata is still faithful.
+  const supplied = await captureContent(root, store, {
+    fileMode: key => (key === 'tool.sh' ? EXECUTABLE_FILE_MODE : undefined)
+  });
+  assert.equal(supplied.entries['tool.sh'].mode, EXECUTABLE_FILE_MODE);
+  assert.equal(supplied.entries['other.txt'].mode, DEFAULT_FILE_MODE);
+  await assert.rejects(captureContent(root, store, { fileMode: () => 0o600 }), { code: 'invalid_capture_mode' });
+});
+
+test('legacy entries without mode resolve to the documented 0o644 default', () => {
+  assert.equal(DEFAULT_FILE_MODE, 0o644);
+  assert.equal(EXECUTABLE_FILE_MODE, 0o755);
+  assert.equal(fileModeOf({ type: 'file', hash: sha256('legacy'), size: 6 }), DEFAULT_FILE_MODE);
+  assert.equal(fileModeOf({ type: 'file', hash: sha256('legacy'), size: 6, mode: 0o755 }), EXECUTABLE_FILE_MODE);
+  assert.equal(isFileMode(0o644), true);
+  assert.equal(isFileMode(0o755), true);
+  for (const invalid of [0o600, 0o777, 420.5, '644', null]) {
+    assert.equal(isFileMode(invalid), false);
+  }
+});
+
+test('POSIX permission bits map to the recorded executable mode', () => {
+  // Typical stat() modes: the file-type bits are ignored and ANY owner/group/
+  // other execute bit makes the file executable (deterministic on every host).
+  for (const [bits, expected] of [
+    [0o100644, DEFAULT_FILE_MODE],
+    [0o100600, DEFAULT_FILE_MODE],
+    [0o100664, DEFAULT_FILE_MODE],
+    [0o100755, EXECUTABLE_FILE_MODE],
+    [0o100700, EXECUTABLE_FILE_MODE],
+    [0o100744, EXECUTABLE_FILE_MODE],
+    [0o100070, EXECUTABLE_FILE_MODE],
+    [0o100007, EXECUTABLE_FILE_MODE],
+    [0o100000, DEFAULT_FILE_MODE],
+    [0o644, DEFAULT_FILE_MODE],
+    [0o755, EXECUTABLE_FILE_MODE]
+  ]) {
+    assert.equal(fileModeFromPermissions(bits), expected, `mode ${bits.toString(8)}`);
+  }
 });

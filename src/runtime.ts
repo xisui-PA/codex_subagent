@@ -15,6 +15,7 @@ import { Mutex, sessionHeader, SessionStore } from './storage';
 import { failure, Provider, Session, SessionHeader, Settings, WorkerError, WorkspaceTools } from './types';
 import { FileToolOptions, FileTools } from './workspace-tools';
 import { IsolatedViewHost } from './isolated-view-host';
+import type { RunnerHostConfig } from './isolated-view-host';
 import { isIsolatedViewTool, isOfflineViewTool } from './isolated-view-tools';
 import type { OpenDocument } from './snapshot-content';
 import { contains, prepareWorkspaces, registeredWorktrees, rememberWorkspaceRoots, rootMetadata, worktreeRoot, workspaceCatalog, workspaceDirectory } from './workspaces';
@@ -26,6 +27,13 @@ export interface RuntimeOptions {
   /** Opt-in task board gate; absent or false keeps every board surface off. Read on every call. */
   taskBoardEnabled?: () => boolean;
   isolatedViewsEnabled?: () => boolean;
+  /**
+   * Live physical-runner configuration for isolated workers. Absent keeps runner
+   * execution off exactly as before: no runner storage is created and bound
+   * commands stay unavailable. The enabled flag is read on every decision point;
+   * capacity/maxQueue are applied when the runner manager is opened.
+   */
+  runners?: () => RunnerHostConfig;
   /** Fresh owning-window dirty document enumeration, queried at each capture boundary. */
   openDocuments?: () => OpenDocument[];
 }
@@ -318,7 +326,14 @@ export class WorkerBroker {
       if (this.closed) {
         throw new WorkerError('host_stopping', 'The private view host is stopping.', true);
       }
-    }, canWrite: this.options.files.canWrite, settings: this.options.settings, openDocuments: this.options.openDocuments });
+    }, canWrite: this.options.files.canWrite, settings: this.options.settings, openDocuments: this.options.openDocuments,
+    // Physical runners are an additional opt-in over the same parent flags;
+    // without the callback this host behaves exactly as before. The global
+    // shell switch and the approval surface are forwarded, not copied, so a
+    // live revocation is seen by every runner decision point.
+    runners: this.options.runners,
+    allowShell: this.options.files.allowShell,
+    approveCommand: this.options.files.approveCommand });
   }
 
   private workerTools(files: FileTools, board: BoardHost, isolation: IsolatedViewHost): WorkspaceTools {

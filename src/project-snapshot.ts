@@ -24,14 +24,24 @@
 // newly toggled layout becomes inconsistent_capture. Tracked
 // symlinks/gitlinks (120000/160000), unmerged stages and other modes are
 // recorded as explicit unsupported entries and never read.
+//
+// Every captured ordinary file also records OPTIONAL executable mode metadata
+// (`mode`: 0o755 or 0o644). The working-tree mode observed on disk is always
+// authoritative on POSIX, so an unstaged `chmod` (or an editor override of a
+// file) is captured exactly as the working tree holds it. Windows cannot
+// represent POSIX execute bits on disk at all, so there a tracked stage-0
+// entry's Git INDEX mode is used instead; untracked and non-Git files fall
+// back to the observed disk mode. Bytes are always stored verbatim (no
+// transcoding). Manifests written before this field existed omit `mode` and
+// read as 0o644 (documented legacy default).
 
 import { createHash } from 'node:crypto';
 import { lstat, readdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
-import { GitSnapshotError, GitSnapshotObjects, runGitProbe } from './git-snapshot-objects';
+import { GitSnapshotError, GitSnapshotObjects, fileModeFromGitMode, runGitProbe } from './git-snapshot-objects';
 import type { CapturedProject, SnapshotBacking } from './isolated-view-types';
-import { captureContent, type ContentStore, type OpenDocument } from './snapshot-content';
+import { captureContent, type ContentStore, type FileMode, type OpenDocument } from './snapshot-content';
 import { WorkerError } from './types';
 
 const ID_RE = /^[0-9a-f]{64}$/;
@@ -55,6 +65,14 @@ export interface CaptureProjectOptions {
 
 const sha256Hex = (value: Buffer | string): string => createHash('sha256').update(value).digest('hex');
 const foldKey = (value: string): string => (process.platform === 'win32' ? value.toLowerCase() : value);
+
+/**
+ * Which mode source is faithful on `platform`: Windows cannot represent POSIX
+ * execute bits on disk, so a tracked entry's Git index mode is used there;
+ * every other platform captures the working-tree mode exactly as a physical
+ * runner will see it, including an unstaged chmod.
+ */
+export const indexModeIsAuthoritative = (platform: NodeJS.Platform = process.platform): boolean => platform === 'win32';
 
 function assertIds(snapshotId: string, namespace: string): void {
   if (!ID_RE.test(snapshotId)) {
@@ -208,6 +226,8 @@ async function assertCaptureSupported(objects: GitSnapshotObjects): Promise<void
 
 interface IndexRecord {
   oid: string;
+  /** Literal index mode (100644/100755) for a supported stage-0 entry. */
+  mode: string;
   regular: boolean;
   unmerged: boolean;
 }
@@ -289,7 +309,7 @@ async function captureGitProject(root: string, content: ContentStore, options: C
     for (const entry of gitSelection.tracked) {
       addPath(entry.path);
       const folded = foldKey(entry.path);
-      const record = index.get(folded) ?? { oid: '', regular: false, unmerged: false };
+      const record = index.get(folded) ?? { oid: '', mode: '', regular: false, unmerged: false };
       if (entry.stage !== 0) {
         record.unmerged = true;
         unsupportedMap[entry.path] = `unmerged index entry (stage ${entry.stage})`;
@@ -301,6 +321,7 @@ async function captureGitProject(root: string, content: ContentStore, options: C
         unsupportedMap[entry.path] = `unsupported index mode ${entry.mode}`;
       } else {
         record.oid = entry.oid;
+        record.mode = entry.mode;
         record.regular = true;
       }
       index.set(folded, record);
@@ -325,12 +346,29 @@ async function captureGitProject(root: string, content: ContentStore, options: C
     contentGuard?.();
     return hash;
   };
+  // Mode source. On POSIX the working-tree mode is authoritative and no mode
+  // is supplied here, so the capture records exactly what is on disk (an
+  // unstaged chmod included, with or without core.fileMode). Windows has no
+  // POSIX execute bits, so a tracked stage-0 entry's Git index mode is the
+  // only faithful source there; unsupported/unmerged records and untracked
+  // paths return undefined and fall back to the observed disk mode.
+  const fileMode = (key: string): FileMode | undefined => {
+    if (!indexModeIsAuthoritative()) {
+      return undefined;
+    }
+    const record = lastIndex?.get(foldKey(key));
+    if (record === undefined || !record.regular || record.unmerged) {
+      return undefined;
+    }
+    return fileModeFromGitMode(record.mode);
+  };
   const manifest = await captureContent(root, content, {
     selection,
     openDocuments: options.openDocuments,
     afterScan: options.afterScan,
     guard,
-    storeContent
+    storeContent,
+    fileMode
   });
   guard?.();
   // Only reuse hashes present in the FINAL manifest: content hashed during
