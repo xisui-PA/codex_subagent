@@ -36,6 +36,13 @@ export interface IsolatedViewPort {
     input: { requestId: string; expectedRevision: number },
     authorize?: () => void
   ): Promise<SealedSubmission>;
+  /** Publish a sealed input and its consumer record under one view lock. */
+  withSealedInput?<T>(
+    binding: IsolatedViewBinding, identity: IsolatedViewIdentity,
+    input: { requestId: string; expectedRevision: number },
+    action: (view: IsolatedViewState, submission: SealedSubmission) => T | Promise<T>,
+    authorize?: () => void
+  ): Promise<T>;
   status(
     binding: IsolatedViewBinding,
     identity: IsolatedViewIdentity,

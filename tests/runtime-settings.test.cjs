@@ -5,9 +5,10 @@ const os = require('node:os');
 const path = require('node:path');
 const { WorkerBroker, unpack } = require('../.test-build/runtime');
 const { defaults } = require('../.test-build/engine');
+const { readResourceConfig } = require('../.test-build/resource-governor');
 const { model, deferred, until } = require('./helpers.cjs');
 
-async function fixture(t) {
+async function fixture(t, overrides = {}) {
   const temporary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'worker-settings-')));
   const root = path.join(temporary, 'repo'); await fs.mkdir(root);
   const gate = deferred();
@@ -34,7 +35,7 @@ async function fixture(t) {
     files: { canWrite: () => true, allowShell: () => false },
     onChange() {}, onError(message) { errors.push(message); }
   };
-  const broker = new WorkerBroker(options);
+  const broker = new WorkerBroker({ ...options, ...overrides });
   await broker.start();
   t.after(async () => { await broker.close(); await fs.rm(temporary, { recursive: true, force: true }); });
   return {
@@ -86,4 +87,19 @@ test('broker.settingsChanged survives malformed settings and reschedules after r
 
   assert.equal((await done(broker, root, first.id)).state, 'completed');
   assert.equal((await done(broker, root, second.id)).state, 'completed');
+});
+
+test('disabled governance leaves legacy startup available with malformed resource limits', async t => {
+  let parsedLimits = 0;
+  const { broker, root, release } = await fixture(t, {
+    resourcesEnabled: () => false,
+    resources: () => {
+      parsedLimits++;
+      return readResourceConfig(key => ({ globalValue: key === 'resources.modelCapacity' ? 0 : undefined }));
+    }
+  });
+  const worker = unpack(await broker.invoke(root, 'subagent_spawn', { requestId: 'legacy-opt-out', task: 'Run legacy work' }));
+  release();
+  assert.equal((await done(broker, root, worker.id)).state, 'completed');
+  assert.equal(parsedLimits, 0);
 });

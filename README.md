@@ -90,7 +90,7 @@ The extension does not extract `${secret:...}` values, query the OS keychain, or
 
 Spawns and **New Worker** selections that omit a model are routed automatically: read-only work takes `model-a-id` first; workspace-write work skips it and uses `model-b-id`, then `model-c-id`, because only `model-b-id`/`model-c-id` allow writes (three concurrent writers: B, C, C).
 
-- `numSessions` bounds **active** conversations for that model inside its owning workspace/store. Omit it for the built-in default of 1.
+- `numSessions` bounds **active** conversations for that model inside its owning workspace/store. Omit it for the built-in default of 1. The opt-in governed workflow yields execution capacity during dependency, message, runner and approval waits while retaining the owning-store model ceiling; legacy reservations still include draining tools. Separate aggregate settings never expand this per-store limit.
 - When every eligible model is full, the worker queues on the highest-priority eligible model and is **not** migrated to a freer model.
 - An explicitly chosen model stays pinned and is still subject to that model's permission flags and `numSessions`.
 - `codexSubagent.models` is now the sole permission/limit policy source. `allowWrite` and `allowShell` default to true when omitted, so set either explicitly to `false` to restrict that model. Only user-level settings are honored.
@@ -210,6 +210,14 @@ Enable it with the User-level settings `codexSubagent.isolatedViews.runners.enab
 Status rows for your own scope include the owner `workerId`, `workerCreatedAt` and the result URI, and lease rows add `createdAt` for when that lease was created rather than when the worker was. Result summaries are limited to output and diagnostic previews (512 characters) rather than full output; read one result with `subagent_runner_result` when you need it. Counts and previews are bounded, and other identities are never shown.
 
 A stored command result is evidence, not an artifact pin and not an automatic board verdict: nothing is accepted or integrated, and no later revision is validated because an earlier command ran. Input revisions are exact and an imported change produces a new revision that no command has tested until one runs.
+
+## Governed isolated startup (opt-in)
+
+Step 4 adds `subagent_isolated_spawn`: create a stopped worker, atomically establish team membership/task assignment, bind its private snapshot, then start its first turn. Enable User `resources.enabled` with the board/view flags. Retry interrupted setup with the same request and arguments; ordinary send/resume cannot bypass incomplete setup.
+
+Separate aggregate model, runnable, runner and storage budgets cover governed work across roots, worktrees, stores and extension hosts for this OS user. Fair queues yield resources during dependency/message/runner waits and reserve validation/integration headroom. Existing owning-store model ceilings, runner pool reopen settings and legacy spawn behavior remain explicit.
+
+Owner-scoped receipt epochs, compressed archives, exact evidence pins and reference-aware collection reclaim metadata without turning expired requests into fresh operations. See [resource governance and lifecycle](docs/resource-governance.md) for configuration, tools, retention limits, recovery and the contracts for steps 5-7.
 
 ## Preservation and workspaces
 

@@ -9,14 +9,28 @@ documentation edits, document summarization, and test execution to workers
 through the codex_subagent MCP tools. Do not substitute native Codex
 subagents.
 
-Check subagent_health and subagent_models before delegation.
-Give workers explicit context and acceptance criteria. Review their
+Check subagent_health and subagent_models before delegation. Review workers'
 changes and test results before reporting completion.
 
-Size tasks conservatively using model metadata and observed performance.
-Prefer one bounded, reviewable outcome per task; resolve uncertain
-prerequisites first. Keep context focused, compacting or starting a fresh
-session when history grows. Increase scope after successful comparable work.
+Size tasks conservatively using model metadata and observed performance;
+resolve uncertain prerequisites first. Write prompts in normal sentences,
+with one deliverable, allowed files, relevant symbols/interfaces, acceptance
+checks and a concrete stopping point. Include current findings and tool
+constraints in a short brief. For reviews, specify one risk area or hypothesis
+and require a minimal reproduction or explicit uncertainty before expanding.
+
+Keep implementation, its tests and immediate corrections in the same session.
+After a completed task, use a compact faithful handoff or a fresh worker on
+the same permitted model for an independent module or role. Do not accumulate
+unrelated assignments until the model's context limit forces compaction.
+Handoffs should retain decisions, exact identities, changed files, check
+results, unresolved risks and next steps; preserve the original histories.
+
+Give workers starting symbols and existing fixtures. Search before reading
+large files, read relevant ranges, and reuse unchanged context. Refresh the
+current editing view and hash before edits as required below. Report findings,
+changes, check results and limitations concisely; keep full logs in named
+artifacts and include only the excerpts needed to assess a result.
 
 Wait until a worker finishes its assigned work before reviewing or modifying
 that worker's changes.
@@ -47,6 +61,21 @@ changes, default to one reviewer; add reviewers only for clearly independent
 areas or a specific unresolved risk. Prefer targeted follow-ups over
 overlapping full reviews, and check existing findings before delegating
 further review work.
+
+Assign one owner per shared build/test output directory and name the focused
+checks for each task. Reuse verified validation helpers and invocations. Avoid
+creating another launcher, watchdog or polling framework for each follow-up.
+Run comprehensive validation once changes are ready for integration; repeat
+checks when relevant changes, failures or unresolved risks justify them.
+
+Use the actual tool schemas. For worker file tools, patch_file requires the
+returned 64-character hash; expectedHash: "new" is only for write_file.
+The worker run_command timeoutMs ceiling is 120000; it is separate from the
+model turn timeout. On a tool failure, diagnose the specific error before
+retrying. If the same failure recurs after a targeted correction, stop that
+retry loop and report the evidence and blocker for a coordinator decision.
+These checkpoints do not justify interrupting a slow worker within its turn
+timeout or abandoning ownership of effects that have not drained.
 
 If delegation is unavailable or repeatedly fails, explain the blocker
 and ask before directly taking on nontrivial work.

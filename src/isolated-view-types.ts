@@ -91,6 +91,13 @@ export interface SealedSubmission extends IsolatedViewBinding {
   revision: number;
   released: boolean;
   createdAt: string;
+  /**
+   * Set ONLY when the governed runner auto-sealed this exact input for one
+   * attempt (withSealedInput), never for an explicit user seal. It is additive:
+   * references are still what retain content, but an unreferenced auto-sealed
+   * input is reclaimable metadata instead of a permanent submission.
+   */
+  runnerInput?: true;
 }
 
 /** Named consumers retain exact snapshots or sealed submissions. */

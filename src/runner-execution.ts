@@ -1,8 +1,9 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import type { IsolatedViewBinding } from './isolated-view-types';
-import type { IsolatedViewIdentity, IsolatedViewPort } from './isolated-view-port';
+import type { RunnerAdmission } from './resource-governor';
+import type { IsolatedViewBinding, SealedSubmission } from './isolated-view-types';
+import type { IsolatedViewIdentity, IsolatedViewPort, IsolatedViewState } from './isolated-view-port';
 import type { Delta, LayeredTree } from './layered-tree';
 import {
   RunnerPool, validateRunnerPoolScope, type RunnerLease, type RunnerLeaseOwner, type RunnerLeaseRecord,
@@ -47,7 +48,11 @@ import { WorkerError } from './types';
 //     against the view tree, durably `results.start` the attempt BEFORE
 //     anything is materialized (so a failed setup is still recorded), and
 //     materialize the complete supported view through the reviewed helper.
-//     The shared view mutex is released before approval or any shell work.
+//     A `start` that reports a storage error AFTER its own commit already owns
+//     a durable pending attempt: the store's replay-only lookup decides, and a
+//     proven attempt continues into this same pre-process failure path instead
+//     of being released as an unrecorded orphan. The shared view mutex is
+//     released before approval or any shell work.
 //  4. Checkpoint `prepared`, ask the caller to approve the exact command +
 //     logical root + actual cwd + execution root + input revision (bound to the
 //     lease signal), recheck authorization LIVE after the await, checkpoint
@@ -63,9 +68,16 @@ import { WorkerError } from './types';
 //     rechecks live authorization.
 //  6. Persist one immutable final result (version 1, input before and after,
 //     never a validation claim about the after revision) BEFORE the lease is
-//     cleared, then release the lease. A final persistence failure quarantines
-//     the directory and throws; the durable pending attempt becomes an
-//     'uncertain' result on reload and is NEVER replayed.
+//     cleared, then release the lease. When the results store reports a failure
+//     for a final record whose rename ALREADY committed (its write wrapper can
+//     fail after its own post-write accounting), the store's replay-only entry
+//     point is asked instead of publishing again: under its own mutex it returns
+//     that FINAL only when the adopted record is this exact attempt, this exact
+//     scope and this exact stage finish (dropping its leftover pending), and the
+//     lease is then released with the stage's own drained/preserve intent. A
+//     missing, conflicting or unreadable final is genuinely unpersisted, so it
+//     quarantines the directory and throws; the durable pending attempt then
+//     becomes an 'uncertain' result on reload and is NEVER replayed.
 //  7. A release whose own durable write fails is RETAINED (with the exact intent
 //     it must honour) instead of dropped: the pool keeps the live record and slot
 //     owned, and one bounded retry from cleanup() or close() settles it once
@@ -302,6 +314,10 @@ export interface RunnerExecutionStatus {
 
 /** Construction options; the hooks are the host's only policy surface. */
 export interface RunnerExecutionOptions {
+  readonly withStorageWrite?: <T>(action: () => Promise<T>) => Promise<T>;
+  readonly admission?: RunnerAdmission;
+  readonly retainInputs?: (owner: RunnerLeaseOwner) => boolean;
+  readonly inputRequestId?: (owner: RunnerLeaseOwner, key: string) => string;
   readonly capacity?: number;
   readonly maxQueue?: number;
   readonly closeTimeoutMs?: number;
@@ -563,11 +579,12 @@ export class RunnerExecution {
     this.cacheRoot = path.join(this.directory, CACHE_DIRECTORY);
     this.pool = new RunnerPool(path.join(this.directory, POOL_DIRECTORY), {
       projectRoot: this.logicalRoot,
+      admission: options.admission,
       capacity: options.capacity ?? RUNNER_EXECUTION_DEFAULTS.capacity,
       maxQueue: options.maxQueue ?? RUNNER_EXECUTION_DEFAULTS.maxQueue,
       ...(options.closeTimeoutMs === undefined ? {} : { closeTimeoutMs: options.closeTimeoutMs })
     });
-    this.results = new RunnerResults(path.join(this.directory, RESULTS_DIRECTORY), this.logicalRoot);
+    this.results = new RunnerResults(path.join(this.directory, RESULTS_DIRECTORY), this.logicalRoot, { withStorageWrite: options.withStorageWrite });
   }
 
   /** Validate the layout and open the pool and results store exactly once. */
@@ -695,6 +712,13 @@ export class RunnerExecution {
     return this.pool.cleanup(validated, record => this.proveDrained(record));
   }
 
+  async collect(scope: RunnerPoolScope, ids: readonly string[], retained: ReadonlySet<string>, activeWorkers: ReadonlySet<string>): Promise<unknown> {
+    this.assertReady();
+    const protectedLeases = new Set(this.pool.status().leases.filter(l => l.state !== 'released').map(l => l.leaseId));
+    const results = await this.results.collect(scope, ids, retained, protectedLeases, activeWorkers);
+    const leases = await this.pool.collectReleased(scope);
+    return { ...results, leases };
+  }
   /**
    * Reject new commands, abort every queued and running one, then wait for an
    * in-flight open() and for every registered command (including its result
@@ -991,8 +1015,11 @@ export class RunnerExecution {
     const flags: GuardState = { policy: false };
     const guard = (): void => this.commandGuard(task, flags);
     try {
-      const view = await task.port.withView(task.binding, task.identity, async current => {
+      const prepareView = async (current: IsolatedViewState, artifact?: SealedSubmission) => {
         guard();
+        if (artifact && artifact.revision !== current.revision) {
+          throw new WorkerError('runner_input_changed', 'Private revision changed after retention; no command ran.');
+        }
         const version = Object.freeze({
           snapshotId: task.binding.snapshotId,
           overlayId: task.binding.overlayId,
@@ -1010,15 +1037,44 @@ export class RunnerExecution {
             command: task.command,
             timeoutMs: task.timeoutMs,
             inputVersion: version,
+            ...(artifact ? { inputArtifact: { id: artifact.id, version: artifact.version, uri: artifact.uri, revision: artifact.revision } } : {}),
             setup,
             startedAt: new Date().toISOString()
           };
-          await this.results.start(attempt);
-          state.recorded = true;
+          try {
+            await this.results.start(attempt);
+            state.recorded = true;
+          } catch (error) {
+            // start() persists the pending attempt through the store's managed
+            // write, whose rename is its commit point: the store adopts that exact
+            // record there, but its injected write wrapper can still fail while
+            // doing its own post-write work, and start() then reports a storage
+            // error for an attempt that IS durable. Asking the store is the only
+            // way to tell the two apart -- the write is never retried, because a
+            // second attempt could publish nothing new and would hide the failure.
+            // A PROVEN pending attempt rethrows this same error so the existing
+            // pre-process failure finalization below records the setup failure
+            // (cancellation or denial included) for that durable attempt; anything
+            // unproven keeps the untouched-lease release it always had.
+            state.recorded = await this.recordedPending(attempt);
+            throw error;
+          }
         }
-        const baseline = await materializeRunnerView(current, lease.sourceDir, guard);
+        const materialize = () => materializeRunnerView(current, lease.sourceDir, guard);
+        const baseline = await (this.options.withStorageWrite ? this.options.withStorageWrite(materialize) : materialize());
         return { version, actualCwd, baseline };
-      }, guard);
+      };
+      let view: Awaited<ReturnType<typeof prepareView>>;
+      if (this.options.retainInputs?.(this.ownerOf(task))) {
+        if (!task.port.withSealedInput) {
+          throw new WorkerError('runner_retention_unavailable', 'Governed runners require atomic sealed-input publication; no command was started.');
+        }
+        const current = await task.port.status(task.binding, task.identity, guard);
+        const input = { requestId: this.options.inputRequestId?.(this.ownerOf(task), 'runner:' + lease.id) ?? 'runner:' + lease.id, expectedRevision: current.revision };
+        view = await task.port.withSealedInput(task.binding, task.identity, input, prepareView, guard);
+      } else {
+        view = await task.port.withView(task.binding, task.identity, current => prepareView(current), guard);
+      }
       return { ok: true, view };
     } catch (error) {
       if (!state.recorded) {
@@ -1027,6 +1083,29 @@ export class RunnerExecution {
       const outcome: RunnerResultOutcome = task.signal.aborted ? 'cancelled' : flags.policy ? 'denied' : 'setup_failed';
       const result = await this.recordFailure(lease, outcome, short(`the command setup failed: ${describe(error)}`));
       return { ok: false, result };
+    }
+  }
+
+  /**
+   * Ask the results store, under its own mutex and WITHOUT writing anything,
+   * whether the pending attempt a failed start() reported is already adopted and
+   * durable for exactly this attempt. The store's commit point is the rename
+   * inside its managed write, so an adopted pending record IS a durable one, and
+   * this lookup can neither publish nor retry that write; it answers 'replayed'
+   * only for this exact id, lease, owner and attempt. A store that is closed,
+   * failed or otherwise unable to answer proves nothing and reports false, so a
+   * genuine pre-publication failure keeps the untouched-lease release it had
+   * before rather than claiming that something published.
+   */
+  private async recordedPending(attempt: RunnerCommandAttempt): Promise<boolean> {
+    try {
+      const replay = await this.results.replayStart(attempt, {
+        ownerId: attempt.owner.ownerId,
+        teamId: attempt.owner.teamId
+      });
+      return replay.status === 'replayed' && replay.attempt !== null;
+    } catch {
+      return false;
     }
   }
 
@@ -1348,8 +1427,32 @@ export class RunnerExecution {
     try {
       result = await this.results.finish(lease.id, stage.finish);
     } catch (error) {
-      // The final record is missing, so the durable pending attempt becomes
-      // 'uncertain' on reload. Retain the directory and never replay.
+      // The store's commit point is the rename inside its managed write, and it
+      // adopts the final at that rename -- but its injected write wrapper may
+      // still fail afterwards, during its own post-write accounting, while
+      // finish() keeps reporting that failure. replayFinal() is the store's own
+      // exact comparison, run under its mutex: it returns an ALREADY adopted final
+      // for this exact lease (dropping its leftover pending) only when every final
+      // field matches this stage, and otherwise reports missing or conflict. It
+      // cannot publish, so nothing is republished and no command is replayed.
+      let committed: RunnerCommandResult | undefined;
+      try {
+        const replay = await this.results.replayFinal(lease.id, stage.finish,
+          { ownerId: lease.owner.ownerId, teamId: lease.owner.teamId });
+        committed = replay.status === 'replayed' && replay.result !== null ? replay.result : undefined;
+      } catch {
+        // A closed, failed or otherwise unusable store cannot prove anything.
+        committed = undefined;
+      }
+      if (committed !== undefined) {
+        // The durable final decides the release intent, so the stage's own
+        // drained/preserve intent is used verbatim. A release that still cannot
+        // be published stays retained exactly as it does after a clean persist.
+        await this.releaseOrRetain(lease, this.finalIntent(stage));
+        return committed;
+      }
+      // Nothing adoptable is durable, so the pending attempt becomes 'uncertain'
+      // on reload. Retain the directory and never replay.
       await this.releaseOrRetain(lease, {
         drained: stage.drained,
         preserve: true,
@@ -1357,16 +1460,26 @@ export class RunnerExecution {
       }).catch(() => undefined);
       throw error;
     }
-    const diagnostic = stage.finish.diagnostic;
     // The durable final record exists, so a release that cannot be published is
     // NOT a lost lease: it stays retained with this exact intent (and its slot)
     // and cleanup()/close() settle it once storage recovers.
-    await this.releaseOrRetain(lease, {
+    await this.releaseOrRetain(lease, this.finalIntent(stage));
+    return result;
+  }
+
+  /**
+   * The release intent a DURABLE final must be paired with: exactly what the
+   * stage proved about the process tree. A proven drain stays a drain, and a stage
+   * that genuinely preserved its directory (unproven drain, refused or uncertain
+   * import) keeps that preservation.
+   */
+  private finalIntent(stage: StageOutcome): RunnerLeaseRelease {
+    const diagnostic = stage.finish.diagnostic;
+    return {
       drained: stage.drained,
       ...(stage.preserve ? { preserve: true } : {}),
       ...(diagnostic === undefined ? {} : { diagnostic: short(diagnostic, MAX_POOL_DIAGNOSTIC_LENGTH) })
-    });
-    return result;
+    };
   }
 
   /**

@@ -15,7 +15,9 @@ import type { IsolatedViewPort, IsolatedViewState, IsolatedViewIdentity } from '
 import { loadRevisionTree, revisionState, MAX_OVERLAY_REVISIONS, parseOverlayRevision } from './overlay-revisions';
 import { createProjectContentReader, readProjectContent, ensureProjectRetention, releaseProjectRetention } from './project-snapshot';
 import { sweepViewContent } from './isolated-cas-cleanup';
-import { Mutex } from './storage';
+import { epochRequest, completeArchiveDeletions, currentEpoch, MAX_RECEIPT_ARCHIVE_FILES, planArchivePublication, preflightArchivePublication, publishArchivePublication, selectPublicationReceipts, verifyArchive } from './receipt-retention';
+import type { ReceiptArchive, ReceiptArchivePublication } from './receipt-retention';
+import { digest, Mutex } from './storage';
 import { WorkerError } from './types';
 
 const sha256 = (value: string | string[]): string =>
@@ -66,8 +68,16 @@ function requireIso(value: unknown, field: string): string {
 }
 
 export interface IsolatedViewsOptions {
+  withStorageWrite?: <T>(action: () => Promise<T>) => Promise<T>;
   /** Live host guard (closing/feature flag/revocation); throws to abort. */
   guard?: () => void;
+  /**
+   * Live, trusted governance flag. `false` means this namespace is not governed,
+   * so an epoch-prefixed request ID is an ordinary fresh identity while no owner
+   * has rolled over. Absent keeps the governed rules; per-request input can
+   * never change it.
+   */
+  governanceEnabled?: () => boolean;
   /** Reads verified immutable Git or CAS bytes; never a live workspace path. */
   readContent?: (backing: SnapshotBacking, content: ContentStore, contentHash: string, guard?: () => void) => Promise<Buffer>;
   /** Confirms a Git-backed snapshot's objects remain reachable; failure aborts. */
@@ -129,6 +139,16 @@ export interface ViewCleanupResult {
   complete: boolean;
 }
 
+/**
+ * One scoped governed-runner input reclamation: the inputs marked released for
+ * the existing CAS cleanup, and how many eligible inputs were kept because a
+ * reference or native pin still retains them.
+ */
+export interface RunnerInputReclamation {
+  released: string[];
+  preserved: number;
+}
+
 export class IsolatedViews implements IsolatedViewPort {
   readonly content: ContentStore;
   /** Stable namespace identity: SHA-256 of the resolved store directory. */
@@ -139,12 +159,14 @@ export class IsolatedViews implements IsolatedViewPort {
   private readonly readContent?: typeof readProjectContent;
   private readonly releaseRetention: typeof releaseProjectRetention;
   private readonly expectExisting: boolean;
+  private readonly governanceEnabled?: () => boolean;
+  private readonly withStorageWrite: <T>(action: () => Promise<T>) => Promise<T>;
   private readonly mutex = new Mutex();
   private opened = false;
   private failedOpen = false;
   private closing = false;
 
-  constructor(directory: string, root: string, options: IsolatedViewsOptions = {}) {
+  constructor(readonly directory: string, root: string, options: IsolatedViewsOptions = {}) {
     if (typeof directory !== 'string' || directory.length === 0 || directory.length > 8192) {
       throw new WorkerError('invalid_path', 'The views directory must be a nonempty path string.');
     }
@@ -154,11 +176,13 @@ export class IsolatedViews implements IsolatedViewPort {
     if (options.expectExisting !== undefined && typeof options.expectExisting !== 'boolean') {
       invalid('The expectExisting option must be a boolean.');
     }
+    this.withStorageWrite = options.withStorageWrite ?? (action => action());
     this.externalGuard = options.guard ?? (() => undefined);
     this.ensureRetention = options.ensureRetention ?? ensureProjectRetention;
     this.readContent = options.readContent;
     this.releaseRetention = options.releaseRetention ?? releaseProjectRetention;
     this.expectExisting = options.expectExisting === true;
+    this.governanceEnabled = options.governanceEnabled;
     const resolvedDir = path.resolve(directory);
     const resolvedRoot = path.resolve(root);
     // The content store must sit OUTSIDE the canonical workspace root before
@@ -166,7 +190,10 @@ export class IsolatedViews implements IsolatedViewPort {
     this.assertStoreOutsideRoot(resolvedDir, resolvedRoot);
     this.namespace = sha256(resolvedDir);
     this.content = new ContentStore(path.join(resolvedDir, 'content'), { guard: this.checkAlive });
-    this.index = new IsolatedIndex(resolvedDir, resolvedRoot, { guard: this.checkAlive });
+    this.index = new IsolatedIndex(resolvedDir, resolvedRoot, { guard: this.checkAlive,
+      // Only the live host says whether this namespace is ungoverned; the
+      // request itself never can, and an unwired handle stays governed.
+      requestIdPolicy: { ordinaryRequestIds: () => this.governanceEnabled?.() === false } });
   }
 
   /** Rejects a store that is inside the root, via path form or junction alias. */
@@ -227,6 +254,9 @@ export class IsolatedViews implements IsolatedViewPort {
           // index write, so a later crash still leaves a complete store.
           await this.index.update(() => undefined);
         }
+        for (const archive of this.index.read().receiptArchives ?? []) {
+          await verifyArchive(this.directory, archive);
+        }
         this.opened = true;
       } catch (error) {
         this.failedOpen = true;
@@ -252,7 +282,7 @@ export class IsolatedViews implements IsolatedViewPort {
     capture: (snapshotId: string, recordCandidate: (candidate: CapturedProject) => Promise<void>) => Promise<CapturedProject>,
     authorize?: () => void
   ): Promise<StoredSnapshot> {
-    return this.mutex.run(async () => {
+    return this.mutex.run(() => this.withStorageWrite(async () => {
       this.authorize(authorize);
       if (!this.opened) {
         throw new WorkerError('unavailable', 'The isolated views are not open; call open() first.');
@@ -272,6 +302,7 @@ export class IsolatedViews implements IsolatedViewPort {
 
       // Stable identity: scoped by owner/request, never by the mutable team.
       const snapshotId = sha256(['create', this.namespace, ownerId, requestId]);
+      this.index.request(ownerId, requestId, snapshotId);
       const receiptKey = sha256(['create', this.namespace, ownerId, requestId]);
       // Fingerprint covers every requested argument, never editor/workspace state.
       const fingerprint = sha256(['create', this.namespace, ownerId, teamId, requestId, selectionKey]);
@@ -409,7 +440,7 @@ export class IsolatedViews implements IsolatedViewPort {
         id: snapshotId, teamId, ownerId, manifestHash, backing, createdAt: capturedAt
       };
       return this.finalizeSnapshot(stored, fingerprint, receiptKey, authorize);
-    });
+    }));
   }
 
   /** Durable recovery/finalization of a journal: verify CAS, retention, commit. */
@@ -518,6 +549,7 @@ export class IsolatedViews implements IsolatedViewPort {
 
       const overlayId = sha256(['overlay', this.namespace, workerId, workerCreatedAt, snapshotId]);
       const receiptKey = sha256(['bind', this.namespace, workerId, workerCreatedAt, requestId]);
+      this.index.request(ownerId, requestId, receiptKey);
       const fingerprint = sha256(['bind', this.namespace, ownerId, teamId, snapshotId, workerId, workerCreatedAt, requestId]);
       const pin: ViewPin = {
         id: sha256(['pin', this.namespace, 'binding', overlayId]),
@@ -729,7 +761,7 @@ export class IsolatedViews implements IsolatedViewPort {
     binding: IsolatedViewBinding, identity: IsolatedViewIdentity,
     planner: Parameters<IsolatedViewPort['edit']>[2], authorize?: () => void
   ): Promise<{ revision: number }> {
-    return this.mutex.run(async () => {
+    return this.mutex.run(() => this.withStorageWrite(async () => {
       const guard = (): void => this.authorize(authorize);
       guard();
       const data = this.assertReady();
@@ -781,49 +813,76 @@ export class IsolatedViews implements IsolatedViewPort {
         current.revision = revision.revision;
       }, guard);
       return { revision: committed.overlays[record.overlayId].revision };
-    });
+    }));
   }
 
   async seal(binding: IsolatedViewBinding, identity: IsolatedViewIdentity, input: { requestId: string; expectedRevision: number }, authorize?: () => void): Promise<SealedSubmission> {
-    return this.mutex.run(async () => {
-      const guard = (): void => this.authorize(authorize);
-      guard();
-      requireString(input.requestId, 'requestId', 1, 200);
-      if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) {
-        invalid('expectedRevision must be a nonnegative safe integer.');
+    return this.mutex.run(() => this.sealLocked(binding, identity, input, authorize));
+  }
+
+  private async sealLocked(binding: IsolatedViewBinding, identity: IsolatedViewIdentity, input: { requestId: string; expectedRevision: number }, authorize?: () => void, runnerInput = false): Promise<SealedSubmission> {
+    const guard = (): void => this.authorize(authorize);
+    guard();
+    requireString(input.requestId, 'requestId', 1, 200);
+    if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) {
+      invalid('expectedRevision must be a nonnegative safe integer.');
+    }
+    this.validateIdentity(binding, identity);
+    const data = this.assertReady();
+    const key = sha256(['seal', this.namespace, binding.overlayId, identity.ownerId, input.requestId]);
+    this.index.request(identity.ownerId, input.requestId, key);
+    const fingerprint = sha256(['seal', binding.overlayId, binding.snapshotId, binding.teamId, identity.ownerId, identity.workerId, identity.workerCreatedAt, String(input.expectedRevision)]);
+    const receipt = data.receipts[key];
+    if (receipt) {
+      if (receipt.fingerprint !== fingerprint) {
+        conflict('This seal requestId was already used with different arguments.');
       }
-      this.validateIdentity(binding, identity);
-      const data = this.assertReady();
-      const key = sha256(['seal', this.namespace, binding.overlayId, identity.ownerId, input.requestId]);
-      const fingerprint = sha256(['seal', binding.overlayId, binding.snapshotId, binding.teamId, identity.ownerId, identity.workerId, identity.workerCreatedAt, String(input.expectedRevision)]);
-      const receipt = data.receipts[key];
-      if (receipt) {
-        if (receipt.fingerprint !== fingerprint) {
-          conflict('This seal requestId was already used with different arguments.');
-        }
-        return this.validateReceiptResult(receipt, parseSealedSubmission, value =>
-          value.overlayId === binding.overlayId && value.snapshotId === binding.snapshotId && value.teamId === binding.teamId
+      return this.validateReceiptResult(receipt, parseSealedSubmission, value =>
+        value.overlayId === binding.overlayId && value.snapshotId === binding.snapshotId && value.teamId === binding.teamId
           && value.ownerId === identity.ownerId && value.workerId === identity.workerId && value.workerCreatedAt === identity.workerCreatedAt
           && value.revision === input.expectedRevision
           && value.version === value.revision + 1 && value.uri === this.submissionUri(value.id, value.version)
-        );
+      );
+    }
+    const record = this.boundOverlay(data, binding, identity);
+    if (record.revision !== input.expectedRevision) {
+      conflict('The overlay has changed; inspect its current revision before sealing.');
+    }
+    await this.loadState(data, record, guard);
+    const id = sha256(['submission', this.namespace, binding.overlayId, identity.ownerId, input.requestId]);
+    const submission: SealedSubmission = { ...record, id, version: record.revision + 1,
+      uri: this.submissionUri(id, record.revision + 1), createdAt: new Date().toISOString(), released: false,
+      // Additive marker: ONLY withSealedInput publishes it, and only on a newly
+      // sealed input, so an abandoned governed setup is reclaimable metadata
+      // while an explicit user seal is never eligible.
+      ...(runnerInput ? { runnerInput: true as const } : {}) };
+    const committed = await this.index.update(draft => {
+      if (draft.submissions[id] || draft.receipts[key]) {
+        conflict('This submission has already been published.');
+      }
+      draft.submissions[id] = submission;
+      draft.receipts[key] = { fingerprint, result: submission };
+    }, guard);
+    return committed.submissions[id];
+  }
+
+  /** No release/cleanup can enter between sealing and the durable consumer. */
+  async withSealedInput<T>(binding: IsolatedViewBinding, identity: IsolatedViewIdentity, input: { requestId: string; expectedRevision: number }, action: (view: IsolatedViewState, submission: SealedSubmission) => T | Promise<T>, authorize?: () => void): Promise<T> {
+    return this.mutex.run(async () => {
+      const guard = (): void => this.authorize(authorize);
+      const submission = await this.sealLocked(binding, identity, input, guard, true);
+      const data = this.assertReady();
+      if (!data.submissions[submission.id] || data.submissions[submission.id].released) {
+        throw new WorkerError('isolation_released', 'The exact sealed input was released; no command was started.');
       }
       const record = this.boundOverlay(data, binding, identity);
-      if (record.revision !== input.expectedRevision) {
-        conflict('The overlay has changed; inspect its current revision before sealing.');
+      if (record.revision !== submission.revision) {
+        conflict('Private input changed before consumer publication.');
       }
-      await this.loadState(data, record, guard);
-      const id = sha256(['submission', this.namespace, binding.overlayId, identity.ownerId, input.requestId]);
-      const submission: SealedSubmission = { ...record, id, version: record.revision + 1,
-        uri: this.submissionUri(id, record.revision + 1), createdAt: new Date().toISOString(), released: false };
-      const committed = await this.index.update(draft => {
-        if (draft.submissions[id] || draft.receipts[key]) {
-          conflict('This submission has already been published.');
-        }
-        draft.submissions[id] = submission;
-        draft.receipts[key] = { fingerprint, result: submission };
-      }, guard);
-      return committed.submissions[id];
+      const state = await this.loadState(data, record, guard);
+      const result = await action(state, submission);
+      guard();
+      return result;
     });
   }
 
@@ -952,7 +1011,7 @@ export class IsolatedViews implements IsolatedViewPort {
   }
 
   /** Releasing a snapshot drops its creation pin, not references held by others. */
-  async release(input: RetentionScope & { kind: 'snapshot' | 'overlay' | 'submission' | 'pin' | 'pending'; id: string }, authorize?: () => void, resolveWorker?: (id: string) => Promise<WorkerViewPresence>): Promise<{ released: true; kind: string; id: string }> {
+  async release(input: RetentionScope & { kind: 'snapshot' | 'overlay' | 'submission' | 'pin' | 'pending'; id: string }, authorize?: () => void, resolveWorker?: (id: string) => Promise<WorkerViewPresence>, retained: ReadonlySet<string> | (() => ReadonlySet<string>) = new Set(), preserveConsumers = false): Promise<{ released: true; kind: string; id: string }> {
     return this.mutex.run(async () => {
       const guard = (): void => this.authorize(authorize);
       guard();
@@ -961,6 +1020,12 @@ export class IsolatedViews implements IsolatedViewPort {
       const data = this.assertReady();
       const { key, fingerprint, receipt } = this.retentionRequest(data, 'release', input, [input.kind, input.id]);
       const result = { released: true as const, kind: input.kind, id: input.id };
+      // An exactly authorized stored acknowledgement replays BEFORE any live
+      // reference is consulted: a release that already happened stays replayable
+      // even after a native pin, board reference or evidence consumer was added
+      // to that same artifact afterwards. The live guard and scope check above
+      // are the whole authorization, and the receipt key/fingerprint bind this
+      // acknowledgement to this owner, team, kind and id.
       if (receipt) {
         if (!isPlain(receipt.result) || Object.keys(receipt.result).length !== 3 || receipt.result.released !== true
           || receipt.result.kind !== input.kind || receipt.result.id !== input.id) {
@@ -968,11 +1033,18 @@ export class IsolatedViews implements IsolatedViewPort {
         }
         return result;
       }
+      // The FRESH path proves the exact resource exists in this owner/team scope
+      // BEFORE the retained-reference gate, so a foreign or missing id is
+      // not_found rather than artifact_retained.
       const resource = input.kind === 'snapshot' ? data.snapshots[input.id] : input.kind === 'overlay' ? data.overlays[input.id]
         : input.kind === 'submission' ? data.submissions[input.id] : input.kind === 'pin' ? data.pins[input.id]
           : input.kind === 'pending' ? data.pendingCaptures[input.id]?.snapshot : undefined;
       if (!resource || resource.ownerId !== input.ownerId || resource.teamId !== input.teamId) {
         throw new WorkerError('not_found', 'This resource does not exist in the requested scope.');
+      }
+      const references = typeof retained === 'function' ? retained() : retained;
+      if (input.kind === 'submission' && (references.has(data.submissions[input.id].uri) || (preserveConsumers && Object.values(data.pins).some(pin => pin.resource.kind === 'submission' && pin.resource.id === input.id)))) {
+        throw new WorkerError('artifact_retained', 'This submission is required by a board reference or evidence consumer. Release that consumer explicitly first.');
       }
       if (input.kind === 'pin') {
         const pin = data.pins[input.id];
@@ -1016,12 +1088,13 @@ export class IsolatedViews implements IsolatedViewPort {
     });
   }
 
-  async cleanup(input: RetentionScope, resolveWorker?: (id: string) => Promise<WorkerViewPresence>, authorize?: () => void): Promise<ViewCleanupResult> {
+  async cleanup(input: RetentionScope, resolveWorker?: (id: string) => Promise<WorkerViewPresence>, authorize?: () => void, retained: ReadonlySet<string> | (() => ReadonlySet<string>) = new Set()): Promise<ViewCleanupResult> {
     return this.mutex.run(async () => {
       const guard = (): void => this.authorize(authorize);
       guard();
       this.checkScope(input.ownerId, input.teamId);
       let data = this.assertReady();
+      const references = typeof retained === 'function' ? retained() : retained;
       const { key, fingerprint, receipt } = this.retentionRequest(data, 'cleanup', input, []);
       if (receipt) {
         const value = receipt.result as ViewCleanupResult;
@@ -1104,7 +1177,7 @@ export class IsolatedViews implements IsolatedViewPort {
       data = this.index.read();
       const rooted = new Set<string>();
       const retentionFailures = new Set<string>();
-      const pinnedSubmissions = new Set(Object.values(data.pins).filter(pin => pin.resource.kind === 'submission').map(pin => pin.resource.id));
+      const pinnedSubmissions = new Set([...Object.values(data.pins).filter(pin => pin.resource.kind === 'submission').map(pin => pin.resource.id), ...Object.values(data.submissions).filter(s => references.has(s.uri)).map(s => s.id)]);
       const retired = Object.values(data.submissions).filter(record => scoped(record) && record.released && !pinnedSubmissions.has(record.id));
       if (retired.length) {
         await this.index.update(draft => {
@@ -1198,19 +1271,446 @@ export class IsolatedViews implements IsolatedViewPort {
     });
   }
 
+  /**
+   * Durably PROVES which sealed submissions are governed runner inputs, using
+   * the exact attempt records that own them.
+   *
+   * A durable result is the only exact evidence that one specific sealed
+   * submission was auto-sealed for one command, and collecting that result
+   * DELETES the evidence. The proof is therefore published - the same additive
+   * marker `withSealedInput` writes - BEFORE the result is removed, inside the
+   * view mutex, so a crash or throw between that deletion and the sweep loses
+   * nothing: the marker sweep reclaims the input on any later collection, with
+   * no result ids and after a reopen.
+   *
+   * Only an exact id + URI match, in this owner/team scope, for a live
+   * unreleased submission is marked. An unproven, unknown, foreign or already
+   * released input is left exactly as it is, and an input that is already
+   * marked is not rewritten. Returns how many inputs this call proved.
+   */
+  async proveRunnerInputs(
+    scope: { ownerId: string; teamId: string },
+    proofs: readonly { id: string; uri: string }[],
+    authorize?: () => void
+  ): Promise<number> {
+    return this.mutex.run(async () => {
+      const guard = (): void => this.authorize(authorize);
+      guard();
+      this.checkScope(scope.ownerId, scope.teamId);
+      if (proofs.length === 0) {
+        return 0;
+      }
+      const data = this.assertReady();
+      const targets = new Map<string, string>();
+      for (const proof of proofs) {
+        if (!isPlain(proof) || typeof proof.id !== 'string' || !HEX64.test(proof.id)
+          || typeof proof.uri !== 'string' || proof.uri.length === 0) {
+          continue;
+        }
+        const record = data.submissions[proof.id];
+        if (record !== undefined && record.uri === proof.uri && !record.released
+          && record.runnerInput !== true
+          && record.ownerId === scope.ownerId && record.teamId === scope.teamId) {
+          targets.set(record.id, record.uri);
+        }
+      }
+      if (targets.size === 0) {
+        return 0;
+      }
+      const committed = await this.index.update(draft => {
+        for (const [id, uri] of targets) {
+          const live = draft.submissions[id];
+          if (live === undefined || live.released || live.uri !== uri || live.runnerInput === true
+            || live.ownerId !== scope.ownerId || live.teamId !== scope.teamId) {
+            throw new WorkerError('isolation_conflict', `Runner input ${id} changed while its proof was published.`);
+          }
+          live.runnerInput = true;
+        }
+      }, guard);
+      let proved = 0;
+      for (const id of targets.keys()) {
+        const live = committed.submissions[id];
+        if (live !== undefined && live.runnerInput !== undefined) {
+          proved += 1;
+        }
+      }
+      return proved;
+    });
+  }
+
+  /**
+   * Reclaims PROVEN governed runner inputs that no live consumer holds, in ONE
+   * scoped index update and with NO per-input receipt (so a full receipt map can
+   * never turn reclamation into a failure after a result was already deleted).
+   *
+   * Only an input carrying the additive marker - published by `withSealedInput`
+   * for the seal it just made, or by `proveRunnerInputs` from a durable attempt
+   * record before that record was collected - is eligible, which is why a marker
+   * sweep can resume with no result ids and after a reopen. `references` is
+   * resolved INSIDE the view mutex, i.e. after the caller's runner collection
+   * committed, so a command that published its pending or final attempt while
+   * this sweep was queued is still retained; the sweep itself also preserves
+   * every native view pin. An unmarked input without proof, a board reference,
+   * an evidence pin and a native pin are always preserved. Released here, the
+   * inputs are removed by the existing reference-aware cleanup.
+   */
+  async reclaimInputs(
+    scope: { ownerId: string; teamId: string },
+    references: () => ReadonlySet<string>,
+    authorize?: () => void
+  ): Promise<RunnerInputReclamation> {
+    return this.mutex.run(async () => {
+      const guard = (): void => this.authorize(authorize);
+      guard();
+      this.checkScope(scope.ownerId, scope.teamId);
+      const data = this.assertReady();
+      const retained = references();
+      const pinned = new Set(Object.values(data.pins)
+        .filter(pin => pin.resource.kind === 'submission')
+        .map(pin => pin.resource.id));
+      const eligible = Object.values(data.submissions).filter(record => !record.released
+        && record.runnerInput === true
+        && record.ownerId === scope.ownerId && record.teamId === scope.teamId);
+      const targets = new Map<string, string>();
+      for (const record of eligible) {
+        if (!pinned.has(record.id) && !retained.has(record.uri)) {
+          targets.set(record.id, record.uri);
+        }
+      }
+      const preserved = eligible.length - targets.size;
+      if (targets.size === 0) {
+        return { released: [], preserved };
+      }
+      this.preflightIndex(draft => {
+        for (const id of targets.keys()) {
+          draft.submissions[id].released = true;
+        }
+      });
+      const committed = await this.index.update(draft => {
+        for (const [id, uri] of targets) {
+          const live = draft.submissions[id];
+          if (live === undefined || live.released || live.uri !== uri || live.runnerInput !== true
+            || live.ownerId !== scope.ownerId || live.teamId !== scope.teamId) {
+            throw new WorkerError('isolation_conflict', `Runner input ${id} changed before it could be reclaimed.`);
+          }
+          live.released = true;
+        }
+      }, guard);
+      const released = [...targets.keys()].filter(id => committed.submissions[id]?.released);
+      return { released, preserved };
+    });
+  }
+
   private retentionRequest(data: ViewIndexData, operation: string, scope: RetentionScope, args: string[]): { key: string; fingerprint: string; receipt?: ViewReceipt } {
     requireString(scope.requestId, 'requestId', 1, 200);
     const key = sha256([operation, this.namespace, scope.ownerId, scope.teamId, scope.requestId]);
+    this.index.request(scope.ownerId, scope.requestId, key);
     const fingerprint = sha256([operation, scope.ownerId, scope.teamId, ...args]);
     const receipt = data.receipts[key];
     if (receipt && receipt.fingerprint !== fingerprint) {
       conflict('This requestId was already used with different arguments.');
     }
+    if (receipt) {
+      // Reaching here IS an authorization-checked exact replay: the caller
+      // already re-ran its live guard and scope check, the key is derived from
+      // this owner's own scope and the operation aliases one owned effect, and
+      // the stored fingerprint matched. That proves which owner an ownerless
+      // legacy acknowledgement belongs to, so the next update publishes it.
+      this.index.adoptReceiptOwner(key, scope.ownerId);
+    }
     return { key, fingerprint, receipt };
+  }
+
+  /**
+   * The owner one durable receipt PROVES, or undefined when its payload alone
+   * cannot prove it. Evidence is restricted to records this store wrote and
+   * validated again here: a snapshot, overlay, sealed submission or pin
+   * acknowledgement that carries its own ownerId, or an acknowledgement naming
+   * one exact artifact id that this index still holds. A live record that
+   * disagrees with its own acknowledgement proves nothing, so a mixed index can
+   * never turn into a guess.
+   */
+  private provenReceiptOwner(data: ViewIndexData, result: unknown): string | undefined {
+    const parsed = <T>(parse: (value: unknown) => T): T | undefined => {
+      try {
+        return parse(result);
+      } catch {
+        return undefined; // not this record shape
+      }
+    };
+    // The acknowledgement may outlive its record; when it does not, both must agree.
+    const agree = (live: { ownerId: string } | undefined, ownerId: string): string | undefined =>
+      (live === undefined || live.ownerId === ownerId ? ownerId : undefined);
+    const snapshot = parsed(parseStoredSnapshot);
+    if (snapshot) {
+      return agree(data.snapshots[snapshot.id], snapshot.ownerId);
+    }
+    const overlay = parsed(parseOverlayRecord);
+    if (overlay) {
+      return agree(data.overlays[overlay.overlayId], overlay.ownerId);
+    }
+    const submission = parsed(parseSealedSubmission);
+    if (submission) {
+      return agree(data.submissions[submission.id], submission.ownerId);
+    }
+    const pin = parsed(parseViewPin);
+    if (pin) {
+      return agree(data.pins[pin.id], pin.ownerId);
+    }
+    if (!isPlain(result)) {
+      return undefined;
+    }
+    const keys = Object.keys(result);
+    // A discarded capture names the exact snapshot identity it retired.
+    if (keys.length === 1 && typeof result.cancelledCapture === 'string') {
+      const id = result.cancelledCapture;
+      return data.snapshots[id]?.ownerId ?? data.pendingCaptures[id]?.snapshot.ownerId;
+    }
+    // A release acknowledgement names one exact artifact of this index.
+    if (keys.length === 3 && result.released === true && typeof result.kind === 'string' && typeof result.id === 'string') {
+      const id = result.id;
+      switch (result.kind) {
+        case 'snapshot': return data.snapshots[id]?.ownerId;
+        case 'overlay': return data.overlays[id]?.ownerId;
+        case 'submission': return data.submissions[id]?.ownerId;
+        case 'pin': return data.pins[id]?.ownerId;
+        case 'pending': return data.pendingCaptures[id]?.snapshot.ownerId;
+        default: return undefined;
+      }
+    }
+    return undefined;
   }
 
   // -- inspect ---------------------------------------------------------------
 
+  /** Archive records still reserved by a pending publication intent cannot be reused by another epoch. */
+  private reservedArchiveRecords(pending: readonly ReceiptArchivePublication[]): number {
+    return pending.reduce((total, intent) => total + intent.archives.length, 0);
+  }
+
+  /**
+   * Completes one owner's durable publication intent: only its missing parts are
+   * opened, its frozen receipt selection is archived, and its exact epoch
+   * advance is committed. Parts opened before an interruption stay named by that
+   * intent, so a bounded file is never orphaned; receipts accepted after the
+   * intent stay live and replayable.
+   */
+  private async resumeArchivePublication(publication: ReceiptArchivePublication): Promise<{ archives: ReceiptArchive[]; retained: number }> {
+    // A pending-intent retry is the same durable filesystem phase as a fresh
+    // rollover, so it takes the same store write fence before any missing part
+    // is opened, published or committed.
+    return this.withStorageWrite(async () => {
+      const data = this.assertReady();
+      if (publication.namespace !== this.namespace || currentEpoch(data, publication.ownerId) !== publication.fromEpoch) {
+        throw new WorkerError('isolation_corrupt', 'The pending receipt archive publication does not match this store or its durable receipt epoch; inspect it before rolling over.');
+      }
+      const selected = selectPublicationReceipts(publication, data.receipts);
+      const others = (data.receiptArchivePublications ?? []).filter(intent => intent.namespace !== publication.namespace
+        || intent.ownerId !== publication.ownerId || intent.fromEpoch !== publication.fromEpoch);
+      const records = MAX_RECEIPT_ARCHIVE_FILES - (data.receiptArchives?.length ?? 0) - (data.receiptArchiveDeletes?.length ?? 0) - this.reservedArchiveRecords(others);
+      const archives = await publishArchivePublication(this.directory, publication, selected, records);
+      await this.index.update(draft => {
+        if (currentEpoch(draft, publication.ownerId) !== publication.fromEpoch
+          || !(draft.receiptArchivePublications ?? []).some(intent => intent.namespace === publication.namespace && intent.ownerId === publication.ownerId && intent.fromEpoch === publication.fromEpoch)) {
+          throw new WorkerError('revision_conflict', 'The receipt archive publication intent changed before it could be completed.');
+        }
+        draft.legacyRequestKeys ??= Object.keys(draft.receipts);
+        for (const key of Object.keys(selected)) {
+          delete draft.receipts[key];
+        }
+        (draft.receiptEpochs ??= {})[digest(publication.ownerId)] = publication.toEpoch;
+        (draft.receiptArchives ??= []).push(...archives);
+        const left = (draft.receiptArchivePublications ?? []).filter(intent => intent.namespace !== publication.namespace
+          || intent.ownerId !== publication.ownerId || intent.fromEpoch !== publication.fromEpoch);
+        if (left.length) {
+          draft.receiptArchivePublications = left;
+        } else {
+          delete draft.receiptArchivePublications;
+        }
+      });
+      return { archives, retained: Object.keys(this.assertReady().receipts).length };
+    });
+  }
+
+  /**
+   * `enroll` is the lifecycle host's optional first-time durable registration. It
+   * runs INSIDE this view mutex at the start of the durable phase - after the
+   * epoch, pending-capture, binding-intent, replay and capacity checks - and
+   * before the one whole filesystem write fence, so a refused rollover enrolls
+   * nothing. It is handed the read-only archive preflight and runs it ONLY while
+   * this store is not yet registered, so a physical archive refusal leaves no
+   * registration and no aggregate row, while an already registered store pays no
+   * second archive preparation. A direct domain caller that omits it keeps the
+   * original behavior.
+   */
+  async rolloverReceipts(ownerId: string, expectedEpoch: number, enroll?: (check: () => Promise<void>) => Promise<void>): Promise<unknown> {
+    return this.mutex.run(async () => {
+      const data = this.assertReady();
+      const epoch = currentEpoch(data, ownerId);
+      const pending = data.receiptArchivePublications ?? [];
+      // A pending intent belongs to its initiating owner and exact fromEpoch: no
+      // other owner and no other epoch may publish under its authority.
+      const own = pending.find(intent => intent.namespace === this.namespace && intent.ownerId === ownerId);
+      if (own) {
+        if (own.fromEpoch !== expectedEpoch || epoch !== expectedEpoch) {
+          throw new WorkerError('revision_conflict', `This owner still has a pending receipt archive publication for epoch ${own.fromEpoch}. Retry the rollover with expectedEpoch ${own.fromEpoch} to finish it; no other epoch can be published first.`);
+        }
+        // Recovering a durable pending publication follows the same first
+        // registration rule: this exact owner and epoch were accepted above, so it
+        // enrolls before the store write fence resumes the publication. A store that
+        // is not registered yet first revalidates its own frozen archive read-only.
+        await enroll?.(() => {
+          const frozen = selectPublicationReceipts(own, data.receipts);
+          const others = pending.filter(intent => intent.namespace !== own.namespace
+            || intent.ownerId !== own.ownerId || intent.fromEpoch !== own.fromEpoch);
+          const records = MAX_RECEIPT_ARCHIVE_FILES - (data.receiptArchives?.length ?? 0) - (data.receiptArchiveDeletes?.length ?? 0) - this.reservedArchiveRecords(others);
+          return preflightArchivePublication(this.directory, own, frozen, records);
+        });
+        const resumed = await this.resumeArchivePublication(own);
+        return { epoch: own.toEpoch, prefix: 'e' + own.toEpoch + ':', archives: resumed.archives,
+          archive: resumed.archives.length === 1 ? resumed.archives[0] : undefined,
+          retainedUnscopedLegacyReceipts: resumed.retained, replay: true, resumed: true };
+      }
+      if (epoch === expectedEpoch + 1) {
+        return { epoch, replay: true, retainedUnscopedLegacyReceipts: Object.keys(data.receipts).length };
+      }
+      if (epoch !== expectedEpoch || !Number.isSafeInteger(epoch + 1)) {
+        throw new WorkerError('revision_conflict', 'View receipt epoch changed.');
+      }
+      if (Object.keys(data.pendingCaptures).length || Object.values(data.pins).some(p => p.binding)) {
+        throw new WorkerError('worker_busy', 'Finish or reconcile pending captures and binding intents before rollover.');
+      }
+      // One epoch can need several deterministic parts, so the record and
+      // directory caps are checked before any part is published. Records already
+      // reserved by any owner's pending intent stay unavailable here.
+      const archiveCapacity = MAX_RECEIPT_ARCHIVE_FILES - (data.receiptArchives?.length ?? 0) - (data.receiptArchiveDeletes?.length ?? 0) - this.reservedArchiveRecords(pending);
+      if (archiveCapacity < 1) {
+        throw new WorkerError('receipt_capacity', `Collect unreferenced receipt archives before rollover (${MAX_RECEIPT_ARCHIVE_FILES} retained, pending deletion or reserved by ${pending.length} pending publication(s)).`);
+      }
+      // Ownership is proven per receipt, never guessed: the durable ownership
+      // map, an exact authorized replay whose fingerprint matched, or a
+      // validated record/result identity this index still holds. A receipt
+      // nothing proves is left live for its own owner, even when every current
+      // artifact looks single-owner - a prior other-owner artifact may already
+      // be gone, so the index shape is not evidence.
+      const proven = new Map<string, string>();
+      for (const [key, receipt] of Object.entries(data.receipts)) {
+        const owner = this.index.receiptOwnerOf(key) ?? this.provenReceiptOwner(data, receipt.result);
+        if (owner !== undefined) {
+          proven.set(key, owner);
+        }
+      }
+      const selected: typeof data.receipts = {};
+      for (const [key, receipt] of Object.entries(data.receipts)) {
+        if (proven.get(key) === ownerId) {
+          selected[key] = receipt;
+        }
+      }
+      const publication = planArchivePublication(this.namespace, ownerId, epoch, selected);
+      if (publication.archives.length > archiveCapacity) {
+        throw new WorkerError('receipt_capacity', `Receipt archive records are bounded to ${MAX_RECEIPT_ARCHIVE_FILES} and only ${archiveCapacity} remain, but this epoch needs ${publication.archives.length} parts. Collect unreferenced receipt archives before rollover.`);
+      }
+      // A physical archive refusal must not register this store, so the whole
+      // read-only archive preflight is handed to the host: it runs under this mutex
+      // and BEFORE any first registration, never for an already registered store.
+      await enroll?.(() => preflightArchivePublication(this.directory, publication, selected, archiveCapacity));
+      // Every bound is proven before the intent is durable and before any part
+      // is opened, so a rejected rollover leaves no metadata and no file. The
+      // durable filesystem phase - preflight, publication intent, every archive
+      // part and the epoch commit - runs under ONE store write fence, and no
+      // resource admission runs inside it: a reclaiming rollover never waits for
+      // a permit, so it stays available when the lane is exhausted. The read-only
+      // preflight above proved this directory usable while the store was still
+      // unregistered; the fenced preflight revalidates it under this same single
+      // fence before the intent becomes durable.
+      const archives = await this.withStorageWrite(async () => {
+        await preflightArchivePublication(this.directory, publication, selected, archiveCapacity);
+        await this.index.update(draft => {
+          draft.receiptArchivePublications = [...(draft.receiptArchivePublications ?? []), publication];
+        });
+        // Parts are opened only after the intent is durable. An interruption from
+        // here on is recoverable by this owner's exact retry, never an orphan file.
+        const published = await publishArchivePublication(this.directory, publication, selected, archiveCapacity);
+        await this.index.update(draft => {
+          draft.legacyRequestKeys ??= Object.keys(draft.receipts);
+          for (const key of Object.keys(selected)) {
+            delete draft.receipts[key];
+          }
+          (draft.receiptEpochs ??= {})[digest(ownerId)] = epoch + 1; (draft.receiptArchives ??= []).push(...published);
+          const left = (draft.receiptArchivePublications ?? []).filter(intent => intent.namespace !== publication.namespace
+            || intent.ownerId !== publication.ownerId || intent.fromEpoch !== publication.fromEpoch);
+          if (left.length) {
+            draft.receiptArchivePublications = left;
+          } else {
+            delete draft.receiptArchivePublications;
+          }
+        });
+        return published;
+      });
+      return { epoch: epoch + 1, prefix: 'e' + (epoch + 1) + ':', archives, archive: archives.length === 1 ? archives[0] : undefined,
+        retainedUnscopedLegacyReceipts: Object.keys(data.receipts).length - Object.keys(selected).length };
+    });
+  }
+
+  async collectReceiptArchives(ownerId: string, retained: ReadonlySet<string>): Promise<number> {
+    return this.mutex.run(async () => {
+      const data = this.assertReady();
+      const pending = data.receiptArchiveDeletes ?? [];
+      // Only this owner's proven-unretained entries are completed. Another
+      // owner's intent, and any identity still pinned or referenced here, stay
+      // published for its own explicit retry after the reference is released.
+      const others = pending.filter(archive => archive.ownerId !== ownerId);
+      const retainedIntent = pending.filter(archive => archive.ownerId === ownerId && retained.has(archive.uri));
+      const work = pending.filter(archive => archive.ownerId === ownerId && !retained.has(archive.uri));
+      const removed = (data.receiptArchives ?? []).filter(archive => archive.ownerId === ownerId && !retained.has(archive.uri));
+      for (const archive of removed) {
+        if (!work.some(done => done.hash === archive.hash)) {
+          work.push(archive);
+        }
+      }
+      const intent = [...others, ...retainedIntent, ...work];
+      if (intent.length > MAX_RECEIPT_ARCHIVE_FILES) {
+        throw new WorkerError('receipt_capacity', 'Archive deletions for this store are already pending. Retry this collection to finish them before removing more archives.');
+      }
+      if (!removed.length && !work.length) {
+        return 0;
+      }
+      await this.index.update(draft => {
+        if (removed.length) {
+          draft.receiptArchives = (draft.receiptArchives ?? []).filter(archive => !removed.some(r => r.hash === archive.hash));
+        }
+        // Durable deletion intent published with the reference removal: a crash
+        // after this point leaves exact recoverable identities, never orphans.
+        if (intent.length) {
+          draft.receiptArchiveDeletes = intent;
+        } else {
+          delete draft.receiptArchiveDeletes;
+        }
+      });
+      if (!work.length) {
+        return 0;
+      }
+      const outcome = await completeArchiveDeletions(this.directory, work);
+      const left = [...others, ...retainedIntent, ...outcome.remaining];
+      await this.index.update(draft => {
+        if (left.length) {
+          draft.receiptArchiveDeletes = left;
+        } else {
+          delete draft.receiptArchiveDeletes;
+        }
+      });
+      if (outcome.remaining.length) {
+        throw new WorkerError('receipt_unavailable', `Receipt archive cleanup could not finish ${outcome.remaining.length} pending deletion(s) in ${this.directory}. The immutable intent was kept; retry this collection after restoring access. ${outcome.diagnostics.join(' ')}`, true);
+      }
+      return outcome.deleted.length;
+    });
+  }
+  hasReceipt(key: string): boolean {
+    return this.assertReady().receipts[key] !== undefined;
+  }
+  requestId(ownerId: string, key: string): string {
+    return epochRequest(this.assertReady(), ownerId, key);
+  }
   async inspect(ownerId: string, teamId: string): Promise<SnapshotInspection> {
     return this.mutex.run(async () => {
       this.checkAlive();

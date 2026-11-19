@@ -271,6 +271,7 @@ async function makeExecution(t, options = {}) {
     }),
     ...(options.guard === undefined ? {} : { guard: options.guard }),
     ...(options.environment === undefined ? {} : { environment: options.environment }),
+    ...(options.withStorageWrite === undefined ? {} : { withStorageWrite: options.withStorageWrite }),
     ...(options.processRunner === undefined ? {} : { processRunner: options.processRunner })
   });
   await execution.open();
@@ -281,6 +282,15 @@ async function makeExecution(t, options = {}) {
 }
 
 const command = script => `node ${script}`;
+
+test('governed retention requires an atomic input port and never falls back to separate sealing', async t => {
+  const { execution, approvals, view } = await makeExecution(t, { processRunner: async () => { throw Error('must not spawn'); } });
+  execution.options.retainInputs = () => true;
+  await assert.rejects(execution.execute(binding, identity, view.port, { command: command('tools/report.cjs'), timeoutMs: 30000 }, new AbortController().signal), e => e.code === 'runner_retention_unavailable');
+  assert.equal(approvals.length, 0); assert.equal(view.port.count.withView, 0);
+  assert.equal(execution.results.status().results, 0); assert.equal(execution.results.status().pending, 0);
+  assert.ok(execution.pool.status().leases.every(lease => lease.state === 'released'));
+});
 
 test('configuration is bounded, open is lazy and single-flight, and a failed handle stays closed', { timeout: TEST_TIMEOUT }, async t => {
   const root = await tempRoot(t);
@@ -1391,4 +1401,404 @@ test('scoped cleanup validates the scope before retrying, and never settles anot
   assert.equal(execution.pool.status().slots[0].state, 'free');
   assert.deepEqual([...execution.pool.status().leases], []);
   assert.equal(execution.results.get(owned.leaseId, scope).outcome, 'denied');
+});
+
+// ---------------------------------------------------------------------------
+// A final record that COMMITTED before the storage wrapper threw.
+//
+// The results store adopts a final exactly at the rename inside its managed
+// write, but its injected write wrapper can still fail after that rename, while
+// measuring or accounting the write it just made. finish() then still reports
+// the storage error, so the durable final has to be reconciled by persist():
+// only when it is this exact attempt and this exact stage finish is it adopted
+// (with its leftover pending dropped and the stage's own release intent), and a
+// missing or conflicting final keeps the conservative quarantine.
+//
+// Known pre-launch path, no process involved: an unsupported view entry fails
+// the setup after the pending attempt was recorded, so persist() records a
+// drained setup_failed final. The pre-publication control below fails the same
+// write BEFORE its rename commits, which must still quarantine.
+// ---------------------------------------------------------------------------
+
+/**
+ * A storage write wrapper that fails AFTER the rename of a final RESULT record
+ * committed -- exactly what a wrapper whose post-write accounting fails does.
+ * Only `results/<id>.json` publications are watched, so the pending attempt and
+ * the view materialization (also wrapped by this seam) publish normally.
+ */
+function finalRecordFault() {
+  const state = {
+    armed: true,
+    injected: 0,
+    resultsDirectory: null,
+    /** Every final record name this seam observed as NEWLY published. */
+    published: [],
+    attach(target) { state.resultsDirectory = target; },
+    async wrap(action) {
+      const before = await finals();
+      const value = await action();
+      const created = (await finals()).filter(name => !before.includes(name));
+      state.published.push(...created);
+      if (state.armed && created.length > 0) {
+        state.injected += 1;
+        throw new Error('injected wrapper failure AFTER the final publication');
+      }
+      return value;
+    }
+  };
+  const finals = async () => {
+    if (state.resultsDirectory === null) {
+      return [];
+    }
+    const names = await fs.readdir(state.resultsDirectory).catch(() => []);
+    return names.filter(name => /^[0-9a-f]{32}\.json$/.test(name)).sort();
+  };
+  return state;
+}
+
+/** The same pre-launch setup failure: one unsupported entry, nothing to run. */
+function unsupportedSetupPort(root, blobs) {
+  return makePort(root, {
+    blobs,
+    entries: {
+      src: { type: 'directory' },
+      'src/app.ts': addFile(blobs, 'ok\n'),
+      bin: { type: 'directory' },
+      'bin/ghost.dll': { type: 'unsupported', detail: 'symlink' }
+    }
+  });
+}
+
+test('a setup failure whose final committed before the storage wrapper threw is reconciled, not quarantined', { timeout: TEST_TIMEOUT }, async t => {
+  const fault = finalRecordFault();
+  let started = 0;
+  const { project, executionRoot, execution, approvals, view } = await makeExecution(t, {
+    capacity: 1,
+    withStorageWrite: action => fault.wrap(action),
+    processRunner: async () => {
+      started += 1;
+      throw new Error('a process must never start for a failed setup');
+    }
+  });
+  fault.attach(path.join(executionRoot, 'results', 'results'));
+  const port = unsupportedSetupPort(execution.logicalRoot, view.blobs);
+
+  // No process, no approval: only the recorded setup failure reaches persist().
+  const result = await execution.execute(binding, identity, port,
+    { command: command('tools/report.cjs') }, new AbortController().signal);
+
+  // Exactly one publication was failed, and it was the durable final.
+  assert.equal(fault.injected, 1, 'only the final publication was failed');
+  assert.equal(fault.published.length, 1, 'the final record is published exactly once');
+  assert.equal(started, 0, 'a failed setup must never spawn a command');
+  assert.equal(port.count.edit, 0, 'a failed setup must never import');
+  assert.equal(approvals.length, 0, 'a failed setup never reaches approval');
+  assert.equal(result.outcome, 'setup_failed');
+  assert.equal(result.import, 'not_started');
+  assert.equal(result.afterVersion, null);
+  assert.equal(result.exitCode, null);
+  assert.equal(result.signal, null);
+  assert.equal(result.output, '');
+  assert.equal(result.drained, true);
+  assert.match(result.diagnostic, /unsupported/i);
+
+  // The reconciled result IS the durable record: read back, never rewritten, and
+  // its leftover pending attempt is cleaned up rather than left for recovery.
+  const resultFile = path.join(executionRoot, 'results', 'results', `${result.id}.json`);
+  const pendingFile = path.join(executionRoot, 'results', 'pending', `${result.id}.json`);
+  const durableText = await fs.readFile(resultFile, 'utf8');
+  assert.deepEqual(JSON.parse(durableText), JSON.parse(JSON.stringify(result)));
+  assert.deepEqual(execution.results.get(result.id, scope), result);
+  assert.equal(execution.results.status().results, 1);
+  assert.equal(execution.results.status().pending, 0, 'the leftover pending is dropped');
+  assert.equal(await exists(pendingFile), false);
+
+  // The stage proved a pre-launch failure (drained, nothing to preserve), so the
+  // lease is released with that exact intent instead of being quarantined by a
+  // storage error it did not really have.
+  const lease = execution.pool.status().leases.find(entry => entry.leaseId === result.id);
+  assert.equal(lease.state, 'released');
+  assert.equal(lease.preserve, false, 'a proven drain is not turned into a preservation');
+  assert.equal(execution.pool.status().slots[0].state, 'free');
+  assert.equal(await exists(lease.directory), false);
+
+  // Reconciliation is idempotent: cleanup settles nothing twice, the final keeps
+  // its exact bytes, and a reopen finds the same result with no recovered
+  // 'uncertain' attempt and no recovery diagnostic.
+  const cleaned = await execution.cleanup(scope);
+  assert.deepEqual([...cleaned.retained], []);
+  assert.equal(await fs.readFile(resultFile, 'utf8'), durableText, 'the durable final is never rewritten');
+  await execution.close();
+  const reopened = new RunnerExecution(executionRoot, project, {
+    approveCommand: async () => {
+      throw new Error('a reopened handle must never approve a command');
+    }
+  });
+  t.after(() => reopened.close().catch(() => undefined));
+  await reopened.open();
+  assert.deepEqual(reopened.results.get(result.id, scope), result);
+  assert.equal(reopened.results.status().pending, 0);
+  assert.deepEqual([...reopened.results.status().diagnostics], [], 'no uncertain recovery was needed');
+  assert.equal(await fs.readFile(resultFile, 'utf8'), durableText);
+});
+
+test('a setup failure whose final never committed keeps the conservative quarantine', { timeout: TEST_TIMEOUT }, async t => {
+  let started = 0;
+  const { project, executionRoot, execution, view } = await makeExecution(t, {
+    capacity: 1,
+    processRunner: async () => {
+      started += 1;
+      throw new Error('a process must never start for a failed setup');
+    }
+  });
+  const port = unsupportedSetupPort(execution.logicalRoot, view.blobs);
+
+  // The control: the final write fails BEFORE its rename commits, so there is no
+  // durable final to reconcile and the pre-fix behaviour must be preserved.
+  const finish = execution.results.finish.bind(execution.results);
+  execution.results.finish = async () => {
+    throw new WorkerError('runner_results_storage', 'the results disk is full');
+  };
+  const failure = await execution.execute(binding, identity, port,
+    { command: command('tools/report.cjs') }, new AbortController().signal).then(() => null, error => error);
+  assert.equal(failure.code, 'runner_results_storage', 'the real persistence error is reported');
+  assert.equal(started, 0);
+  assert.equal(execution.results.status().results, 0);
+  assert.equal(execution.results.status().pending, 1, 'the pending attempt stays durable');
+
+  const quarantined = execution.pool.status().leases.find(entry => entry.state === 'quarantined');
+  assert.ok(quarantined, 'an unpersisted final still quarantines its directory');
+  assert.equal(quarantined.preserve, true);
+  assert.match(quarantined.diagnostic, /could not be persisted/);
+  assert.equal(await exists(quarantined.directory), true);
+
+  // Nothing was replayed: the attempt reloads as uncertain, exactly as before.
+  execution.results.finish = finish;
+  await execution.close();
+  const reopened = new RunnerExecution(executionRoot, project, {
+    approveCommand: async () => {
+      throw new Error('a reopened handle must never approve a command');
+    }
+  });
+  t.after(() => reopened.close().catch(() => undefined));
+  await reopened.open();
+  const recovered = reopened.results.list(scope);
+  assert.equal(recovered.total, 1);
+  assert.equal(recovered.results[0].id, quarantined.leaseId);
+  assert.equal(recovered.results[0].outcome, 'uncertain');
+  assert.equal(recovered.results[0].import, 'uncertain');
+  assert.equal(recovered.results[0].afterVersion, null);
+  assert.equal(recovered.results[0].drained, false);
+  assert.match(recovered.results[0].diagnostic, /not replayed/);
+  assert.equal(started, 0, 'the command must never be replayed');
+  const retained = reopened.pool.status().leases.find(entry => entry.leaseId === quarantined.leaseId);
+  assert.equal(retained.state, 'quarantined');
+  assert.equal(retained.preserve, true);
+  assert.equal(await exists(quarantined.directory), true);
+});
+
+// ---------------------------------------------------------------------------
+// A PENDING attempt that COMMITTED before the storage wrapper threw.
+//
+// RunnerResults.start persists the pending attempt through the same managed
+// write and adopts it at the rename that commits it. A wrapper that fails while
+// doing its own post-write accounting therefore reports a storage error for an
+// attempt that IS durable. prepare() may not read that as "nothing was
+// recorded": the lease would be released as an untouched, unrecorded attempt
+// (no preservation, its directory discarded) while the durable pending attempt
+// stays behind, and the next open turns it into a permanent, uncollectible
+// 'uncertain' result -- an orphan produced by a failure that really published.
+//
+// The reconciliation is a LOOKUP, never a retry: RunnerResults.replayStart
+// answers, under the store's own mutex, only for this exact id/lease/owner/
+// attempt. A proven attempt takes the existing pre-process failure finalization
+// (a durable setup_failed final, no process, no approval, no import); an
+// unproven one keeps the pre-fix behaviour, which the control test pins.
+// ---------------------------------------------------------------------------
+
+/**
+ * A storage write wrapper that fails AFTER the rename of a PENDING attempt
+ * record committed -- exactly what a wrapper whose post-write accounting fails
+ * does. Only `pending/<id>.json` publications are watched, so both the final
+ * result of the reconciled attempt and the view materialization (also wrapped by
+ * this same seam) publish normally.
+ */
+function pendingRecordFault() {
+  const state = {
+    armed: true,
+    injected: 0,
+    pendingDirectory: null,
+    /** Every pending record name this seam observed as NEWLY published. */
+    published: [],
+    attach(target) { state.pendingDirectory = target; },
+    async wrap(action) {
+      const before = await pendings();
+      const value = await action();
+      const created = (await pendings()).filter(name => !before.includes(name));
+      state.published.push(...created);
+      if (state.armed && created.length > 0) {
+        state.injected += 1;
+        throw new Error('injected wrapper failure AFTER the pending publication');
+      }
+      return value;
+    }
+  };
+  const pendings = async () => {
+    if (state.pendingDirectory === null) {
+      return [];
+    }
+    const names = await fs.readdir(state.pendingDirectory).catch(() => []);
+    return names.filter(name => /^[0-9a-f]{32}\.json$/.test(name)).sort();
+  };
+  return state;
+}
+
+test('a pending attempt whose write committed before the wrapper threw is finalized, not orphaned', { timeout: TEST_TIMEOUT }, async t => {
+  const fault = pendingRecordFault();
+  let started = 0;
+  const { project, executionRoot, execution, approvals, view } = await makeExecution(t, {
+    capacity: 1,
+    withStorageWrite: action => fault.wrap(action),
+    processRunner: async () => {
+      started += 1;
+      throw new Error('a process must never start for a reconciled attempt');
+    }
+  });
+  fault.attach(path.join(executionRoot, 'results', 'pending'));
+
+  // The ONLY injected fault is the pending publication: the attempt is durable,
+  // and start() still reports the storage error to prepare().
+  const result = await execution.execute(binding, identity, view.port,
+    { command: command('tools/report.cjs'), timeoutMs: 30_000 }, new AbortController().signal);
+
+  // Exactly one publication was failed, and it was the durable pending attempt.
+  assert.equal(fault.injected, 1, 'only the pending publication was failed');
+  assert.deepEqual(fault.published, [`${result.id}.json`], 'the pending record is published once and adopted');
+
+  // The reconciliation is a LOOKUP: no command, no approval, no import, no
+  // second write of the attempt.
+  assert.equal(started, 0, 'the adopted attempt must never spawn a command');
+  assert.equal(approvals.length, 0, 'the adopted attempt never reaches approval');
+  assert.equal(view.port.count.edit, 0, 'the adopted attempt never imports');
+  assert.equal(view.port.revision(), 3, 'the private view is untouched');
+
+  // It is finalized exactly like any other pre-process setup failure.
+  assert.equal(result.outcome, 'setup_failed');
+  assert.equal(result.import, 'not_started');
+  assert.equal(result.afterVersion, null);
+  assert.equal(result.exitCode, null);
+  assert.equal(result.signal, null);
+  assert.equal(result.output, '');
+  assert.equal(result.truncated, false);
+  assert.equal(result.drained, true, 'nothing ran, so nothing is unproven about a process tree');
+  assert.match(result.diagnostic, /setup failed/);
+  assert.match(result.diagnostic, /could not be persisted/);
+  assert.equal(result.attempt.id, result.attempt.leaseId, 'the durable attempt keeps its lease identity');
+  assert.equal(result.attempt.command, command('tools/report.cjs'));
+  assert.equal(result.attempt.inputVersion.revision, 3);
+  assert.equal(result.attempt.owner.ownerId, identity.ownerId);
+
+  // The durable final IS the returned record and the pending attempt is gone, so
+  // no orphan is left for a reload to convert into 'uncertain'.
+  const resultFile = path.join(executionRoot, 'results', 'results', `${result.id}.json`);
+  const pendingFile = path.join(executionRoot, 'results', 'pending', `${result.id}.json`);
+  const durableText = await fs.readFile(resultFile, 'utf8');
+  assert.deepEqual(JSON.parse(durableText), JSON.parse(JSON.stringify(result)));
+  assert.deepEqual(execution.results.get(result.id, scope), result);
+  assert.equal(execution.results.status().results, 1);
+  assert.equal(execution.results.status().pending, 0, 'the adopted pending attempt is consumed by its final');
+  assert.equal(await exists(pendingFile), false);
+
+  // The stage proved a pre-launch failure (drained, nothing to preserve), so the
+  // lease is released with that exact intent instead of being abandoned as an
+  // unrecorded attempt or quarantined by a storage error it did not really have.
+  const lease = execution.pool.status().leases.find(entry => entry.leaseId === result.id);
+  assert.equal(lease.state, 'released');
+  assert.equal(lease.preserve, false, 'a proven drain is not turned into a preservation');
+  assert.equal(execution.pool.status().slots[0].state, 'free');
+  assert.equal(await exists(lease.directory), false);
+
+  // Nothing is retained for a retry, and a reopen finds that exact result with no
+  // recovered 'uncertain' attempt and no recovery diagnostic.
+  const cleaned = await execution.cleanup(scope);
+  assert.deepEqual([...cleaned.retained], []);
+  await execution.close();
+  const reopened = new RunnerExecution(executionRoot, project, {
+    approveCommand: async () => {
+      throw new Error('a reopened handle must never approve a command');
+    }
+  });
+  t.after(() => reopened.close().catch(() => undefined));
+  await reopened.open();
+  assert.deepEqual(reopened.results.get(result.id, scope), result);
+  assert.equal(reopened.results.status().results, 1);
+  assert.equal(reopened.results.status().pending, 0);
+  assert.deepEqual([...reopened.results.status().diagnostics], [], 'no uncertain recovery was needed');
+  assert.equal(await fs.readFile(resultFile, 'utf8'), durableText, 'the durable final is never rewritten');
+
+  // Once otherwise eligible it is collectible: nothing about the reconciliation
+  // pinned the record or its directory.
+  const collected = await reopened.collect(scope, [result.id], new Set(), new Set());
+  assert.deepEqual(collected.removed.map(entry => entry.id), [result.id]);
+  assert.deepEqual(collected.retained, []);
+  assert.equal(await exists(resultFile), false);
+  const again = await reopened.collect(scope, [result.id], new Set(), new Set());
+  assert.deepEqual(again.removed, [], 'collection is idempotent');
+});
+
+test('a pending attempt whose write never committed keeps the untouched-lease release', { timeout: TEST_TIMEOUT }, async t => {
+  let started = 0;
+  let writes = 0;
+  const { project, executionRoot, execution, approvals, view } = await makeExecution(t, {
+    capacity: 1,
+    // The control: the pending write fails BEFORE its rename runs, so nothing is
+    // adopted, nothing is durable and nothing may be claimed as published.
+    withStorageWrite: async action => {
+      writes += 1;
+      if (writes === 1) {
+        throw new Error('injected wrapper failure BEFORE the pending publication');
+      }
+      await action();
+    },
+    processRunner: async () => {
+      started += 1;
+      throw new Error('a process must never start for a failed setup');
+    }
+  });
+
+  const failure = await execution.execute(binding, identity, view.port,
+    { command: command('tools/report.cjs') }, new AbortController().signal).then(() => null, error => error);
+  assert.equal(failure.code, 'runner_results_storage', 'the real start failure is reported, unmasked');
+  assert.match(failure.message, /could not be persisted/);
+  assert.equal(writes, 1, 'a pre-publication failure is never retried to detect adoption');
+  assert.equal(started, 0, 'no process may start');
+  assert.equal(approvals.length, 0, 'no approval may be requested');
+  assert.equal(view.port.count.edit, 0, 'nothing may be imported');
+
+  // Nothing was recorded and nothing was claimed: no pending record, no final.
+  assert.equal(execution.results.status().results, 0);
+  assert.equal(execution.results.status().pending, 0);
+  assert.deepEqual(await fs.readdir(path.join(executionRoot, 'results', 'pending')), []);
+  assert.deepEqual(await fs.readdir(path.join(executionRoot, 'results', 'results')), []);
+
+  // The untouched lease keeps its pre-fix release: discarded, not preserved.
+  const leases = execution.pool.status().leases;
+  assert.equal(leases.length, 1);
+  assert.equal(leases[0].state, 'released');
+  assert.equal(leases[0].preserve, false, 'an unrecorded attempt keeps its untouched release');
+  assert.equal(execution.pool.status().slots[0].state, 'free');
+  assert.equal(await exists(leases[0].directory), false);
+
+  // A reload finds no record at all: nothing recovered, nothing uncertain.
+  await execution.close();
+  const reopened = new RunnerExecution(executionRoot, project, {
+    approveCommand: async () => {
+      throw new Error('a reopened handle must never approve a command');
+    }
+  });
+  t.after(() => reopened.close().catch(() => undefined));
+  await reopened.open();
+  assert.equal(reopened.results.list(scope).total, 0);
+  assert.equal(reopened.results.status().pending, 0);
+  assert.deepEqual([...reopened.results.status().diagnostics], []);
 });

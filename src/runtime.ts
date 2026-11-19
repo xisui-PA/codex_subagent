@@ -4,14 +4,18 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { invoke, ToolResult } from './api';
 import { BridgeHost, forward } from './bridge';
-import { WorkerEngine } from './engine';
+import { WorkerLifecycle } from './worker-lifecycle';
+import { ResourceGovernor, resourceDefaults, storageUsage } from './resource-governor';
+import type { ResourceConfig, WorkLane } from './resource-governor';
+import { isGovernedTool } from './worker-startup';
+import { WorkerEngine, type ExecutionGovernance } from './engine';
 import { TaskBoard } from './task-board';
 import type { BoardActor } from './task-board-types';
-import { invokeBoard, isBoardTool, workerBoardTools } from './task-board-tools';
+import { boardAdmissionLane, boardStorageReservation, invokeBoard, isBoardTool, workerBoardTools } from './task-board-tools';
 import type { BoardPort } from './task-board-tools';
 import { summarizeBoard } from './task-board-summary';
 import type { BoardWorkspaceStatus } from './task-board-summary';
-import { Mutex, sessionHeader, SessionStore } from './storage';
+import { digest, Mutex, sessionHeader, SessionStore } from './storage';
 import { failure, Provider, Session, SessionHeader, Settings, WorkerError, WorkspaceTools } from './types';
 import { FileToolOptions, FileTools } from './workspace-tools';
 import { IsolatedViewHost } from './isolated-view-host';
@@ -34,10 +38,15 @@ export interface RuntimeOptions {
    * capacity/maxQueue are applied when the runner manager is opened.
    */
   runners?: () => RunnerHostConfig;
+  /** Check the trusted opt-in flag independently of the resource limits. */
+  resourcesEnabled?: () => boolean;
+  resources?: () => ResourceConfig;
+  /** Internal test seam; never configurable by a checkout or an MCP caller. */
+  resourceDirectory?: string;
   /** Fresh owning-window dirty document enumeration, queried at each capture boundary. */
   openDocuments?: () => OpenDocument[];
 }
-interface Local { root: string; roots: string[]; store: SessionStore; engine: WorkerEngine; files: FileTools; host: BridgeHost; board: BoardHost; isolation: IsolatedViewHost }
+interface Local { root: string; roots: string[]; store: SessionStore; engine: WorkerEngine; files: FileTools; host: BridgeHost; board: BoardHost; isolation: IsolatedViewHost; lifecycle: WorkerLifecycle }
 const identifier = z.string().regex(/^[a-f0-9]{32}$/);
 const changeIdentifier = z.string().uuid();
 export function unpack<T>(result: ToolResult): T {
@@ -73,7 +82,9 @@ class BoardHost implements BoardPort {
     private readonly root: string,
     private readonly worker: (id: string) => Session | undefined,
     private readonly enabled: () => boolean,
-    private readonly guard: () => void
+    private readonly guard: () => void,
+    private readonly ordinaryRequestIds: () => boolean,
+    private readonly withStorageWrite: <T>(action: () => Promise<T>) => Promise<T>
   ) {}
 
   /** Host-stopping / feature-off gate shared by open, reads and the commit guard. */
@@ -102,7 +113,8 @@ class BoardHost implements BoardPort {
   async open(): Promise<TaskBoard> {
     this.assertUsable();
     if (!this.opening) {
-      const board = new TaskBoard(this.directory, this.root, this.worker, () => this.commitGuard());
+      const board = new TaskBoard(this.directory, this.root, this.worker, () => this.commitGuard(),
+        { ordinaryRequestIds: this.ordinaryRequestIds }, this.withStorageWrite);
       this.opening = board.open().then(() => {
         this.board = board;
         return board;
@@ -190,13 +202,16 @@ export class WorkerBroker {
   private readonly scopes = new Set<string>();
   private readonly mutex = new Mutex();
   private closed = false;
+  private readonly resources: ResourceGovernor;
+  private resourceUsed = false;
   private lastDiscovery = 0;
   private savedRoots: string[] = [];
   private readonly leaseTimer: NodeJS.Timeout;
   constructor(readonly options: RuntimeOptions) {
+    this.resources = new ResourceGovernor(() => options.resources?.() ?? resourceDefaults, options.resourceDirectory);
     this.leaseTimer = setInterval(() => {
       for (const runtime of this.local.values()) {
-        void runtime.engine.expireParents().catch(error => options.onError(failure(error).message));
+        void runtime.lifecycle.expirePreparing().catch(error => options.onError(failure(error).message)).then(() => runtime.engine.expireParents()).catch(error => options.onError(failure(error).message));
       }
     }, 5000);
     this.leaseTimer.unref();
@@ -255,10 +270,22 @@ export class WorkerBroker {
    * re-evaluate queued work against the new pool (repaired malformed config,
    * raised numSessions). Ownership, running jobs and draining tools are left
    * untouched; windows that do not own a store simply have nothing to do.
+   *
+   * A participating host also re-publishes its aggregate policy. The raw trusted
+   * opt-in is forwarded as a READER, never as a captured value: the governor calls
+   * it inside its own transaction, so an explicit `false` withdraws this host's
+   * registered profile before any of its (now unused) limits is read or validated,
+   * and a notification that waited behind another transaction cannot apply a stale
+   * flag after a newer one. A throwing callback is reported by the same async
+   * handler, and the refresh itself then aborts without publishing anything.
    */
   settingsChanged(): void {
     if (this.closed) {
       return;
+    }
+    if (this.resourceUsed) {
+      void this.resources.refreshPolicy(() => this.options.resourcesEnabled?.())
+        .catch(error => this.options.onError(failure(error).message));
     }
     for (const runtime of this.local.values()) {
       try {
@@ -312,6 +339,30 @@ export class WorkerBroker {
     };
   }
 
+  private resourcesEnabled(): boolean {
+    return this.options.resourcesEnabled?.() ?? (this.options.resources?.().enabled === true);
+  }
+  /**
+   * Trusted live resource switch for a NEW evidence pin, and nothing more.
+   *
+   * A board-only pin - a manual URI - has always been supported
+   * with private views disabled, and an exact replay or a release is no new
+   * admission at all, so the combined feature guard must not decide this one
+   * boundary. Only resources.enabled may refuse a fresh pin before the
+   * governor registers or charges this store, which is what would enroll an
+   * opted-out, unused store as a side effect of a refused request.
+   */
+  private freshPinGate(): () => void {
+    return () => {
+      if (this.closed) {
+        throw new WorkerError('host_stopping', 'The host is stopping.', true);
+      }
+      if (!this.resourcesEnabled()) {
+        throw new WorkerError('feature_disabled', 'Enable codexSubagent.resources.enabled in User Settings to add a new evidence pin. Existing pins can still be replayed or released.');
+      }
+    };
+  }
+
   /**
    * Private tools for one worker: file tools stay exactly as the engine built
    * them, so write/shell policy and the authorize callback are unchanged, and
@@ -332,12 +383,118 @@ export class WorkerBroker {
     // shell switch and the approval surface are forwarded, not copied, so a
     // live revocation is seen by every runner decision point.
     runners: this.options.runners,
+    governanceEnabled: () => this.resourcesEnabled(),
+    withStorageWrite: action => store.withStorageWrite(action),
     allowShell: this.options.files.allowShell,
-    approveCommand: this.options.files.approveCommand });
+    approveCommand: this.options.files.approveCommand,
+    admission: (() => {
+      const poolDirectory = path.join(store.directory, 'runners', 'pool');
+      const accountedTerminal = new Set<string>();
+      // Exact ids this scope asked the shared ledger about, so a queued runner
+      // request can still cancel its own claim before any lease record exists.
+      const admitted = new Set<string>();
+      const admission = this.resources.runnerAdmission(poolDirectory, root, owner => store.get(owner.workerId).startup?.lane ?? 'work', async (owner, reason) => {
+        const current = store.get(owner.workerId);
+        if (current.startup && current.waitingReason !== reason) {
+          await store.change(current.id, s => {
+            s.waitingReason = reason; s.activity = reason ? 'Waiting: ' + reason : 'Preparing isolated command';
+          }); this.options.onChange();
+        }
+      });
+      // Live local participation: a lease whose session still carries governed
+      // startup state, even before this store is registered in the ledger.
+      const governed = (record: import('./runner-pool').RunnerLeaseRecord): boolean => {
+        try {
+          return !!store.get(record.owner.workerId).startup;
+        } catch {
+          return false;
+        }
+      };
+      /**
+       * Exact local participation in the shared ledger, and the only condition
+       * under which this runner scope may touch it: a request this scope is still
+       * cancelling its own claim for, or a local registration proving this store
+       * opted in - now or in an earlier host - so retained claims stay
+       * reconcilable after opt-out, reload or deletion of its sessions. `hasStore`
+       * is a local metadata read (no ledger lock, read or write), and the
+       * broker-wide resourceUsed flag is deliberately NOT consulted here: another
+       * root participating, or a status call, must never push an unused opted-out
+       * legacy runner scope into the shared ledger.
+       */
+      const participates = async (): Promise<boolean> => admitted.size > 0 || this.resources.hasStore(store.directory);
+      return {
+        applies: (owner: import('./runner-pool').RunnerLeaseOwner) => !!store.get(owner.workerId).startup,
+        tryAcquire: async (id: string, owner: import('./runner-pool').RunnerLeaseOwner, localCapacity?: number) => {
+          if (!store.get(owner.workerId).startup) {
+            return true;
+          }
+          admitted.add(id); this.resourceUsed = true; return admission.tryAcquire(id, owner, localCapacity);
+        },
+        cancel: async (id: string) => {
+          if (!await participates()) {
+            return;
+          }
+          admitted.delete(id); await admission.cancel(id);
+        },
+        cancelMany: async (ids: readonly string[]) => {
+          if (!await participates()) {
+            return;
+          }
+          // Same local bookkeeping and participation rule as `cancel`, in the same
+          // order: forget every id BEFORE the shared withdrawal, so a retried batch
+          // still needs the same registered-store proof. The whole batch is ONE
+          // scoped ledger transaction when the admission offers it; the per-id
+          // fallback only covers an admission that does not.
+          for (const id of ids) {
+            admitted.delete(id);
+          }
+          const many = admission.cancelMany;
+          if (many) {
+            await many.call(admission, ids);
+            return;
+          }
+          for (const id of ids) {
+            await admission.cancel(id);
+          }
+        },
+        reconcile: async (records: readonly import('./runner-pool').RunnerLeaseRecord[], recovery?: boolean, releasedIds?: readonly string[], physicalAvailable?: boolean) => {
+          if (!records.some(governed) && !await participates()) {
+            return;
+          }
+          this.resourceUsed = true;
+          // A record that became a lease is reconciled through its own release or
+          // quarantine state, so its exact cancellation id is no longer needed.
+          for (const record of records) {
+            admitted.delete(record.leaseId);
+          }
+          if (recovery || releasedIds?.length || records.some(r => ['released', 'quarantined'].includes(r.state) && !accountedTerminal.has(r.leaseId + r.state))) {
+            await this.resources.account(store.directory, () => storageUsage(store.directory));
+          }
+          await admission.reconcile(records, recovery, releasedIds, physicalAvailable);
+          accountedTerminal.clear();
+          for (const record of records.filter(r => ['released', 'quarantined'].includes(r.state))) {
+            accountedTerminal.add(record.leaseId + record.state);
+          }
+        }
+      };
+    })(),
+    onRunnerPhase: async (id, reason) => {
+      if (store.get(id).startup) {
+        await store.change(id, s => {
+          s.waitingReason = reason; s.activity = reason ? 'Waiting: ' + reason : 'Running isolated command';
+        });
+      }
+    }
+    });
   }
 
   private workerTools(files: FileTools, board: BoardHost, isolation: IsolatedViewHost): WorkspaceTools {
-    const scoped = (session: Session): WorkspaceTools => session.schema === 2 || session.isolatedView ? isolation.scoped(session) : files.forSession(session);
+    const scoped = (session: Session): WorkspaceTools => {
+      if (session.startup && session.startup.phase !== 'started') {
+        throw new WorkerError('startup_incomplete', 'Incomplete startup has no worker tools.');
+      }
+      return session.schema === 2 || session.isolatedView ? isolation.scoped(session) : files.forSession(session);
+    };
     return {
       get workspaceRoot() {
         return files.workspaceRoot;
@@ -348,6 +505,82 @@ export class WorkerBroker {
     };
   }
 
+  private trackStorage(store: SessionStore): () => void {
+    let registered = false; let restoring = true;
+    /** This exact store is a real participant of the aggregate. */
+    const participate = () => {
+      registered = true; this.resourceUsed = true;
+    };
+    /**
+     * Settle a FAILED attempt against durable proof. Tracking is kept only for a
+     * store that really participates: its own pending or registered local marker
+     * - published by this attempt before it failed, or by an earlier one - or a
+     * claim the aggregate already holds. A definitive pre-admission refusal
+     * publishes nothing, so an opted-out legacy scope keeps its original behavior
+     * instead of being latched into a rejection it never enrolled in, while a
+     * durable marker or fence - and any action that already entered - keeps being
+     * tracked, so recovery and shutdown still see the participant.
+     */
+    const settle = async (): Promise<void> => {
+      if (await this.resources.hasStore(store.directory).catch(() => true)) {
+        participate();
+      }
+    };
+    store.onWrite = async (session, action) => {
+      // Opening recovery must never bootstrap a missing established ledger
+      // before model ownership has been checked against durable worker history.
+      if (!(session?.startup || registered || this.resourcesEnabled() || await this.resources.hasStore(store.directory))) {
+        return action();
+      }
+      if (restoring && !await this.resources.hasState()) {
+        return action();
+      }
+      try {
+        const value = await this.resources.withStoreWrite(store.directory, action, () => storageUsage(store.directory), session?.startup ? undefined
+          : error => this.options.onError('Legacy storage accounting ' + store.directory + ': ' + failure(error).message));
+        // The write fence, the published marker and the action that entered are
+        // the durable proof that this exact store participates.
+        participate();
+        return value;
+      } catch (error) {
+        await settle();
+        throw error;
+      }
+    };
+    store.onCheckpoint = async session => {
+      try {
+        if (session.startup || registered || this.resourcesEnabled() || await this.resources.hasStore(store.directory)) {
+          if (restoring && !await this.resources.hasState()) {
+            return;
+          }
+          await this.resources.account(store.directory, () => storageUsage(store.directory));
+          participate();
+        }
+      } catch (error) {
+        await settle();
+        if (session.startup) {
+          throw error;
+        }
+        // Accounting quarantines an unreadable store. Legacy execution keeps
+        // its original behavior while fresh governed storage grants fail closed.
+        this.options.onError('Legacy storage accounting ' + store.directory + ': ' + failure(error).message);
+      }
+    };
+    return () => {
+      restoring = false;
+    };
+  }
+  private executionGovernance(lifecycle: () => WorkerLifecycle, queue = true): ExecutionGovernance {
+    return {
+      drainAdmissions: workerId => lifecycle().drainAdmissions(workerId),
+      waitReady: (session, signal) => lifecycle().waitReady(session, signal),
+      stream: (session, messages, tools, signal, maintenance) => lifecycle().stream(session, messages, tools, signal, maintenance),
+      archive: (session, summary, signal) => lifecycle().archive(session, summary, signal, queue),
+      execute: (session, name, signal, action) => lifecycle().execute(session, name, signal, action),
+      activeForModel: (modelId, excludeId) => lifecycle().activeForModel(modelId, excludeId),
+      authorize: (session, effect) => lifecycle().authorize(session, effect)
+    };
+  }
   private async ensure(root: string): Promise<Local | undefined> {
     if (!this.closed && this.local.has(root)) {
       return this.local.get(root);
@@ -365,6 +598,7 @@ export class WorkerBroker {
       this.scopes.add(root);
       const directory = await workspaceDirectory(this.options.storage, root);
       const store = new SessionStore(directory);
+      const restored = this.trackStorage(store);
       try {
         await store.open();
       } catch (error) {
@@ -395,23 +629,48 @@ export class WorkerBroker {
       }).catch(async error => {
         await store.close(); throw error;
       });
-      const board = new BoardHost(directory, root, this.workerResolver(store), () => this.boardEnabled(), () => this.boardGuard());
+      const board = new BoardHost(directory, root, this.workerResolver(store), () => this.boardEnabled(), () => this.boardGuard(),
+        () => !this.resourcesEnabled(), action => store.withStorageWrite(action));
       // An enabled board loads before any worker turn runs. Board trouble is
       // reported and cached but never blocks the standalone worker host.
       if (this.boardEnabled()) {
         await board.open().catch(error => this.options.onError(`board ${root}: ${failure(error).message}`));
       }
       const isolation = this.isolationHost(root, store, board);
-      const engine = new WorkerEngine(store, this.options.provider, this.workerTools(files, board, isolation), this.options.settings);
+      const engine: WorkerEngine = new WorkerEngine(store, this.options.provider, this.workerTools(files, board, isolation), this.options.settings, this.executionGovernance(() => lifecycle));
+      const lifecycle: WorkerLifecycle = new WorkerLifecycle(root, store, engine, board, isolation, this.resources, this.options.provider, this.options.settings, () => {
+        if (this.closed) {
+          throw new WorkerError('host_stopping', 'The host is stopping.', true);
+        }
+        if (!this.viewsEnabled() || !this.resourcesEnabled()) {
+          throw new WorkerError('feature_disabled', 'Governed workers require User resources.enabled, taskBoard.enabled and isolatedViews.enabled.');
+        }
+      }, this.freshPinGate(), () => {
+        // Reported by the lifecycle only from real accounting/acquisition/enrollment.
+        this.resourceUsed = true;
+      });
       engine.onChange = this.options.onChange;
       engine.onError = (id, error) => this.options.onError(`${id}: ${failure(error).message}`);
+      try {
+        if (await this.resources.recoverStoreWrite(store.directory, () => storageUsage(store.directory))) {
+          this.resourceUsed = true;
+        }
+        const retainedStartup = await store.hasGovernedHistory();
+        if (retainedStartup || this.resourcesEnabled()) {
+          await lifecycle.restoreModelReservations(retainedStartup);
+        }
+        restored();
+      } catch (error) {
+        await lifecycle.close(); await engine.shutdown(); await isolation.close(); await board.close(); await store.close(); throw error;
+      }
       const host = new BridgeHost();
-      const local: Local = { root, roots, store, engine, files, host, board, isolation };
+      const local: Local = { root, roots, store, engine, files, host, board, isolation, lifecycle };
       this.local.set(root, local);
       try {
         await host.start(this.options.registry, roots, (name, args, signal, cwd) => this.invoke(cwd || root, name, args, signal));
       } catch (error) {
         this.local.delete(root);
+        await lifecycle.close();
         const closing = Promise.all([board.close(), isolation.close()]);
         await engine.shutdown(); await closing; await store.close(); throw error;
       }
@@ -453,6 +712,15 @@ export class WorkerBroker {
     if (this.closed) {
       throw new WorkerError('host_stopping', 'Workspace host is stopping. Retry after another window takes ownership.', true);
     }
+    if (name === 'subagent_isolated_spawn') {
+      try {
+        if (!this.viewsEnabled() || !this.resourcesEnabled()) {
+          return this.boardFailure('feature_disabled', 'Isolated startup requires User resources.enabled, taskBoard.enabled and isolatedViews.enabled.');
+        }
+      } catch (error) {
+        return this.boardFailure('invalid_arguments', failure(error).message);
+      }
+    }
     if (isBoardTool(name) && !this.boardEnabled()) {
       // Structured failure before routing: a disabled board never opens a store or a bridge.
       return this.boardFailure('feature_disabled', 'The task board is disabled; enable codexSubagent.taskBoard.enabled in User Settings.');
@@ -489,9 +757,34 @@ export class WorkerBroker {
     }
     const { engine, store, files } = route.local;
     const respond = (value: unknown): ToolResult => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
+    let releaseControl: (() => void) | undefined;
     try {
+      if (name === 'subagent_spawn' && args && typeof args === 'object' && 'ownerId' in args && typeof args.ownerId === 'string') {
+        releaseControl = route.local.lifecycle.beginControl(args.ownerId);
+      }
+      if (['subagent_send', 'subagent_resume', 'subagent_compact', 'subagent_cancel', 'subagent_delete', 'subagent_discard_queued', 'subagent_schedule', 'ui_revert'].includes(name)
+        && args && typeof args === 'object' && 'id' in args) {
+        const session = engine.session(identifier.parse(args.id));
+        if (name !== 'ui_revert') {
+          engine.assertOwner(session.id, 'ownerId' in args ? z.string().optional().parse(args.ownerId) : undefined);
+        }
+        if (session.ownerId) {
+          releaseControl = route.local.lifecycle.beginControl(session.ownerId);
+        }
+      }
+      if (isGovernedTool(name)) {
+        // Dispatching a governed tool is NOT participation: this request can still
+        // be refused by validation, authorization or a domain epoch check without
+        // acquiring any ownership, and an unused opted-out window must never make
+        // settingsChanged or close() touch an unrelated aggregate ledger. The
+        // lifecycle reports participation from its real governor accounting or
+        // acquisition, and trackStorage does the same for a durable store write.
+        const value = await route.local.lifecycle.invoke(name, args, signal);
+        this.options.onChange(); return respond(value);
+      }
       if (isIsolatedViewTool(name)) {
-        const result = await route.local.isolation.invoke(name, args, engine, signal);
+        const result = await this.storageOperation(route.local, name === 'subagent_snapshot_create' ? 600 * 1024 ** 2 : 32 * 1024 ** 2,
+          () => route.local!.isolation.invoke(name, args, engine, signal), signal, /_cleanup$|_release$|_status$|_result$|_read$/.test(name) || await route.local.isolation.hasReceipt(name, args));
         this.options.onChange();
         return result;
       }
@@ -511,7 +804,10 @@ export class WorkerBroker {
         if (!this.boardEnabled()) {
           throw new WorkerError('feature_disabled', 'The task board is disabled; enable codexSubagent.taskBoard.enabled in User Settings.');
         }
-        const result = await invokeBoard(await route.local.board.open(), name, args);
+        const lane = boardAdmissionLane(name, args);
+        const board = await route.local.board.open();
+        const replay = args && typeof args === 'object' && 'ownerId' in args && typeof args.ownerId === 'string' && 'requestId' in args && typeof args.requestId === 'string' && board.hasRequest(args.ownerId, args.requestId);
+        const result = await this.storageOperation(route.local, boardStorageReservation(lane), async () => invokeBoard(board, name, args), signal, /_get$|_list$/.test(name) || !!replay, lane);
         if (!result.isError && /_create$|_update$/.test(name)) {
           this.options.onChange();
         }
@@ -526,10 +822,10 @@ export class WorkerBroker {
         return respond(summarizeBoard((await route.local.board.open()).snapshot()));
       }
       if (name === 'ui_parent_scope') {
-        return invoke(engine, 'subagent_parent', args, signal);
+        return this.invokeParent(route.local, args, signal);
       }
       if (name === 'subagent_parent') {
-        const result = await invoke(engine, name, args, signal);
+        const result = await this.invokeParent(route.local, args, signal);
         if (result.isError) {
           return result;
         }
@@ -557,7 +853,7 @@ export class WorkerBroker {
           if (other.local?.engine === engine) {
             continue;
           }
-          const response = other.local ? await invoke(other.local.engine, name, args, signal) : await this.ownerInvoke(other.root, scope, 'ui_parent_scope', args, signal);
+          const response = other.local ? await this.invokeParent(other.local, args, signal) : await this.ownerInvoke(other.root, scope, 'ui_parent_scope', args, signal);
           if (response.isError) {
             return response;
           }
@@ -598,9 +894,52 @@ export class WorkerBroker {
       if (name === 'subagent_health') {
         return respond({ ready: true, root: route.root, workspaceRoots: route.local.roots, models: await engine.models(), capabilities: files.definitions('workspace-write').map(t => t.name), diagnostics: store.diagnostics, sessionsDirectory: store.directory, taskBoard: { enabled: this.boardEnabled(), ...(route.local.board.error ? { error: route.local.board.error } : {}) } });
       }
-      return invoke(engine, name, args, signal, route.workspaceRoot);
+      if (['subagent_send', 'subagent_resume'].includes(name) && args && typeof args === 'object' && 'id' in args) {
+        const session = engine.session(identifier.parse(args.id));
+        if (session.startup) {
+          engine.assertOwner(session.id, 'ownerId' in args ? z.string().optional().parse(args.ownerId) : undefined);
+          const recorded = 'requestId' in args && typeof args.requestId === 'string' && store.findOperation(digest([session.ownerId, args.requestId]));
+          if (!recorded) {
+            // A service follow-up checkpoints bounded control metadata.
+            const bytes = (session.startup.lane === 'work' ? 32 : 4) * 1024 ** 2;
+            return await route.local.lifecycle.withStorage(bytes, () => invoke(engine, name, args, signal, route.workspaceRoot), signal, session.startup.lane);
+          }
+        }
+      }
+      return await invoke(engine, name, args, signal, route.workspaceRoot);
     } catch (error) {
       return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: failure(error) }) }] };
+    } finally {
+      releaseControl?.();
+    }
+  }
+  private async invokeParent(local: Local, input: unknown, signal?: AbortSignal): Promise<ToolResult> {
+    const a = z.strictObject({ ownerId: z.string().min(1).max(200), action: z.enum(['heartbeat', 'stop']), leaseSeconds: z.number().int().min(30).max(3600).default(120) }).parse(input);
+    let pendingError: unknown;
+    try {
+      await local.lifecycle.parent(a.ownerId, a.action, a.leaseSeconds);
+    } catch (error) {
+      pendingError = error;
+    }
+    const result = await invoke(local.engine, 'subagent_parent', a, signal);
+    if (pendingError && !result.isError) {
+      throw pendingError;
+    }
+    return result;
+  }
+  private async storageOperation<T>(local: Pick<Local, 'store' | 'lifecycle'>, bytes: number, action: () => Promise<T>, signal?: AbortSignal, reclaim = false, lane: WorkLane = 'work', queue = true): Promise<T> {
+    const enabled = this.resourcesEnabled();
+    if (!enabled && !await this.resources.hasStore(local.store.directory)) {
+      return action();
+    }
+    this.resourceUsed = true;
+    if (enabled && !reclaim) {
+      return local.lifecycle.withStorage(bytes, action, signal, lane, queue);
+    }
+    try {
+      return await action();
+    } finally {
+      await this.resources.account(local.store.directory, () => storageUsage(local.store.directory));
     }
   }
   async list(): Promise<SessionHeader[]> {
@@ -660,13 +999,33 @@ export class WorkerBroker {
         throw new WorkerError('host_stopping', 'Workspace host is restarting.', true);
       }
       const store = new SessionStore(await workspaceDirectory(this.options.storage, root));
+      const restored = this.trackStorage(store);
       await store.open();
-      const engine = new WorkerEngine(store, this.options.provider, await FileTools.create([], this.options.files), this.options.settings);
-      const board = new BoardHost(store.directory, root, this.workerResolver(store), () => this.boardEnabled(), () => this.boardGuard());
+      const board = new BoardHost(store.directory, root, this.workerResolver(store), () => this.boardEnabled(), () => this.boardGuard(),
+        () => !this.resourcesEnabled(), action => store.withStorageWrite(action));
       const isolation = this.isolationHost(root, store, board);
+      const engine: WorkerEngine = new WorkerEngine(store, this.options.provider, await FileTools.create([], this.options.files), this.options.settings, this.executionGovernance(() => lifecycle, false));
+      const lifecycle = new WorkerLifecycle(root, store, engine, board, isolation, this.resources, this.options.provider, this.options.settings, () => {
+        throw new WorkerError('workspace_changed', 'Restore this folder before worker inference or tools. Saved history remains administrable.');
+      }, this.freshPinGate(), () => {
+        // Reported by the lifecycle only from real accounting/acquisition/enrollment.
+        this.resourceUsed = true;
+      });
       try {
+        if (await this.resources.recoverStoreWrite(store.directory, () => storageUsage(store.directory))) {
+          this.resourceUsed = true;
+        }
+        const retainedStartup = await store.hasGovernedHistory();
+        if (retainedStartup || this.resourcesEnabled()) {
+          await lifecycle.restoreModelReservations(retainedStartup);
+        }
+        restored();
         if (isOfflineViewTool(name) && isIsolatedViewTool(name)) {
-          return await isolation.invoke(name, args, engine, signal);
+          // This control owns the offline store mutex. Admission must fail
+          // promptly so release/cleanup can enter and reclaim the needed space.
+          return await this.storageOperation({ store, lifecycle }, 32 * 1024 ** 2,
+            () => isolation.invoke(name, args, engine, signal), signal,
+            /_cleanup$|_release$|_status$|_result$|_read$/.test(name) || await isolation.hasReceipt(name, args), 'work', false);
         }
         if (name === 'ui_session' || name === 'ui_change') {
           const a = z.object({ id: identifier, changeId: changeIdentifier.optional() }).strict().parse(args);
@@ -678,6 +1037,7 @@ export class WorkerBroker {
         }
         return await invoke(engine, name, args, signal);
       } finally {
+        await lifecycle.close();
         const closing = Promise.all([isolation.close(), board.close()]);
         await engine.shutdown(); await closing; await store.close();
       }
@@ -712,6 +1072,7 @@ export class WorkerBroker {
         // Scope validation no longer permits this root. Withdraw its bridge so
         // history requests cannot forward back to the same retiring owner.
         await local.host.close();
+        await local.lifecycle.close();
         const closing = Promise.all([local.board.close(), local.isolation.close()]);
         await local.engine.shutdown(); await closing;
         await local.store.close();
@@ -723,13 +1084,64 @@ export class WorkerBroker {
   async close(): Promise<void> {
     this.closed = true; clearInterval(this.leaseTimer);
     await this.mutex.run(async () => undefined);
-    for (const local of this.local.values()) {
+    // Every store this window opened is kept EXCLUSIVELY owned until the aggregate
+    // shutdown below has run: the final sample of an exact affected store is the only
+    // thing that can clear a drain fence its own host published, and it is only safe
+    // while that store's owner lock is still held.
+    const owned: SessionStore[] = [];
+    // The per-local effect drain runs FIRST and deliberately outside every catch: if
+    // it fails, this map - and with it each root's exact owner handle and lock - stays
+    // intact, because a local whose board, runner or bridge effect is still draining
+    // must remain reachable so a retried close can finish it. Dropping the map here
+    // would leak a root lock that nothing could ever release again.
+    for (const local of [...this.local.values()]) {
+      await local.lifecycle.close();
       // Keep the exact owner discoverable while effects drain. Incoming requests
       // receive host_stopping instead of falling back to an unrelated checkout.
       const closing = Promise.all([local.board.close(), local.isolation.close()]);
-      await local.engine.shutdown(); await local.host.close(); await closing; await local.store.close();
+      // A sibling drain may still be awaiting (engine, bridge) when this pair fails;
+      // this handler only keeps the pair from being reported as an UNHANDLED rejection
+      // in that window. The `await closing` below still reports the real error once, and
+      // a failing drain keeps this local - and its store lock - for a retried close.
+      closing.catch(() => undefined);
+      await local.engine.shutdown(); await local.host.close(); await closing;
+      // Drain engine/runner/board/bridge effects first; the store itself is released
+      // below, after the governor's final sample of its directory.
+      owned.push(local.store);
     }
-    this.local.clear();
+    // Every local effect is drained, so no store can be sampled by a later fallback
+    // any more: ONE aggregate shutdown over exactly these stores.
+    let failed = false; let failure: unknown;
+    try {
+      // A window that never accounted, acquired or enrolled owes the aggregate
+      // nothing: a refused request must not make shutdown write an unrelated ledger.
+      if (this.resourceUsed) {
+        await this.resources.close(owned.map(store => store.directory));
+      }
+    } catch (error) {
+      failed = true; failure = error;
+    }
+    // Ownership kept for that final sample is released after the aggregate shutdown,
+    // including after ITS failure: a store this window no longer serves must not keep
+    // its lock (or its effects) behind. Each local is forgotten only once its exact
+    // store was really released, so a lock that could not be dropped keeps its owner
+    // - and the retry that can drop it - reachable. The first shutdown error wins.
+    let release: unknown;
+    for (const [root, local] of [...this.local]) {
+      try {
+        await local.store.close();
+      } catch (error) {
+        release ??= error;
+        continue;
+      }
+      this.local.delete(root);
+    }
+    if (failed) {
+      throw failure;
+    }
+    if (release !== undefined) {
+      throw release;
+    }
   }
 }
 

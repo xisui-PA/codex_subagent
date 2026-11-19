@@ -84,6 +84,10 @@ const MAX_PROCESS_DEPTH = 16;
 const MAX_DIAGNOSTIC_LENGTH = 500;
 const MAX_REMOVE_ENTRIES = 1_000_000;
 const MAX_DIAGNOSTICS = 50;
+/** Bounded retries for a withdrawal (aggregate cancel) that failed. */
+const MAX_WITHDRAWAL_ATTEMPTS = 5;
+/** Delay before retrying every outstanding withdrawal, in milliseconds. */
+const WITHDRAWAL_RETRY_MS = 100;
 
 /** A strictly-JSON value; process identity data is opaque but must round-trip. */
 export type PoolJsonValue = null | string | number | boolean | PoolJsonValue[] | { [key: string]: PoolJsonValue };
@@ -237,7 +241,10 @@ export interface RunnerPoolCleanupResult {
   readonly unknownEntries: readonly string[];
 }
 
+import type { RunnerAdmission } from './resource-governor';
+
 export interface RunnerPoolOptions {
+  admission?: RunnerAdmission;
   /** Fixed slot count, 1..8 (default 2). */
   capacity?: number;
   /** Bounded FIFO queue length, 0..256 (default 32). */
@@ -261,6 +268,7 @@ interface PoolJournal {
 }
 
 interface PoolWaiter {
+  readonly admissionId: string;
   readonly owner: RunnerLeaseOwner;
   readonly caller?: AbortSignal;
   readonly promise: Promise<RunnerLease>;
@@ -882,6 +890,12 @@ async function withTimeout<T>(work: Promise<T>, milliseconds: number, make: () =
  */
 const describeFailure = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
+/** Bounded, order-preserving id list for one batch diagnostic. */
+function summarizeIds(ids: readonly string[]): string {
+  const shown = ids.slice(0, 8).join(', ');
+  return ids.length > 8 ? `${shown} and ${ids.length - 8} more` : shown;
+}
+
 /**
  * The error reported to a caller whose untouched reservation could NOT be
  * discarded. It keeps the cleanup failure's own code, so a storage problem is
@@ -967,11 +981,22 @@ export class RunnerPool {
   readonly maxQueue: number;
 
   private readonly mutex = new Mutex();
+  private readonly admission?: RunnerAdmission;
+  private readonly admissionCancellations = new Set<Promise<void>>();
+  private pumpTimer?: NodeJS.Timeout;
+  private withdrawalTimer?: NodeJS.Timeout;
+  /**
+   * Admission ids whose withdrawal (aggregate cancel) failed, with the attempts
+   * already spent. A retained waiting ticket is what can hold the aggregate
+   * runner leadership, so the pool retries the withdrawal a bounded number of
+   * times even after its caller is already settled.
+   */
+  private readonly withdrawals = new Map<string, number>();
   private readonly writeJournal: (file: string, text: string) => Promise<void>;
   private readonly proveDrained?: RunnerProcessProof;
   private readonly closeTimeoutMs: number;
   private readonly projectRoot?: string;
-  private readonly waiters: PoolWaiter[] = [];
+  private waiters: PoolWaiter[] = [];
   /** Slots promised to admitted requests whose reservation is still in flight. */
   private claims = 0;
   private readonly live = new Map<string, LiveLease>();
@@ -1009,6 +1034,7 @@ export class RunnerPool {
     if (options.proveDrained !== undefined && typeof options.proveDrained !== 'function') {
       throw new WorkerError('invalid_pool_config', 'proveDrained must be a function.');
     }
+    this.admission = options.admission;
     this.directory = path.resolve(directory);
     this.journalFile = path.join(this.directory, JOURNAL_FILE);
     this.capacity = capacity;
@@ -1038,6 +1064,9 @@ export class RunnerPool {
       }
       try {
         await this.openLocked();
+        // Reopen recovery tells the aggregate layer whether this pool still has a
+        // usable physical slot, so no waiting ticket reserves capacity for one.
+        await this.admission?.reconcile(Object.values(this.journal.leases), true, undefined, this.freeSlot() !== undefined);
         this.opened = true;
       } catch (error) {
         this.failed = true;
@@ -1071,7 +1100,7 @@ export class RunnerPool {
       rejectGrant = reject;
     });
     const waiter: PoolWaiter = {
-      owner: validated, caller: signal, promise, resolve: resolveGrant, reject: rejectGrant,
+      admissionId: randomUUID().replace(/-/g, ''), owner: validated, caller: signal, promise, resolve: resolveGrant, reject: rejectGrant,
       settled: false, aborted: false, claimed: claimable
     };
     if (claimable) {
@@ -1090,7 +1119,7 @@ export class RunnerPool {
       this.waiters.splice(index, 1);
       waiter.settled = true;
       this.releaseClaim(waiter);
-      rejectGrant(new WorkerError('pool_aborted', 'The acquire request was aborted while queued; no lease was allocated.'));
+      void this.cancelAdmission(waiter.admissionId).then(() => rejectGrant(new WorkerError('pool_aborted', 'The acquire request was aborted while queued; no lease was allocated.')));
     };
     signal?.addEventListener('abort', onAbort, { once: true });
     this.schedulePump();
@@ -1217,6 +1246,9 @@ export class RunnerPool {
       return this.closingPromise;
     }
     this.closing = true;
+    clearTimeout(this.pumpTimer);
+    clearTimeout(this.withdrawalTimer);
+    this.withdrawalTimer = undefined;
     const queued = this.waiters.splice(0, this.waiters.length);
     for (const waiter of queued) {
       waiter.settled = true;
@@ -1229,6 +1261,10 @@ export class RunnerPool {
       for (const liveLease of this.live.values()) {
         liveLease.controller.abort();
       }
+      // One withdrawal covers the whole rejected queue: a batch admission runs it
+      // as one exact scoped ledger transaction, and a legacy adapter starts its
+      // cancellations together, so N tickets never serialize one deadline.
+      await this.withdrawQueued(queued.map(waiter => waiter.admissionId));
       // Serialize with any grant already inside its critical section; such a
       // grant is discarded (no lease is handed out after closing).
       await this.mutex.run(async () => undefined);
@@ -1238,6 +1274,7 @@ export class RunnerPool {
       const pending = [...this.live.values()].map(liveLease => liveLease.settled);
       await withTimeout(Promise.all(pending), this.closeTimeoutMs,
         () => new WorkerError('pool_drain_timeout', 'The runner pool did not settle every active lease before closing.'));
+      await Promise.all([...this.admissionCancellations]);
       this.closed = true;
       this.opened = false;
     })();
@@ -1357,6 +1394,49 @@ export class RunnerPool {
     });
   }
 
+  /**
+   * Drop this scope's released tombstones. A tombstone is collected only when it
+   * is provably finished: its directory is gone and no live lease in this
+   * process still owns the id.
+   *
+   * The live check is the important half. A release publishes (and so adopts) its
+   * 'released' revision BEFORE the aggregate reconcile of that very publish runs,
+   * so a reconcile failure after adoption leaves a durable released record whose
+   * lease is still live: its own release never reached finishLease. Dropping the
+   * record here would turn the caller's exact release retry into
+   * pool_unknown_lease and leave a live entry that close() can never drain.
+   * Retaining it keeps both paths working: the retry re-publishes the same
+   * 'released' state, settles the live entry and unblocks shutdown.
+   *
+   * The directory check mirrors cleanup(): a released record whose directory
+   * still exists (or cannot be inspected) is retained instead of deleting a
+   * record whose layout is no longer proven, so a directory is never orphaned as
+   * an unknown entry that no record could ever reconcile.
+   */
+  async collectReleased(scope: RunnerPoolScope): Promise<number> {
+    const validated = validateRunnerPoolScope(scope);
+    return this.mutex.run(async () => {
+      const collected: string[] = [];
+      for (const record of Object.values(this.journal.leases)) {
+        if (record.state !== 'released' || record.owner.ownerId !== validated.ownerId || record.owner.teamId !== validated.teamId) {
+          continue;
+        }
+        if (this.live.has(record.leaseId) || await lstatOrNull(record.directory) !== null) {
+          continue;
+        }
+        collected.push(record.leaseId);
+      }
+      if (collected.length === 0) {
+        return 0;
+      }
+      await this.publish(draft => {
+        for (const id of collected) {
+          delete draft.leases[id];
+        }
+      });
+      return collected.length;
+    });
+  }
   /** Frozen durable record for one lease id, when the journal still holds it. */
   leaseRecord(leaseId: string): RunnerLeaseRecord | undefined {
     const record = this.journal.leases[leaseId];
@@ -1701,6 +1781,15 @@ export class RunnerPool {
    */
   private claimFor(waiter: PoolWaiter): void {
     if (!waiter.claimed) {
+      // Admission can yield while a younger arrival promises the free slot.
+      // The oldest eligible promotion inherits that promise; the younger
+      // waiter occupies the queue entry this promotion just vacated.
+      if (this.availableSlots() === 0) {
+        const promised = this.waiters.find(candidate => candidate.claimed && !candidate.settled);
+        if (promised) {
+          this.releaseClaim(promised);
+        }
+      }
       waiter.claimed = true;
       this.claims += 1;
     }
@@ -1719,6 +1808,98 @@ export class RunnerPool {
     waiter.settled = true;
     this.releaseClaim(waiter);
     waiter.reject(error instanceof Error ? error : new Error(String(error)));
+  }
+
+  /** Cleanup failure retains aggregate ownership, but cannot strand a caller. */
+  private cancelAdmission(id: string): Promise<void> {
+    const operation = this.cancelAdmissionNow(id);
+    this.admissionCancellations.add(operation);
+    void operation.then(() => this.admissionCancellations.delete(operation), () => this.admissionCancellations.delete(operation));
+    return operation;
+  }
+  /**
+   * Withdraw every ticket a close-time queue rejection orphaned.
+   *
+   * A batch-capable admission performs the whole withdrawal as ONE exact scoped
+   * ledger transaction. An adapter that exposes only `cancel` starts every
+   * withdrawal TOGETHER instead of awaiting them one after another, so N queued
+   * tickets never multiply one bounded deadline into N serial deadlines.
+   *
+   * Either way the pool keeps local ownership of these tickets until their
+   * effects settle: the withdrawal stays tracked in admissionCancellations and
+   * close awaits it. The callers themselves were already rejected, so no waiter
+   * is ever left pending on the ledger.
+   */
+  private async withdrawQueued(ids: readonly string[]): Promise<void> {
+    if (ids.length === 0) {
+      return;
+    }
+    const batch = this.admission?.cancelMany;
+    if (batch === undefined) {
+      // Legacy adapter: individual withdrawals, started together and joined once.
+      await Promise.all(ids.map(id => this.cancelAdmission(id)));
+      return;
+    }
+    const operation = this.withdrawMany(ids, batch);
+    this.admissionCancellations.add(operation);
+    void operation.then(() => this.admissionCancellations.delete(operation), () => this.admissionCancellations.delete(operation));
+    await operation;
+  }
+  /**
+   * One batch withdrawal. It never rejects and never falls back to per-ticket
+   * cancellation: a failed transaction retains every affected ticket in the
+   * ledger and is reported as one bounded batch diagnostic plus one diagnostic per
+   * id, so an operator can reconcile each exact claim without guessing which ids
+   * the failed call covered. No retry is scheduled here - the pool is already
+   * draining, and the aggregate layer's bounded waiting-ticket window is the
+   * independent second bound.
+   */
+  private async withdrawMany(ids: readonly string[], batch: NonNullable<RunnerAdmission['cancelMany']>): Promise<void> {
+    try {
+      await batch.call(this.admission, [...ids]);
+      for (const id of ids) {
+        this.withdrawals.delete(id);
+      }
+    } catch (error) {
+      this.diagnose(`Aggregate claims ${summarizeIds(ids)} remain retained after one batch withdrawal of ${ids.length} queued tickets: ${describeFailure(error)}. Restore the ledger and reopen this exact pool to reconcile them; no command is replayed.`);
+      for (const id of ids) {
+        this.diagnose(`Aggregate claim ${id} remains retained: the batch withdrawal of ${ids.length} queued tickets failed.`);
+      }
+    }
+  }
+  private async cancelAdmissionNow(id: string): Promise<void> {
+    try {
+      await this.admission?.cancel(id);
+      this.withdrawals.delete(id);
+    } catch (error) {
+      this.diagnose(`Aggregate claim ${id} remains retained: ${describeFailure(error)}. Restore the ledger and reopen this exact pool to reconcile it; no command is replayed.`);
+      // Failure is not final while the aggregate ledger is merely unavailable:
+      // retry the withdrawal a bounded number of times so a cancelled or closed
+      // request does not leave a waiting ticket behind. The aggregate layer's
+      // bounded ticket window is the independent second bound when every retry
+      // fails, so head-of-line eligibility still cannot outlive it.
+      if (this.admission !== undefined && !this.closing && !this.closed) {
+        const attempts = (this.withdrawals.get(id) ?? 0) + 1;
+        if (attempts < MAX_WITHDRAWAL_ATTEMPTS) {
+          this.withdrawals.set(id, attempts);
+          this.scheduleWithdrawalRetry();
+        } else {
+          this.withdrawals.delete(id);
+        }
+      }
+    }
+  }
+  private scheduleWithdrawalRetry(): void {
+    if (this.withdrawalTimer !== undefined || this.withdrawals.size === 0 || this.closing || this.closed) {
+      return;
+    }
+    this.withdrawalTimer = setTimeout(() => {
+      this.withdrawalTimer = undefined;
+      for (const id of [...this.withdrawals.keys()]) {
+        void this.cancelAdmission(id);
+      }
+    }, WITHDRAWAL_RETRY_MS);
+    this.withdrawalTimer.unref();
   }
 
   private schedulePump(): void {
@@ -1747,7 +1928,61 @@ export class RunnerPool {
       if (slot === undefined) {
         return;
       }
-      const waiter = this.waiters.shift() as PoolWaiter;
+      let waiter: PoolWaiter | undefined;
+      // One snapshot orders this pass, but every poll below awaits, and a close
+      // batch or a caller abort can remove the WHOLE queue while an earlier poll
+      // is gated. The pool state and the candidate's own liveness are therefore
+      // re-checked before every NEW poll (and before the legacy no-admission
+      // reservation): an id that was removed was already withdrawn and settled
+      // exactly once, so it must never be offered to tryAcquire again or become a
+      // fresh reservation. The poll that was ALREADY in flight keeps its own
+      // settlement and withdrawal below, unchanged.
+      for (const candidate of [...this.waiters]) {
+        if (this.closing || this.closed) {
+          return;
+        }
+        if (candidate.settled || candidate.aborted || !this.waiters.includes(candidate)) {
+          continue;
+        }
+        // A throwing applicability check is settled in the SAME guarded path as a
+        // throwing admission: this one request is refused (never left pending,
+        // never wedged at the head of the queue) and the loop keeps serving the
+        // rest of the queue instead of rejecting out of the pump.
+        let eligible = true;
+        try {
+          eligible = this.admission === undefined || this.admission.applies?.(candidate.owner) !== false;
+        } catch (error) {
+          this.waiters = this.waiters.filter(w => w !== candidate); await this.cancelAdmission(candidate.admissionId); this.failWaiter(candidate, error); continue;
+        }
+        if (eligible && this.admission) {
+          let granted: boolean;
+          try {
+            granted = await this.admission.tryAcquire(candidate.admissionId, candidate.owner, this.capacity);
+          } catch (error) {
+            this.waiters = this.waiters.filter(w => w !== candidate); await this.cancelAdmission(candidate.admissionId); this.failWaiter(candidate, error); continue;
+          }
+          if (candidate.aborted || !this.waiters.includes(candidate)) {
+            await this.cancelAdmission(candidate.admissionId); continue;
+          }
+          if (!granted) {
+            this.releaseClaim(candidate);
+            if (this.waiters.filter(w => !w.claimed && !w.settled).length > this.maxQueue) {
+              this.waiters = this.waiters.filter(w => w !== candidate); await this.cancelAdmission(candidate.admissionId);
+              this.failWaiter(candidate, new WorkerError('pool_queue_full', 'Aggregate capacity requires waiting but this root queue is full.'));
+            }
+            continue;
+          }
+        }
+        waiter = candidate; this.waiters = this.waiters.filter(w => w !== candidate); break;
+      }
+      if (!waiter) {
+        if (!this.pumpTimer && this.waiters.length) {
+          this.pumpTimer = setTimeout(() => {
+            this.pumpTimer = undefined; this.schedulePump();
+          }, 100); this.pumpTimer.unref();
+        }
+        return;
+      }
       // A promoted request owns the promise of this slot BEFORE its first
       // asynchronous publish, exactly like an immediately grantable acquire.
       // Once that publish is adopted the claim is transferred to the durable
@@ -1775,8 +2010,11 @@ export class RunnerPool {
   private async grantLocked(slot: number, waiter: PoolWaiter): Promise<void> {
     let grant: LeaseGrant;
     try {
-      grant = await this.reserveLocked(slot, waiter.owner, waiter.caller, () => this.adoptClaim(waiter));
+      grant = await this.reserveLocked(slot, waiter.owner, waiter.caller, () => this.adoptClaim(waiter), waiter.admissionId);
     } catch (error) {
+      if (!this.journal.leases[waiter.admissionId]) {
+        await this.cancelAdmission(waiter.admissionId);
+      }
       this.failWaiter(waiter, error);
       return;
     }
@@ -1811,8 +2049,7 @@ export class RunnerPool {
    * neither. Afterwards the record keeps the slot unavailable.
    */
   private async reserveLocked(slot: number, owner: RunnerLeaseOwner, caller?: AbortSignal,
-    onReserved?: () => void): Promise<LeaseGrant> {
-    const leaseId = randomUUID().replace(/-/g, '');
+    onReserved?: () => void, leaseId = randomUUID().replace(/-/g, '')): Promise<LeaseGrant> {
     const paths = leasePaths(this.directory, slot, leaseId);
     const sequence = this.journal.nextSequence;
     const stamp = nowIso();
@@ -1984,7 +2221,14 @@ export class RunnerPool {
       throw new WorkerError('pool_storage', `The runner pool journal could not be persisted: ${error instanceof Error ? error.message : String(error)}`);
     }
     // Adopt, then hand over atomically: no await separates these two statements.
+    const releasedIds = Object.keys(this.journal.leases).filter(id => !validated.leases[id]);
     this.journal = validated;
     onAdopt?.();
+    // Physical eligibility is reported from the ADOPTED journal on every
+    // revision, so the aggregate layer never keeps a waiting ticket for a slot
+    // this pool no longer has: the promotion below claims a slot before its own
+    // record exists, and the adoption that records it also withdraws the
+    // remaining tickets' eligibility for that same slot.
+    await this.admission?.reconcile(Object.values(this.journal.leases), false, releasedIds, this.freeSlot() !== undefined);
   }
 }

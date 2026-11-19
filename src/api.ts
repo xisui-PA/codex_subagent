@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { WorkerEngine } from './engine';
+import { governedMcpTools, waitRevision } from './worker-startup';
 import { boardMcpTools } from './task-board-tools';
 import { isolatedViewMcpTools } from './isolated-view-tools';
 import { failure, Session, WorkerError } from './types';
@@ -46,7 +47,7 @@ const legacyTools = Object.entries(schemas).map(([name, schema]) => {
   };
 });
 /** Legacy worker-control tools, then the opt-in board tools (codexSubagent.taskBoard.enabled). invoke() is unchanged. */
-export const mcpTools = [...legacyTools, ...boardMcpTools, ...isolatedViewMcpTools];
+export const mcpTools = [...legacyTools, ...boardMcpTools, ...isolatedViewMcpTools, ...governedMcpTools];
 export const mcpInstructions = 'Use subagent_health and subagent_models before delegation. To target a registered Git worktree explicitly supply workspaceRoot; retain the returned root on subsequent controls and group wait IDs by that root. Choose a unique ownerId for this parent conversation and retain it with worker IDs/requestIds; pass it on every mutating control. Spawn is asynchronous. Poll with subagent_wait, omitting timeoutMs to use max(60s, one tenth of the effective model turn timeout), using the largest interval across a mixed batch. Shorter explicit timeoutMs values are allowed; values above the derived limit are rejected. Wait results already contain worker status and output; only inspect status for additional history or output. Remove stopped workers from subsequent waits. Ensure client request timeouts and parent leases cover the wait plus a margin. For work that should stop when unattended use parentPolicy cancel-on-expiry and renew with subagent_parent heartbeat; explicitly call subagent_parent stop when cancelling a parent task. MCP disconnects alone do not prove a parent stopped. Native stop events are unavailable. Retry ambiguous mutations with the SAME requestId and arguments. Reloaded work is interrupted and resumes explicitly. Context/history rollover is automatic and archival messages remain available through status pagination. Workers have explicit context and private workspace tools; parent tools, approvals and sandbox are not inherited. Check completed results before reporting success.';
 
 export function view(session: Session, offset = 0, limit = 12_000, turnId?: string, attempt?: number): Record<string, unknown> {
@@ -61,7 +62,7 @@ export function view(session: Session, offset = 0, limit = 12_000, turnId?: stri
   const output = previous?.output ?? turn?.output ?? '';
   return {
     id: session.id, title: session.title, state: session.state, model: session.model.id, permission: session.permission, ownerId: session.ownerId, ownerLabel: session.ownerLabel, workspaceRoot: session.workspaceRoot, activity: session.activity,
-    revision: session.revision, createdAt: session.createdAt, updatedAt: session.updatedAt, maintenanceError: session.maintenanceError, isolatedView: session.isolatedView,
+    revision: session.revision, createdAt: session.createdAt, updatedAt: session.updatedAt, maintenanceError: session.maintenanceError, startup: session.startup, waitingReason: session.waitingReason, scheduleWait: session.scheduleWait, ...(session.startup ? { scheduleWaitRevision: waitRevision(session) } : {}), isolatedView: session.isolatedView,
     turns: session.turns.map(t => ({ id: t.id, state: t.state, attempts: t.attempts, error: t.error, outputCharacters: t.output.length, previousAttempts: t.attemptsLog?.map(a => ({ attempt: a.attempt, error: a.error, outputCharacters: a.output.length })), toolCount: t.tools.length, tools: t.tools.slice(-20).map(tool => ({ id: tool.call.id, name: tool.call.name, state: tool.state })) })),
     outputTurnId: turn?.id, outputAttempt: attempt || turn?.attempts,
     output: output.slice(offset, offset + limit), outputOffset: offset, nextOutputOffset: offset + limit < output.length ? offset + limit : null,

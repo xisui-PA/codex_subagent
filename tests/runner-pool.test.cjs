@@ -13,7 +13,9 @@ const crypto = require('node:crypto');
 
 const buildDir = path.join(__dirname, '..', process.env.CODEX_TEST_BUILD?.trim() || '.test-build');
 const { RunnerPool } = require(path.join(buildDir, 'runner-pool'));
-const { atomicWrite } = require(path.join(buildDir, 'storage'));
+const { atomicWrite, digest } = require(path.join(buildDir, 'storage'));
+const { ResourceGovernor, resourceDefaults } = require(path.join(buildDir, 'resource-governor'));
+const { WorkerBroker } = require(path.join(buildDir, 'runtime'));
 
 const TEAM = 'a'.repeat(32);
 const ISO = '2024-01-01T00:00:00.000Z';
@@ -37,6 +39,277 @@ async function makePool(t, options = {}) {
   });
   return { base, project, poolDirectory, pool };
 }
+
+async function admissionDeadline(promise, milliseconds = 1000) {
+  let timer;
+  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(Error('admission did not settle')), milliseconds); })]); }
+  finally { clearTimeout(timer); }
+}
+
+/** Poll a predicate; the pool pumps on a 100 ms timer, so never busy-wait forever. */
+async function until(check, milliseconds = 5000) {
+  const deadline = Date.now() + milliseconds;
+  for (;;) {
+    if (await check()) {
+      return;
+    }
+    if (Date.now() > deadline) {
+      throw Error('condition did not settle');
+    }
+    await tick();
+  }
+}
+
+test('admission cleanup failures never strand rejected or refused runner requests', async t => {
+  for (const mode of ['admission', 'reservation', 'overflow']) {
+    await t.test(mode, async t => {
+      const admission = { tryAcquire: async () => { if (mode === 'admission') { throw Error('ledger unavailable'); } return mode !== 'overflow'; },
+        cancel: async () => { throw Error('ledger cleanup unavailable'); }, reconcile: async () => {} };
+      const { pool } = await makePool(t, { capacity: 1, maxQueue: mode === 'overflow' ? 0 : 2, admission,
+        writeJournal: async (file, text) => { if (mode === 'reservation' && Object.keys(JSON.parse(text).leases).length) { throw Error('reservation journal unavailable'); } await atomicWrite(file, text); } });
+      const controller = new AbortController();
+      await assert.rejects(admissionDeadline(pool.acquire(owner('fault'), controller.signal)), mode === 'overflow' ? e => e.code === 'pool_queue_full' : /unavailable/);
+      controller.abort(); await pool.close();
+      assert.equal(pool.status().closed, true); assert.equal(pool.status().queue.length, 0); assert.equal(pool.status().leases.length, 0);
+      assert.ok(pool.status().diagnostics.some(d => /Aggregate claim .* remains retained/.test(d)));
+    });
+  }
+});
+
+test('closing still aborts and drains active leases when queued admission cleanup fails', async t => {
+  let finishCleanup; const cleanup = new Promise(resolve => { finishCleanup = resolve; });
+  const { pool } = await makePool(t, { capacity: 1, admission: { tryAcquire: async () => true, cancel: async () => { await cleanup; throw Error('ledger unavailable'); }, reconcile: async () => {} } });
+  const lease = await pool.acquire(owner('active'));
+  const queued = assert.rejects(pool.acquire(owner('queued')), e => e.code === 'pool_closed');
+  const closing = pool.close(); await queued;
+  try {
+    for (let i = 0; i < 100 && !lease.signal.aborted; i++) { await tick(); }
+    assert.equal(lease.signal.aborted, true, 'active effects must stop before ledger cleanup finishes');
+  } finally { finishCleanup(); await lease.release({ drained: true }); await closing; }
+  assert.equal(pool.status().closed, true);
+});
+
+test('close withdraws its whole queued set with one batch admission call', { timeout: 15000 }, async t => {
+  const batches = [], singles = [];
+  let releaseBatch; const batchGate = new Promise(resolve => { releaseBatch = resolve; });
+  const admission = {
+    tryAcquire: async (id, candidate) => candidate.ownerId.endsWith('-held'),
+    cancel: async id => { singles.push(id); },
+    cancelMany: async ids => { batches.push([...ids]); await batchGate; },
+    reconcile: async () => {}
+  };
+  const { pool } = await makePool(t, { capacity: 1, maxQueue: 3, admission });
+  const held = await pool.acquire(owner('batch-held'));
+  const queued = ['batch-b', 'batch-c', 'batch-d'].map(label => pool.acquire(owner(label)).then(lease => ({ lease }), error => ({ error })));
+  try {
+    await until(() => pool.status().queue.length === 3);
+    const tickets = pool.waiters.map(waiter => waiter.admissionId);
+    let settled = false;
+    const closing = pool.close().then(() => { settled = true; });
+    for (const outcome of queued) {
+      assert.equal((await outcome).error?.code, 'pool_closed', 'a closing pool still rejects every queued caller promptly');
+    }
+    assert.deepEqual(batches, [tickets], 'one batch covers exactly the queued tickets, in FIFO order');
+    assert.deepEqual(singles, [], 'a batch-capable admission is never withdrawn ticket by ticket');
+    assert.equal(pool.leaseRecord(held.id).state, 'leased', 'close never releases an active lease on its own');
+    assert.equal(await exists(held.directory), true);
+    await held.release({ drained: true });
+    await tick();
+    assert.equal(settled, false, 'close keeps local ownership of the batch until its effect settles');
+    releaseBatch();
+    await closing;
+    assert.equal(pool.status().closed, true);
+    assert.equal(pool.status().queue.length, 0);
+  } finally { releaseBatch(); }
+});
+
+test('a cancel-only adapter starts every close-time withdrawal together instead of serially', { timeout: 15000 }, async t => {
+  const entered = [];
+  let releaseCancels; const gate = new Promise(resolve => { releaseCancels = resolve; });
+  const admission = { tryAcquire: async (id, candidate) => candidate.ownerId.endsWith('-held'), cancel: async id => { entered.push(id); await gate; }, reconcile: async () => {} };
+  const { pool } = await makePool(t, { capacity: 1, maxQueue: 2, admission });
+  const held = await pool.acquire(owner('legacy-held'));
+  const queued = ['legacy-b', 'legacy-c'].map(label => pool.acquire(owner(label)).then(lease => ({ lease }), error => ({ error })));
+  try {
+    await until(() => pool.status().queue.length === 2);
+    const closing = pool.close();
+    for (const outcome of queued) {
+      assert.equal((await outcome).error?.code, 'pool_closed');
+    }
+    // Two tickets, ONE shared deadline: both withdrawals must be in flight at the
+    // same time. A serial loop keeps this false until the gate opens.
+    await until(() => entered.length === 2, 1000);
+    assert.notEqual(entered[0], entered[1], 'each queued ticket is withdrawn exactly once');
+    await held.release({ drained: true });
+    releaseCancels();
+    await closing;
+    assert.equal(pool.status().closed, true);
+  } finally { releaseCancels(); }
+});
+
+test('a failed batch withdrawal is diagnosed per ticket and still settles close', { timeout: 15000 }, async t => {
+  const batches = [], singles = [];
+  const admission = {
+    tryAcquire: async (id, candidate) => candidate.ownerId.endsWith('-held'),
+    cancel: async id => { singles.push(id); },
+    cancelMany: async ids => { batches.push([...ids]); throw Error('ledger unavailable'); },
+    reconcile: async () => {}
+  };
+  const { pool } = await makePool(t, { capacity: 1, maxQueue: 2, admission });
+  const held = await pool.acquire(owner('fail-held'));
+  const queued = ['fail-b', 'fail-c'].map(label => pool.acquire(owner(label)).then(lease => ({ lease }), error => ({ error })));
+  await until(() => pool.status().queue.length === 2);
+  const tickets = pool.waiters.map(waiter => waiter.admissionId);
+  const closing = pool.close();
+  for (const outcome of queued) {
+    assert.equal((await outcome).error?.code, 'pool_closed');
+  }
+  await held.release({ drained: true });
+  await closing;
+  const status = pool.status();
+  assert.equal(status.closed, true);
+  assert.deepEqual(status.queue, []);
+  assert.deepEqual(batches, [tickets], 'the failed batch still covered the whole queue exactly once');
+  assert.deepEqual(singles, [], 'a failed batch is never retried as serial single withdrawals');
+  assert.ok(status.diagnostics.some(d => /Aggregate claims .* remain retained after one batch withdrawal of 2 queued tickets/.test(d) && d.includes('ledger unavailable')),
+    'one clear batch diagnostic names the failed transaction');
+  for (const id of tickets) {
+    assert.ok(status.diagnostics.some(d => d.includes(`Aggregate claim ${id} remains retained`)), `ticket ${id} is reported on its own`);
+  }
+});
+
+test('a close that empties the queue never re-polls the ticket whose poll was gated', { timeout: 20000 }, async t => {
+  const polls = [], singles = [], batches = [];
+  let enterFirst, openFirst;
+  const firstEntered = new Promise(resolve => { enterFirst = resolve; });
+  const firstGate = new Promise(resolve => { openFirst = resolve; });
+  const admission = {
+    tryAcquire: async (id, candidate) => {
+      if (candidate.ownerId.endsWith('-held')) {
+        return true;
+      }
+      polls.push(id);
+      if (polls.length === 1) {
+        enterFirst(); await firstGate; return false;
+      }
+      return false;
+    },
+    cancel: async id => { singles.push(id); },
+    cancelMany: async ids => { batches.push([...ids]); },
+    reconcile: async () => {}
+  };
+  const { pool } = await makePool(t, { capacity: 2, maxQueue: 4, closeTimeoutMs: 3000, admission });
+  let held, closing;
+  try {
+    held = await pool.acquire(owner('race-held'));
+    const queued = ['r1', 'r2', 'r3', 'r4'].map(label => pool.acquire(owner(label)).then(lease => ({ lease }), error => ({ error })));
+    await firstEntered;
+    const tickets = pool.waiters.map(waiter => waiter.admissionId);
+    assert.equal(tickets.length, 4, 'all four requests are queued in one synchronous batch');
+    assert.deepEqual(polls, [tickets[0]], 'the pump is gated inside the FIRST poll');
+    closing = pool.close();
+    for (const outcome of queued) {
+      assert.equal((await outcome).error?.code, 'pool_closed', 'close rejects every queued caller');
+    }
+    assert.equal(pool.waiters.length, 0, 'close spliced the whole queue');
+    assert.deepEqual(batches, [tickets], 'one batch withdrawal covers exactly the removed tickets');
+    assert.deepEqual(singles, [], 'a close-time removal is never withdrawn ticket by ticket');
+    // Opening the gate lets the IN-FLIGHT poll finish exactly once. The pump then
+    // has to stop: the other three ids are gone, so no further poll may run and
+    // nothing but that one poll may keep the mutex (and so close) waiting.
+    openFirst();
+    assert.equal((await admissionDeadline(held.release({ drained: true }), 2000)).state, 'released',
+      'a fresh mutex-serialized release settles as soon as the in-flight poll returns');
+    await admissionDeadline(closing, 2000);
+    assert.deepEqual(polls, [tickets[0]], 'a removed ticket is never offered to tryAcquire again');
+    assert.deepEqual(singles, [tickets[0]], 'only the in-flight poll completes its own withdrawal');
+    const status = pool.status();
+    assert.equal(status.closed, true);
+    assert.deepEqual(status.queue, []);
+    assert.equal(status.leases.some(record => tickets.includes(record.leaseId)), false, 'no stale lease is materialized');
+  } finally {
+    openFirst();
+    await closing?.catch(() => undefined);
+    await held?.release({ drained: true }).catch(() => undefined);
+  }
+});
+
+test('caller aborts that empty the queue never re-poll a cancelled ticket', { timeout: 20000 }, async t => {
+  const polls = [], singles = [];
+  let enterFirst, openFirst;
+  const firstEntered = new Promise(resolve => { enterFirst = resolve; });
+  const firstGate = new Promise(resolve => { openFirst = resolve; });
+  const admission = {
+    tryAcquire: async (id, candidate) => {
+      if (candidate.ownerId.endsWith('-held')) {
+        return true;
+      }
+      polls.push(id);
+      if (polls.length === 1) {
+        enterFirst(); await firstGate; return false;
+      }
+      return false;
+    },
+    cancel: async id => { singles.push(id); },
+    reconcile: async () => {}
+  };
+  const { pool } = await makePool(t, { capacity: 2, maxQueue: 4, closeTimeoutMs: 3000, admission });
+  let held;
+  try {
+    held = await pool.acquire(owner('abort-held'));
+    const controllers = [1, 2, 3, 4].map(() => new AbortController());
+    const queued = controllers.map((controller, index) => pool.acquire(owner(`b${index + 1}`), controller.signal)
+      .then(lease => ({ lease }), error => ({ error })));
+    await firstEntered;
+    const tickets = pool.waiters.map(waiter => waiter.admissionId);
+    assert.equal(tickets.length, 4);
+    assert.deepEqual(polls, [tickets[0]], 'the pump is gated inside the FIRST poll');
+    for (const controller of controllers) {
+      controller.abort();
+    }
+    for (const outcome of queued) {
+      assert.equal((await outcome).error?.code, 'pool_aborted', 'every aborted caller is rejected');
+    }
+    assert.equal(pool.waiters.length, 0, 'the aborts removed every waiter');
+    assert.deepEqual([...new Set(singles)].sort(), [...tickets].sort(), 'each aborted ticket was withdrawn');
+
+    // The in-flight poll still completes its own withdrawal, but the aborted ids
+    // behind it are gone: they must never be withdrawn again from a stale poll,
+    // and must never reach tryAcquire.
+    openFirst();
+    await admissionDeadline(held.release({ drained: true }), 2000);
+    await tick(); await tick();
+    assert.deepEqual(polls, [tickets[0]], 'an aborted, already-withdrawn ticket is never offered to tryAcquire again');
+    assert.deepEqual(singles.filter(id => id !== tickets[0]).sort(), tickets.slice(1).sort(),
+      'a removed ticket is withdrawn exactly once, never again by a stale poll');
+    assert.deepEqual([...new Set(singles)].sort(), [...tickets].sort(), 'no ticket was lost from the withdrawal');
+    assert.equal(pool.status().leases.some(record => tickets.includes(record.leaseId)), false, 'no stale lease is materialized');
+  } finally {
+    openFirst();
+    await held?.release({ drained: true }).catch(() => undefined);
+  }
+});
+
+test('a promotion inherits a younger slot promise without hiding a queued waiter from maxQueue', { timeout: 10000 }, async t => {
+  let enter, resume; const entered = new Promise(resolve => { enter = resolve; }), gate = new Promise(resolve => { resume = resolve; });
+  let pause = true;
+  const admission = { tryAcquire: async (_id, candidate) => { if (candidate.ownerId === 'owner-older' && pause) { pause = false; enter(); await gate; } return true; }, cancel: async () => {}, reconcile: async () => {} };
+  const { pool } = await makePool(t, { capacity: 1, maxQueue: 1, admission });
+  const controller = new AbortController(); let active, promoted, arrival;
+  try {
+    active = await pool.acquire(owner('active'));
+    const older = pool.acquire(owner('older'), controller.signal).then(lease => ({ lease }), error => ({ error }));
+    await active.release({ drained: true }); await entered;
+    const younger = pool.acquire(owner('younger'), controller.signal).then(lease => ({ lease }), error => ({ error }));
+    resume(); promoted = (await older).lease; assert.ok(promoted);
+    assert.equal(pool.status().queue.length, 1);
+    const extra = new AbortController(), refused = pool.acquire(owner('overflow'), extra.signal).then(lease => ({ lease }), error => ({ error }));
+    await tick(); extra.abort(); const result = await refused; assert.equal(result.error?.code, 'pool_queue_full');
+    await promoted.release({ drained: true }); arrival = (await younger).lease; assert.ok(arrival);
+    await arrival.release({ drained: true });
+  } finally { resume(); controller.abort(); await arrival?.release({ drained: true }); await promoted?.release({ drained: true }); await active?.release({ drained: true }); }
+});
+
 
 test('configuration is bounded and validated; defaults are 2 slots and a 32 queue', async t => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), 'runner-pool-config-'));
@@ -1529,4 +1802,336 @@ test('a promotion whose lease directory became unverifiable is quarantined, not 
     assert.equal(await exists(leaseDirectory), true, 'the unverifiable directory is retained');
     assert.equal(await fs.readFile(path.join(outside, 'keep.txt'), 'utf8'), 'keep me', 'the link target was never touched');
   }
+});
+
+test('a release whose aggregate reconcile fails after adoption still settles and drains', { timeout: 20000 }, async t => {
+  let injected = false;
+  const admission = { tryAcquire: async () => true, cancel: async () => {}, reconcile: async records => {
+    if (!injected && records.some(record => record.state === 'released')) {
+      injected = true;
+      throw Error('simulated aggregate reconcile failure');
+    }
+  } };
+  const { pool } = await makePool(t, { capacity: 1, maxQueue: 0, admission });
+  const lease = await pool.acquire(owner('adopted'));
+  // The drained release verifiably removes the directory and ADOPTS its
+  // 'released' revision, and only then does the aggregate reconcile of that same
+  // publish throw. The record is durable and released, but the live lease never
+  // reached finishLease.
+  await assert.rejects(lease.release({ drained: true }), /simulated aggregate reconcile failure/);
+  assert.equal(pool.leaseRecord(lease.id).state, 'released');
+  assert.equal(pool.status().slots[0].state, 'free');
+  assert.equal(await exists(lease.directory), false);
+  // Collecting that tombstone must keep the record, because a live lease in this
+  // process still owns it; dropping it would turn the exact retry into
+  // pool_unknown_lease and leave a live entry close() could never drain.
+  assert.equal(await pool.collectReleased(scopeOf('adopted')), 0);
+  assert.equal(pool.leaseRecord(lease.id).state, 'released');
+  const retried = await lease.release({ drained: true });
+  assert.equal(retried.state, 'released');
+  assert.equal(retried.deleted, true);
+  // The retry settled the lease, so collection is allowed and shutdown drains.
+  assert.equal(await pool.collectReleased(scopeOf('adopted')), 1);
+  assert.deepEqual(pool.status().leases, []);
+  await pool.close();
+  assert.equal(pool.status().closed, true);
+});
+
+test('collecting released tombstones keeps a record whose directory is still present', { timeout: 20000 }, async t => {
+  const { pool } = await makePool(t, { capacity: 1, maxQueue: 0 });
+  const lease = await pool.acquire(owner('tombstone'));
+  await lease.release({ drained: true });
+  // A directory that reappears under a released lease is unproven layout: the
+  // record is retained (cleanup reports it, collection refuses it) instead of
+  // orphaning the directory as an unknown entry no record could reconcile.
+  await fs.mkdir(path.join(lease.directory, 'temp'), { recursive: true });
+  const cleanup = await pool.cleanup(scopeOf('tombstone'));
+  assert.equal(pool.leaseRecord(lease.id).state, 'released');
+  assert.ok(cleanup.retained.some(entry => entry.leaseId === lease.id));
+  assert.ok(pool.status().unknownEntries.some(entry => entry.endsWith(lease.id)));
+  assert.equal(await pool.collectReleased(scopeOf('tombstone')), 0);
+  assert.equal(pool.leaseRecord(lease.id).state, 'released');
+  await fs.rm(lease.directory, { recursive: true, force: true });
+  assert.equal(await pool.collectReleased(scopeOf('tombstone')), 1);
+  assert.deepEqual(pool.status().leases, []);
+});
+
+test('cross-root legacy occupancy never reserves aggregate capacity for a blocked runner', { timeout: 30000 }, async t => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'runner-pool-roots-'));
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+  // Two slots overall with the fixed one-slot service reserve, so a work ticket
+  // waits as soon as one work ticket is active.
+  const config = { ...resourceDefaults, enabled: true, runnerCapacity: 2 };
+  const resources = new ResourceGovernor(() => config, path.join(base, 'resources'));
+  t.after(() => resources.close().catch(() => undefined));
+  const rootA = path.join(base, 'root-a'), rootB = path.join(base, 'root-b');
+  await fs.mkdir(rootA, { recursive: true });
+  await fs.mkdir(rootB, { recursive: true });
+  const scopeA = path.join(base, 'store-a', 'pool'), scopeB = path.join(base, 'store-b', 'pool');
+  // Same shape the broker builds: a legacy (non-governed) owner opts out of
+  // governed admission and keeps its original per-pool behavior.
+  const admissionFor = (scope, root) => {
+    const admission = resources.runnerAdmission(scope, root, candidate => candidate.ownerId);
+    return { ...admission, applies: candidate => candidate.ownerId !== 'legacy' };
+  };
+  const poolA = new RunnerPool(scopeA, { projectRoot: rootA, capacity: 2, maxQueue: 4, closeTimeoutMs: 2000, admission: admissionFor(scopeA, rootA) });
+  const poolB = new RunnerPool(scopeB, { projectRoot: rootB, capacity: 1, maxQueue: 4, closeTimeoutMs: 2000, admission: admissionFor(scopeB, rootB) });
+  await poolA.open();
+  await poolB.open();
+  t.after(async () => { await poolA.close().catch(() => undefined); await poolB.close().catch(() => undefined); });
+  const who = (lane, id) => ({ ownerId: lane, teamId: TEAM, workerId: hex32(`roots-${id}`), workerCreatedAt: ISO });
+  const runnerClaims = async () => (await resources.status()).claims.filter(claim => claim.kind === 'runner');
+
+  const held = await poolA.acquire(who('work', 'a1'));
+  const waiting = poolB.acquire(who('work', 'b1')).then(lease => ({ lease }), error => ({ error }));
+  // B's governed ticket is queued in the aggregate (the one work slot is taken).
+  await until(async () => (await runnerClaims()).some(claim => claim.scope === scopeB && claim.state === 'waiting'));
+  // Legacy occupancy fills B's only physical slot WITHOUT an aggregate claim.
+  const legacy = await poolB.acquire(who('legacy', 'b-legacy'));
+  assert.deepEqual(poolB.status().slots.map(slot => slot.state), ['active']);
+  await held.release({ drained: true });
+
+  // A's next poll must not hand aggregate capacity to B's now physically blocked
+  // ticket: only B's own pool can prove a usable slot.
+  const next = await admissionDeadline(poolA.acquire(who('work', 'a2')), 10000);
+  assert.ok(next);
+  const afterPromotion = await runnerClaims();
+  assert.equal(afterPromotion.find(claim => claim.scope === scopeB).state, 'waiting', 'a blocked ticket holds no aggregate capacity');
+  assert.equal(afterPromotion.find(claim => claim.scope === scopeA).state, 'active');
+  // ...and it must not block eligible work in another root either.
+  await next.release({ drained: true });
+  const third = await admissionDeadline(poolA.acquire(who('work', 'a3')), 10000);
+  assert.equal(poolA.status().slots.filter(slot => slot.state === 'active').length, 1, 'the other root keeps handing out its own physical slot');
+  await third.release({ drained: true });
+  // The queued ticket runs as soon as its own pool has a usable physical slot,
+  // and only then: oldest-eligible FIFO inside that pool is unchanged.
+  await legacy.release({ drained: true });
+  const granted = await admissionDeadline(waiting, 10000);
+  assert.ok(granted.lease, JSON.stringify(granted.error));
+  await granted.lease.release({ drained: true });
+  assert.deepEqual(await runnerClaims(), []);
+  assert.equal(poolA.status().slots.filter(slot => slot.state === 'free').length, 2);
+  assert.equal(poolB.status().slots.filter(slot => slot.state === 'free').length, 1);
+});
+
+test('an unused opted-out legacy runner scope never touches the shared ledger while retained claims still reconcile', { timeout: 60000 }, async t => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'runner-pool-optout-'));
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+  const root = path.join(base, 'project');
+  await fs.mkdir(root);
+  const config = { ...resourceDefaults, enabled: false };
+  const errors = [];
+  const broker = new WorkerBroker({
+    storage: path.join(base, 'storage'), registry: path.join(base, 'bridges'), roots: [root], identity: 'test',
+    provider: { models: async () => [], countTokens: async () => 0, stream: async function* () { yield { type: 'text', text: 'idle' }; } },
+    settings: () => ({ maxTurns: 1, maxToolRounds: 1, turnTimeoutMs: 1000, maxOutputChars: 1000, maxHistoryBytes: 100000, maxSessions: 4, retries: 0 }),
+    taskBoardEnabled: () => false, isolatedViewsEnabled: () => true,
+    resources: () => config, resourceDirectory: path.join(base, 'resources'),
+    runners: () => ({ enabled: true, capacity: 1, maxQueue: 4 }),
+    files: { canWrite: () => true, allowShell: () => true, approveCommand: async () => true },
+    onChange: () => {}, onError: message => errors.push(message)
+  });
+  await broker.start();
+  t.after(() => broker.close().catch(() => undefined));
+  const local = broker.local.get(root);
+  const model = { id: 'byok/qwen', name: 'Qwen', vendor: 'test', family: 'qwen', version: '1', maxInputTokens: 1000 };
+  // A legacy (non-governed) session: it never opted into governed runners.
+  const create = async label => {
+    const id = hex32(`opt-out-${label}`);
+    await local.store.create({ schema: 1, id, title: label, model, instructions: '', permission: 'workspace-write', state: 'completed',
+      messages: [], turns: [{ id: `turn-${label}`, input: label, state: 'completed', started: true, attempts: 1, output: 'done', tools: [], createdAt: ISO, updatedAt: ISO }],
+      operations: {}, revision: 1, createdAt: ISO, updatedAt: ISO, ownerId: 'parent' });
+    return id;
+  };
+  const manager = await local.isolation.openRunners();
+  const leaseOf = async label => manager.pool.acquire({ ownerId: 'parent', teamId: TEAM, workerId: await create(label), workerCreatedAt: ISO });
+
+  // A status call or another root participating flips the broker-wide flag; it
+  // must not make this unused opted-out scope write the shared ledger.
+  broker.resourceUsed = true;
+  const first = await leaseOf('one');
+  assert.equal((await first.release({ drained: true })).state, 'released');
+  assert.equal(await broker.resources.hasState(), false,
+    'an unused opted-out legacy runner scope never creates or reads the aggregate namespace');
+  assert.deepEqual(errors, []);
+
+  // A claim retained from an earlier governed run is still reconciled after
+  // opt-out: participation is the local registration plus this exact scope, not
+  // the broker-wide flag.
+  config.enabled = true;
+  const scope = path.join(local.store.directory, 'runners', 'pool');
+  await broker.resources.account(local.store.directory, async () => 0);
+  const stable = await broker.resources.runnerScope(scope);
+  const retained = `runner:${digest(stable)}:${first.id}`;
+  const seeded = await broker.resources.tryAcquire({ key: retained, kind: 'runner', root, scope: stable, lane: 'work', localCapacity: 1, bytes: 1024 ** 3 });
+  assert.equal(seeded.granted, true);
+  config.enabled = false;
+  const second = await leaseOf('two');
+  assert.equal((await second.release({ drained: true })).state, 'released');
+  assert.deepEqual((await broker.resources.status()).claims.filter(claim => claim.kind === 'runner'), [],
+    'the retained claim of a released lease is reconciled after opt-out');
+  assert.deepEqual(errors, []);
+});
+
+test('a runner handoff respects older storage tickets before they claim capacity', async t => {
+  const { base, project } = await makePool(t);
+  const gib = 1024 ** 3;
+  const resources = new ResourceGovernor(() => ({ ...resourceDefaults, enabled: true, storageBytes: 2 * gib }), path.join(base, 'resources'));
+  t.after(() => resources.close());
+  const hold = { key: 'hold', kind: 'storage', lane: 'validation', root: project, bytes: 1.5 * gib };
+  const older = { ...hold, key: 'older', bytes: 1.25 * gib };
+  const runner = { key: 'runner', kind: 'runner', lane: 'validation', root: project, bytes: gib };
+  assert.equal((await resources.tryAcquire(hold)).granted, true);
+  assert.equal((await resources.tryAcquire(older)).granted, false);
+  assert.equal((await resources.tryAcquire(runner)).granted, false);
+  await resources.release(hold.key);
+  assert.deepEqual(await resources.tryAcquire(runner), { granted: false, reason: 'storage' });
+  const status = await resources.status();
+  assert.equal(status.claims.find(claim => claim.key === older.key).state, 'waiting');
+  assert.equal(status.summary.reservedBytes, 0);
+  assert.equal((await resources.tryAcquire(older)).granted, true);
+  assert.equal((await resources.status()).summary.reservedBytes, older.bytes);
+  assert.deepEqual(await resources.tryAcquire(runner), { granted: false, reason: 'storage' });
+  await resources.release(older.key);
+  assert.equal((await resources.tryAcquire(runner)).granted, true);
+  await resources.release(runner.key);
+});
+
+test('a younger cross-root contender cannot overtake an older physically eligible runner', { timeout: 30000 }, async t => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'runner-pool-overtake-'));
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+  const config = { ...resourceDefaults, enabled: true, runnerCapacity: 2 };
+  const resources = new ResourceGovernor(() => config, path.join(base, 'resources'));
+  t.after(() => resources.close().catch(() => undefined));
+  const admissionFor = async name => {
+    const root = path.join(base, 'project-' + name);
+    await fs.mkdir(root, { recursive: true });
+    return resources.runnerAdmission(path.join(base, 'store-' + name, 'pool'), root, () => 'validation');
+  };
+  const older = await admissionFor('older'), younger = await admissionFor('younger'), filler = await admissionFor('filler');
+  const who = id => ({ ownerId: 'parent', teamId: TEAM, workerId: hex32('overtake-' + id), workerCreatedAt: ISO });
+  const id = label => label.repeat(32);
+  const ledger = async () => (await resources.status()).claims.filter(claim => claim.kind === 'runner');
+  const stateOf = async label => (await ledger()).find(claim => claim.key.endsWith(id(label)))?.state;
+  try {
+    // A third root fills the aggregate runner bound, so the OLDER ticket below
+    // must be created while there is no aggregate room for it.
+    assert.equal(await filler.tryAcquire(id('c'), who('c1'), 2), true);
+    assert.equal(await filler.tryAcquire(id('d'), who('c2'), 2), true);
+    assert.equal(await older.tryAcquire(id('a'), who('a1'), 1), false, 'the older ticket waits for aggregate capacity');
+    // Free exactly one aggregate slot: the older ticket is now physically and
+    // aggregately eligible, but its own pool has not polled yet.
+    await filler.cancel(id('c'));
+    // The YOUNGER root polls first. Sequence order wins, not polling order, and
+    // the younger poll must not mark the older ticket active either.
+    assert.equal(await younger.tryAcquire(id('b'), who('b1'), 1), false, 'a younger poll never overtakes an older eligible runner');
+    assert.equal(await stateOf('a'), 'waiting');
+    assert.equal(await stateOf('b'), 'waiting');
+    assert.equal((await ledger()).filter(claim => claim.state === 'active').length, 1, 'no phantom runner ownership was created');
+    // The older ticket's own poll takes the handoff, activating exactly itself.
+    assert.equal(await older.tryAcquire(id('a'), who('a1'), 1), true);
+    assert.equal(await stateOf('a'), 'active');
+    assert.equal(await stateOf('b'), 'waiting', 'one handoff activates exactly one ticket');
+    assert.equal((await ledger()).filter(claim => claim.state === 'active').length, 2);
+  } finally {
+    for (const [admission, label] of [[older, 'a'], [younger, 'b'], [filler, 'c'], [filler, 'd']]) {
+      await admission.cancel(id(label)).catch(() => undefined);
+    }
+  }
+  assert.deepEqual(await ledger(), []);
+});
+
+test('one local handoff grants a single claim and never blocks other roots on a physically full pool', { timeout: 40000 }, async t => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'runner-pool-handoff-'));
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+  const root = path.join(base, 'project');
+  await fs.mkdir(root, { recursive: true });
+  const config = { ...resourceDefaults, enabled: true, runnerCapacity: 2 };
+  const resources = new ResourceGovernor(() => config, path.join(base, 'resources'));
+  t.after(() => resources.close().catch(() => undefined));
+  const scope = path.join(base, 'store', 'pool');
+  const other = resources.runnerAdmission(path.join(base, 'other-store', 'pool'), path.join(base, 'other-project'), () => 'validation');
+  const admission = resources.runnerAdmission(scope, root, () => 'validation');
+  // The broker's shape: a legacy (non-governed) owner keeps its original
+  // per-pool behavior and holds no aggregate runner claim.
+  const pool = new RunnerPool(scope, {
+    projectRoot: root, capacity: 3, maxQueue: 4, closeTimeoutMs: 2000,
+    admission: { ...admission, applies: candidate => candidate.ownerId !== 'legacy' }
+  });
+  await pool.open();
+  t.after(() => pool.close().catch(() => undefined));
+  const who = (lane, label) => ({ ownerId: lane, teamId: TEAM, workerId: hex32('handoff-' + label), workerCreatedAt: ISO });
+  const id = label => label.repeat(32);
+  const held = promise => promise.then(lease => ({ lease }), error => ({ error }));
+  const local = async state => (await resources.status()).claims
+    .filter(claim => claim.kind === 'runner' && claim.scope === scope && claim.state === state);
+  const legacy = [];
+  try {
+    legacy.push(await pool.acquire(who('legacy', 'l1')));
+    legacy.push(await pool.acquire(who('legacy', 'l2')));
+    // Fill the aggregate bound from another root: both governed tickets still get
+    // a waiting claim (one physical slot is free) without reserving any.
+    assert.equal(await other.tryAcquire(id('p'), who('parent', 'p1'), 2), true);
+    assert.equal(await other.tryAcquire(id('q'), who('parent', 'p2'), 2), true);
+    const first = held(pool.acquire(who('work', 'w1')));
+    const second = held(pool.acquire(who('work', 'w2')));
+    await until(async () => (await local('waiting')).length === 2);
+    // Occupy the last physical slot, then free exactly one aggregate slot, so a
+    // single physical slot and a single aggregate slot remain for two tickets.
+    legacy.push(await pool.acquire(who('legacy', 'l3')));
+    await other.cancel(id('q'));
+    await legacy[0].release({ drained: true });
+    const one = await admissionDeadline(first, 10000);
+    assert.ok(one.lease, JSON.stringify(one.error));
+    assert.equal((await local('active')).length, 1, 'one local handoff grants exactly one runner claim');
+    assert.equal((await local('waiting')).length, 1);
+    assert.equal(pool.status().queue.length, 1);
+    // The waiting ticket is physically blocked by its own pool (three legacy
+    // slots were full), so it must not take the next handoff from another root.
+    await other.cancel(id('p'));
+    const service = resources.runnerAdmission(path.join(base, 'service-store', 'pool'), path.join(base, 'service-project'), () => 'validation');
+    assert.equal(await service.tryAcquire(id('s'), who('parent', 's1'), 1), true, 'a physically blocked ticket holds no handoff');
+    assert.equal((await local('active')).length, 1);
+    assert.equal((await local('waiting')).length, 1, 'the blocked ticket waits instead of holding aggregate capacity');
+    await service.cancel(id('s'));
+    // Freed physical capacity promotes it through its own pool, in order.
+    await one.lease.release({ drained: true });
+    const two = await admissionDeadline(second, 15000);
+    assert.ok(two.lease, JSON.stringify(two.error));
+    await two.lease.release({ drained: true });
+    assert.deepEqual(await local('active'), []);
+  } finally {
+    for (const lease of legacy) {
+      await lease.release({ drained: true }).catch(() => undefined);
+    }
+    for (const label of ['p', 'q']) {
+      await other.cancel(id(label)).catch(() => undefined);
+    }
+  }
+});
+
+test('a throwing admission applicability check settles that request instead of wedging the queue', async t => {
+  const admission = {
+    applies: candidate => {
+      if (candidate.ownerId === 'owner-poison') {
+        throw Error('applicability unavailable');
+      }
+      return true;
+    },
+    tryAcquire: async () => true,
+    cancel: async () => {},
+    reconcile: async () => {}
+  };
+  const { pool } = await makePool(t, { capacity: 1, maxQueue: 2, admission });
+  const poison = pool.acquire(owner('poison')).then(lease => ({ lease }), error => ({ error }));
+  // The refusal must be a settled rejection carrying its own cause, never a
+  // pending promise and never a request left at the head of the queue.
+  const settled = await admissionDeadline(poison);
+  assert.equal(settled.lease, undefined);
+  assert.match(settled.error?.message ?? '', /applicability unavailable/);
+  const survivor = await admissionDeadline(pool.acquire(owner('survivor')));
+  assert.ok(survivor, 'the queue kept serving the next request');
+  assert.deepEqual(pool.status().queue, []);
+  await survivor.release({ drained: true });
+  assert.equal(pool.status().slots[0].state, 'free');
 });

@@ -6,11 +6,14 @@ import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { WorkerError } from './types';
+import { assertRequestEpoch, receiptArchiveDeletesSchema, receiptArchivePublicationsSchema, receiptArchiveSchema, receiptEpochsSchema } from './receipt-retention';
+import type { ReceiptMetadata, RequestIdPolicy } from './receipt-retention';
 import { Mutex, atomicWrite } from './storage';
 import type { SealedSubmission, OverlayRecord, PendingCapture, StoredSnapshot, ViewPin, ViewReceipt } from './isolated-view-types';
 
 /** The single atomic document published at <directory>/index.json. */
-export interface ViewIndexData {
+export interface ViewIndexData extends ReceiptMetadata {
+  receiptOwners?: Record<string, string>;
   schema: 1;
   root: string;
   revision: number;
@@ -65,7 +68,9 @@ const overlaySchema = z.strictObject({
 const submissionSchema = z.strictObject({
   id: id64, teamId, snapshotId: id64, overlayId: id64,
   version: z.number().int().positive(), uri: z.string().min(1).max(2048),
-  workerId: teamId, workerCreatedAt: isoDate, ownerId, head, revision, released: z.boolean(), createdAt: isoDate
+  workerId: teamId, workerCreatedAt: isoDate, ownerId, head, revision, released: z.boolean(), createdAt: isoDate,
+  /** Additive governed-runner marker; records without it stay untouched. */
+  runnerInput: z.literal(true).optional()
 }).refine(value => (value.head === null) === (value.revision === 0));
 const pinSchema = z.strictObject({
   id: id64, ownerId, teamId, name: z.string().min(1).max(128),
@@ -90,6 +95,13 @@ const dataSchema = z.strictObject({
   submissions: z.record(id64, submissionSchema),
   pins: z.record(id64, pinSchema),
   receipts: z.record(id64, receiptSchema),
+  legacyRequestKeys: z.array(id64).max(4096).optional(),
+  receiptEpochs: receiptEpochsSchema.optional(), receiptArchives: z.array(receiptArchiveSchema).max(64).optional(),
+  /** Durable archive-deletion intent; completed by a retry or the next open. */
+  receiptArchiveDeletes: receiptArchiveDeletesSchema.optional(),
+  /** Durable archive-publication intents (one per owner); each is completed only by that owner's exact rollover retry. */
+  receiptArchivePublications: receiptArchivePublicationsSchema.optional(),
+  receiptOwners: z.record(id64, ownerId).optional(),
   pendingCaptures: z.record(id64, pendingSchema)
 });
 
@@ -359,19 +371,60 @@ export function parseViewPin(value: unknown): ViewPin {
 }
 
 export class IsolatedIndex {
+  private receiptOwner?: string;
+  /**
+   * Receipts an exact authorized replay proved in this handle, and whose
+   * operation-specific fingerprint and authorization already passed. It is
+   * ephemeral: a claim is published only with the next authorized index update
+   * and pruned once its receipt is gone.
+   */
+  private readonly adopted = new Map<string, string>();
+  request(ownerId: string, requestId: string, key: string): void {
+    const data = this.assertReady();
+    assertRequestEpoch(data, ownerId, requestId, key, data.receipts[key] !== undefined, this.policy);
+    this.receiptOwner = ownerId;
+  }
+  /**
+   * Records ownership proof for one ownerless legacy receipt. The caller must
+   * have already re-run the operation's own authorization and matched its exact
+   * fingerprint, so a key (derived from that owner's own scope) can only ever
+   * name that owner's receipt. A receipt that is gone, already attributed or
+   * absent records nothing.
+   */
+  adoptReceiptOwner(key: string, ownerId: string): void {
+    const data = this.assertReady();
+    if (data.receipts[key] !== undefined && data.receiptOwners?.[key] === undefined) {
+      this.adopted.set(key, ownerId);
+    }
+  }
+  /**
+   * Proven owner of one receipt key: the durable ownership map, or a live claim
+   * an exact authorized replay proved. Never a guess, and never a stale claim
+   * whose receipt left the index.
+   */
+  receiptOwnerOf(key: string): string | undefined {
+    const data = this.assertReady();
+    const durable = data.receiptOwners?.[key];
+    if (durable !== undefined || data.receipts[key] === undefined) {
+      return durable;
+    }
+    return this.adopted.get(key);
+  }
   private data?: ViewIndexData;
   private opened = false;
   private closing = false;
   private readonly guard: () => void = () => undefined;
   private readonly limits: IndexLimits;
+  private readonly policy?: RequestIdPolicy;
   private readonly mutex = new Mutex();
   readonly file: string;
 
-  constructor(readonly directory: string, readonly root: string, options: { guard?: () => void; limits?: Partial<IndexLimits> } = {}) {
+  constructor(readonly directory: string, readonly root: string, options: { guard?: () => void; limits?: Partial<IndexLimits>; requestIdPolicy?: RequestIdPolicy } = {}) {
     if (typeof root !== 'string' || root.length > 8192 || !path.isAbsolute(root)) {
       throw new WorkerError('invalid_path', 'The index root must be an absolute path.');
     }
     this.guard = options.guard ?? (() => undefined);
+    this.policy = options.requestIdPolicy;
     this.limits = { ...indexLimits };
     for (const key of Object.keys(indexLimits) as (keyof IndexLimits)[]) {
       const value = options.limits?.[key];
@@ -456,6 +509,27 @@ export class IsolatedIndex {
       authorize?.();
       const draft = structuredClone(current);
       const result = mutator(draft) as unknown;
+      for (const key of Object.keys(draft.receipts)) {
+        if (!current.receipts[key] && this.receiptOwner) {
+          (draft.receiptOwners ??= {})[key] = this.receiptOwner;
+        }
+      }
+      // Ownership proven by an exact authorized replay becomes durable here, so
+      // a reload keeps what this handle already proved and a scoped rollover can
+      // reclaim that receipt without guessing. A claim whose receipt is gone is
+      // dropped instead of outliving the identity it described.
+      for (const [key, owner] of this.adopted) {
+        if (draft.receipts[key] === undefined) {
+          this.adopted.delete(key);
+        } else if (draft.receiptOwners?.[key] === undefined) {
+          (draft.receiptOwners ??= {})[key] = owner;
+        }
+      }
+      for (const key of Object.keys(draft.receiptOwners ?? {})) {
+        if (!draft.receipts[key]) {
+          delete draft.receiptOwners![key];
+        }
+      }
       // A thenable (including a rejected promise) is an async mutator: it is
       // declined without publication and must not become an unhandled rejection.
       if (result instanceof Promise || (result !== null && ['object', 'function'].includes(typeof result) && typeof (result as { then?: unknown }).then === 'function')) {

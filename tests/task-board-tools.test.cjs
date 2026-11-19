@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { WorkerError, failure } = require('../.test-build/types');
 const {
-  boardMcpTools, boardToolNames, invokeBoard, isBoardTool, workerBoardToolNames, workerBoardTools,
+  boardAdmissionLane, boardMcpTools, boardToolNames, invokeBoard, isBoardTool, workerBoardToolNames, workerBoardTools,
 } = require('../.test-build/task-board-tools');
 
 const OWNER = 'owner-1';
@@ -120,6 +120,35 @@ const coordinatorTools = [
 ];
 const withBoard = names => [...names, ...workerBoardToolNames];
 
+test('coordinator storage lane hints are optional, strictly validated and removed before domain mutation', async () => {
+  const port = new FakePort(), actor = { kind: 'coordinator', ownerId: OWNER };
+  const calls = [
+    ['subagent_team_create', { ownerId: OWNER, requestId: 'team-new', name: 'team', description: '' }],
+    ['subagent_team_update', { ownerId: OWNER, requestId: 'team-update', teamId: TEAM, expectedRevision: 0 }],
+    ['subagent_task_create', { ownerId: OWNER, requestId: 'task-new', teamId: TEAM, title: 'task', description: '' }],
+    ['subagent_task_update', { ownerId: OWNER, requestId: 'task-update', taskId: TASK, expectedRevision: 0 }],
+  ];
+  for (const [name, input] of calls) {
+    const descriptor = boardMcpTools.find(tool => tool.name === name);
+    assert.deepEqual(descriptor.inputSchema.properties.lane.enum, ['work', 'validation', 'integration']);
+    assert.equal(descriptor.inputSchema.required.includes('lane'), false);
+    assert.equal(boardAdmissionLane(name, input), 'work');
+    for (const lane of ['work', 'validation', 'integration']) {
+      assert.equal(boardAdmissionLane(name, { ...input, lane }), lane);
+      assert.equal((await invokeBoard(port, name, { ...input, lane })).isError, undefined);
+      const [bound, args] = port.calls.at(-1).args;
+      assert.deepEqual(bound, actor); assert.equal(args.lane, undefined); assert.equal(args.ownerId, undefined);
+    }
+    for (const lane of ['', 'service', null, 1]) {
+      const before = port.calls.length;
+      assert.throws(() => boardAdmissionLane(name, { ...input, lane }), e => e.code === 'invalid_arguments');
+      assert.equal((await invokeBoard(port, name, { ...input, lane })).isError, true); assert.equal(port.calls.length, before);
+    }
+  }
+  assert.throws(() => boardAdmissionLane('subagent_task_get', { ownerId: OWNER, id: TASK, lane: 'integration' }), e => e.code === 'invalid_arguments');
+});
+
+
 test('board descriptors require the coordinator identity and advertise read-only tools separately', () => {
   assert.deepEqual(boardMcpTools.map(tool => tool.name), coordinatorTools);
   assert.deepEqual([...boardToolNames].sort(), [...coordinatorTools].sort());
@@ -141,7 +170,7 @@ test('board descriptors require the coordinator identity and advertise read-only
   }
 
   const byName = Object.fromEntries(boardMcpTools.map(tool => [tool.name, tool]));
-  assert.deepEqual(Object.keys(byName.subagent_team_create.inputSchema.properties).sort(), ['description', 'name', 'ownerId', 'requestId', 'workspaceRoot']);
+  assert.deepEqual(Object.keys(byName.subagent_team_create.inputSchema.properties).sort(), ['description', 'lane', 'name', 'ownerId', 'requestId', 'workspaceRoot']);
   assert.deepEqual(Object.keys(byName.subagent_team_get.inputSchema.properties).sort(), ['id', 'ownerId', 'workspaceRoot']);
   assert.deepEqual(Object.keys(byName.subagent_team_list.inputSchema.properties).sort(), ['limit', 'offset', 'ownerId', 'workspaceRoot']);
   assert.deepEqual(Object.keys(byName.subagent_task_get.inputSchema.properties).sort(), ['id', 'ownerId', 'workspaceRoot']);
@@ -262,7 +291,7 @@ test('worker definitions are team-scoped when the board answers synchronously', 
   for (const key of ['progress', 'blockers', 'candidates', 'state', 'requestId', 'taskId', 'expectedRevision']) {
     assert.ok(update.properties[key], `worker update schema exposes ${key}`);
   }
-  for (const key of ['ownerId', 'actor', 'workerId', 'validations']) {
+  for (const key of ['ownerId', 'actor', 'workerId', 'validations', 'lane']) {
     assert.ok(!update.properties[key], `worker update schema hides ${key}`);
   }
 });
@@ -337,6 +366,8 @@ test('workers cannot spoof identity, use coordinator tools or send coordinator f
     { kind: 'coordinator' },
     { teamId: TEAM },
     { validations: [] },
+    { lane: 'validation' },
+    { lane: 'integration' },
     { acceptanceCriteria: ['sneaky'] },
   ];
   for (const extra of spoofs) {

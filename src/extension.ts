@@ -16,6 +16,7 @@ import { ModelsTree } from './models-view';
 import { TaskBoardTree } from './task-board-view';
 import { prepareRuntime, register, repairRegistration } from './registration';
 import { WorkerBroker, unpack } from './runtime';
+import { readResourceConfig } from './resource-governor';
 import { readRunnerHostConfig } from './isolated-view-host';
 import type { RunnerHostConfig } from './isolated-view-host';
 import { Mutex } from './storage';
@@ -270,6 +271,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
         taskBoardEnabled: boardEnabled,
         isolatedViewsEnabled,
         runners: runnerHostConfig,
+        resourcesEnabled: () => vscode.workspace.getConfiguration('codexSubagent').inspect<boolean>('resources.enabled')?.globalValue === true,
+        resources: () => readResourceConfig(key => vscode.workspace.getConfiguration('codexSubagent').inspect(key)),
         openDocuments: () => vscode.workspace.textDocuments.filter(document => document.isDirty
           && (document.uri.scheme === 'file' || (document.isUntitled && path.isAbsolute(document.uri.fsPath))))
           .map(document => ({ path: document.uri.fsPath, text: document.getText(), version: document.version })),
@@ -757,6 +760,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
   // Opting in or out changes only the board: no broker restart, no model or
   // permission reconfiguration, and running workers are never interrupted.
   context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
+    if (event.affectsConfiguration('codexSubagent.resources')) {
+      broker?.settingsChanged();
+    }
     if (!event.affectsConfiguration('codexSubagent.taskBoard.enabled')) {
       return;
     }

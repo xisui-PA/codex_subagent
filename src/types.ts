@@ -1,3 +1,5 @@
+import type { WorkerStartup, ScheduleWait } from './worker-startup';
+import type { WaitingReason } from './resource-governor';
 import type { IsolatedViewBinding } from './isolated-view-types';
 
 export type Part =
@@ -27,23 +29,28 @@ export interface Turn {
   archived?: boolean;
 }
 export interface Session {
-  schema: 1 | 2; id: string; title: string; model: Model; instructions: string;
+  schema: 1 | 2 | 3; id: string; title: string; model: Model; instructions: string;
   permission: 'read-only' | 'workspace-write'; state: State; messages: Message[]; turns: Turn[];
   operations: Record<string, { fingerprint: string; turnId: string }>;
   summary?: { text: string; through: number }; revision: number; createdAt: string; updatedAt: string;
   ownerId?: string; ownerLabel?: string; parentPolicy?: 'keep' | 'cancel-on-expiry'; parentExpiresAt?: number; parentLeaseSeconds?: number;
   workspaceRoot?: string; activity?: string;
   maintenanceError?: Failure;
-  maintenance?: { kind: 'revert' | 'isolation'; previousState: State };
+  maintenance?: { kind: 'revert' | 'isolation' | 'compact'; previousState: State };
   /** Permanent: unavailable private storage must never fall back to live files. */
   isolatedView?: IsolatedViewBinding;
+  startup?: WorkerStartup;
+  scheduleWait?: ScheduleWait;
+  /** Opaque schedule-wait generation; absent means 0. */
+  scheduleWaitRevision?: number;
+  waitingReason?: WaitingReason;
   storeDirectory?: string;
   messageBase?: number; archives?: { id: string; firstMessage: number; messageCount: number; createdAt: string }[];
   changes?: FileChange[];
 }
 export interface FileChange { id: string; path: string; target?: string; kind: 'write' | 'delete' | 'rename'; state: 'pending' | 'applied' | 'reverted'; createdAt: string }
 export interface ChangeContent extends FileChange { before: string | null; after: string | null }
-export type SessionHeader = Pick<Session, 'id' | 'title' | 'model' | 'permission' | 'state' | 'revision' | 'createdAt' | 'updatedAt' | 'ownerId' | 'ownerLabel' | 'workspaceRoot' | 'activity' | 'parentPolicy' | 'parentExpiresAt' | 'isolatedView'> & { lastTurnId?: string; lastAttempt?: number };
+export type SessionHeader = Pick<Session, 'id' | 'title' | 'model' | 'permission' | 'state' | 'revision' | 'createdAt' | 'updatedAt' | 'ownerId' | 'ownerLabel' | 'workspaceRoot' | 'activity' | 'parentPolicy' | 'parentExpiresAt' | 'isolatedView' | 'startup' | 'waitingReason'> & { lastTurnId?: string; lastAttempt?: number };
 export interface ModelPolicy {
   allowWrite?: boolean; allowShell?: boolean; numSessions?: number; maxToolRounds?: number;
   turnTimeoutSeconds?: number; autoCompact?: boolean;

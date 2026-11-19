@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { Session } from './types';
 import { WorkerError } from './types';
+import { assertRequestEpoch, completeArchiveDeletions, currentEpoch, epochRequest, MAX_RECEIPT_ARCHIVE_FILES, planArchivePublication, preflightArchivePublication, publishArchivePublication, selectPublicationReceipts, verifyArchive } from './receipt-retention';
+import type { ReceiptArchive, ReceiptArchivePublication, RequestIdPolicy } from './receipt-retention';
 import { atomicWrite, digest, Mutex } from './storage';
 import {
   activeTaskStates,
@@ -99,10 +101,18 @@ export class TaskBoard {
   private readonly mutex = new Mutex();
   private data?: BoardData;
   private closing = false;
+  private readonly withStorageWrite: <T>(action: () => Promise<T>) => Promise<T>;
 
-  constructor(readonly directory: string, workspaceRoot: string, private readonly worker: WorkerResolver, private readonly mutationGuard?: () => void) {
+  /**
+   * `withStorageWrite` fences ONLY the durable filesystem phase of a receipt
+   * rollover (preflight, publication intent, every archive part and the epoch
+   * commit) with the host's exclusive store write fence. Absent keeps the
+   * original behavior, so an unwired board never holds a store it does not own.
+   */
+  constructor(readonly directory: string, workspaceRoot: string, private readonly worker: WorkerResolver, private readonly mutationGuard?: () => void, private readonly requestIdPolicy?: RequestIdPolicy, withStorageWrite?: <T>(action: () => Promise<T>) => Promise<T>) {
     this.root = path.resolve(workspaceRoot);
     this.file = path.join(directory, 'task-board.json');
+    this.withStorageWrite = withStorageWrite ?? (action => action());
   }
 
   async open(): Promise<void> {
@@ -114,6 +124,9 @@ export class TaskBoard {
       text = await fs.readFile(this.file, 'utf8');
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        if (await fs.lstat(path.join(this.directory, 'task-board.namespace.json')).then(() => true, () => false) || await fs.lstat(path.join(this.directory, 'board-retention')).then(() => true, () => false)) {
+          throw new WorkerError('board_malformed', 'The task board is missing beside durable namespace metadata. Restore it; expired requests must not become fresh operations.');
+        }
         this.data = { schema: 1, workspaceRoot: this.root, teams: [], tasks: [], requests: {} };
         return;
       }
@@ -139,7 +152,14 @@ export class TaskBoard {
       }
       throw new WorkerError('board_malformed', `Task board ${this.file} is malformed and was left untouched: ${error instanceof Error ? error.message : String(error)}`);
     }
+    for (const archive of data.receiptArchives ?? []) {
+      await verifyArchive(path.join(this.directory, 'board-retention'), archive);
+    }
+    await this.ensureNamespace();
     this.data = data;
+    // Pending archive deletions are never executed here: unlink runs only
+    // during an explicit scoped collection that holds the full retained set, so
+    // a newly pinned archive can never be deleted by a restart.
   }
 
   /** Mark the board closing and drain queued/in-flight mutations before the host releases the owner lock. */
@@ -334,6 +354,9 @@ export class TaskBoard {
       }
       scanTask(parsed.data.id, parsed.data);
     }
+    for (const entry of data.referenceHistory ?? []) {
+      visit(entry.taskId, entry.kind, entry.kind === 'report' ? 'validation_invalid' : 'ref_conflict', entry.ref);
+    }
     for (const task of data.tasks) {
       scanTask(task.id, task);
     }
@@ -414,11 +437,54 @@ export class TaskBoard {
   }
 
   /** Validate the full durable shape and graph, atomically write, and publish in memory only after disk success. */
-  private async commit(draft: BoardData): Promise<void> {
+  private async ensureNamespace(): Promise<void> {
+    const file = path.join(this.directory, 'task-board.namespace.json'); const text = JSON.stringify({ schema: 1, root: this.root });
+    const existing = await fs.readFile(file, 'utf8').catch(error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return undefined;
+      } throw error;
+    });
+    if (existing !== undefined && existing !== text) {
+      throw new WorkerError('board_malformed', 'Task board namespace identity differs from this canonical root.');
+    }
+    if (existing === undefined) {
+      await atomicWrite(file, text);
+    }
+  }
+  private async commit(draft: BoardData, authorize?: () => void): Promise<void> {
+    // Older non-strict board readers must reject expiry metadata instead of
+    // stripping it and making retired request IDs eligible for fresh effects.
+    // Once expiry metadata is published the board never downgrades, so clearing
+    // a finished deletion intent cannot make an older host accept retired IDs.
+    if (draft.schema === 2 || draft.receiptEpochs || draft.receiptArchives || draft.receiptArchiveDeletes?.length || draft.receiptArchivePublications?.length || draft.referenceHistory) {
+      draft.schema = 2;
+    }
     boardDataSchema.parse(draft);
     this.validateGraph(draft);
     this.mutationGuard?.();
-    await atomicWrite(this.file, JSON.stringify(draft));
+    await this.ensureNamespace();
+    // The caller's per-mutation authorization is re-applied immediately before
+    // the rename, so a paused assignment can never be published after it was
+    // revoked.
+    await atomicWrite(this.file, JSON.stringify(draft), 0o600, () => {
+      this.mutationGuard?.();
+      authorize?.();
+    });
+    this.data = draft;
+  }
+
+  /**
+   * Commits only the durable publication intent. The intent adds one validated
+   * record to a board document that was already validated when it was adopted,
+   * so the historical receipt graph is not re-validated here; the final epoch
+   * mutation still goes through commit().
+   */
+  private async commitPublicationIntent(draft: BoardData): Promise<void> {
+    draft.schema = 2;
+    boardDataSchema.parse(draft);
+    this.mutationGuard?.();
+    await this.ensureNamespace();
+    await atomicWrite(this.file, JSON.stringify(draft), 0o600, () => this.mutationGuard?.());
     this.data = draft;
   }
 
@@ -441,10 +507,12 @@ export class TaskBoard {
     return this.mutex.run(async () => {
       const data = this.requireOpen();
       this.mutationGuard?.();
+      const owner = actor.kind === 'coordinator' ? actor.ownerId : this.worker(actor.workerId)?.ownerId ?? actor.workerId;
       const actorId = actor.kind === 'coordinator' ? actor.ownerId : actor.workerId;
       const key = digest([actor.kind, actorId, input.requestId]);
       const fingerprint = digest([name, resource, canonical(input)]);
       const recorded = data.requests[key];
+      assertRequestEpoch(data, owner, input.requestId, key, recorded !== undefined, this.requestIdPolicy);
       if (recorded) {
         authorize(data);
         if (recorded.fingerprint !== fingerprint) {
@@ -461,11 +529,312 @@ export class TaskBoard {
       const result = run(draft);
       guard?.();
       draft.requests[key] = { fingerprint, result: structuredClone(result), at: new Date().toISOString() };
-      await this.commit(draft);
+      await this.commit(draft, guard);
       return structuredClone(result);
     });
   }
 
+  hasRequest(ownerId: string, requestId: string): boolean {
+    return this.requireOpen().requests[digest(['coordinator', ownerId, requestId])] !== undefined;
+  }
+  requestId(ownerId: string, key: string): string {
+    return epochRequest(this.requireOpen(), ownerId, key);
+  }
+  assertRequest(ownerId: string, requestId: string): void {
+    assertRequestEpoch(this.requireOpen(), ownerId, requestId, undefined, false, this.requestIdPolicy);
+  }
+  epoch(ownerId: string): number {
+    return currentEpoch(this.requireOpen(), ownerId);
+  }
+  /** Recomputes the immutable reference identities one archived receipt set contributes. */
+  private referenceHistoryFor(data: BoardData, selected: BoardData['requests']): BoardData['referenceHistory'] {
+    const history = new Map((data.referenceHistory ?? []).map(entry => [digest([entry.taskId, entry.kind, entry.ref.id, entry.ref.version]), entry]));
+    for (const receipt of Object.values(selected)) {
+      const task = taskSchema.safeParse(receipt.result);
+      if (!task.success) {
+        continue;
+      }
+      for (const [kind, refs] of [['candidate', task.data.candidates], ['contract', task.data.agreedContracts], ['report', task.data.validations.flatMap(v => v.resultRef ? [v.resultRef] : [])]] as const) {
+        for (const ref of refs) {
+          history.set(digest([task.data.id, kind, ref.id, ref.version]), { taskId: task.data.id, kind, ref });
+        }
+      }
+    }
+    if (history.size > 8192) {
+      throw new WorkerError('receipt_capacity', '8192 immutable reference identities are retained. Keep this board read-only and start a new team namespace in a separate canonical project; identities cannot be erased for capacity.');
+    }
+    return [...history.values()];
+  }
+
+  /** Archive records still reserved by a pending publication intent cannot be reused by another epoch. */
+  private reservedArchiveRecords(pending: readonly ReceiptArchivePublication[]): number {
+    return pending.reduce((total, intent) => total + intent.archives.length, 0);
+  }
+
+  /** Removes exactly one completed intent; every other owner keeps its own. */
+  private clearArchivePublication(draft: BoardData, publication: ReceiptArchivePublication): void {
+    const left = (draft.receiptArchivePublications ?? []).filter(intent => intent.namespace !== publication.namespace
+      || intent.ownerId !== publication.ownerId || intent.fromEpoch !== publication.fromEpoch);
+    if (left.length) {
+      draft.receiptArchivePublications = left;
+    } else {
+      delete draft.receiptArchivePublications;
+    }
+  }
+
+  /**
+   * Applies the frozen epoch/owner mutation of one publication intent. It only
+   * removes the exact archived receipts, advances that owner's epoch, records
+   * the published parts and clears that one intent, so a replay of the same
+   * intent converges instead of re-planning against a changed receipt set.
+   * Receipts accepted after the intent stay live and replayable.
+   */
+  private applyArchivePublication(draft: BoardData, publication: ReceiptArchivePublication, selected: BoardData['requests'], archives: ReceiptArchive[], referenceHistory: BoardData['referenceHistory']): void {
+    draft.legacyRequestKeys ??= Object.keys(draft.requests);
+    for (const key of Object.keys(selected)) {
+      delete draft.requests[key];
+    }
+    (draft.receiptEpochs ??= {})[digest(publication.ownerId)] = publication.toEpoch;
+    (draft.receiptArchives ??= []).push(...archives);
+    draft.referenceHistory = referenceHistory;
+    this.clearArchivePublication(draft, publication);
+  }
+
+  private rolloverResult(epoch: number, archives: ReceiptArchive[], retained: number, replay: boolean): Record<string, unknown> {
+    return { epoch, prefix: 'e' + epoch + ':', archives, archive: archives.length === 1 ? archives[0] : undefined, retainedUnscopedLegacyReceipts: retained, ...(replay ? { replay: true, resumed: true } : {}) };
+  }
+
+  /**
+   * Completes one owner's durable publication intent: only its missing parts are
+   * opened, its frozen receipt selection is archived, and its exact epoch
+   * advance is committed. Parts opened before an interruption stay named by that
+   * intent, so a bounded file is never orphaned; receipts accepted after the
+   * intent stay live and replayable.
+   */
+  private async resumeArchivePublication(publication: ReceiptArchivePublication): Promise<{ archives: ReceiptArchive[]; retained: number }> {
+    // A pending-intent retry is the same durable filesystem phase as a fresh
+    // rollover, so it takes the same store write fence before any missing part
+    // is opened, published or committed.
+    return this.withStorageWrite(async () => {
+      const data = this.requireOpen();
+      if (publication.namespace !== digest(this.root) || currentEpoch(data, publication.ownerId) !== publication.fromEpoch) {
+        throw new WorkerError('receipt_corrupt', 'The pending receipt archive publication does not match this board or its durable receipt epoch; inspect this store before rolling over.');
+      }
+      const selected = selectPublicationReceipts(publication, data.requests);
+      const referenceHistory = this.referenceHistoryFor(data, selected);
+      const others = (data.receiptArchivePublications ?? []).filter(intent => intent.namespace !== publication.namespace
+        || intent.ownerId !== publication.ownerId || intent.fromEpoch !== publication.fromEpoch);
+      const records = MAX_RECEIPT_ARCHIVE_FILES - (data.receiptArchives?.length ?? 0) - (data.receiptArchiveDeletes?.length ?? 0) - this.reservedArchiveRecords(others);
+      const archives = await publishArchivePublication(path.join(this.directory, 'board-retention'), publication, selected, records);
+      const draft = structuredClone(this.requireOpen());
+      this.applyArchivePublication(draft, publication, selected, archives, referenceHistory);
+      await this.commit(draft);
+      return { archives, retained: Object.keys(draft.requests).length };
+    });
+  }
+
+  /**
+   * `enroll` is the lifecycle host's optional first-time durable registration. It
+   * runs INSIDE this board's mutex at the start of the durable phase - after the
+   * epoch, pending-intent, replay and capacity checks - and before the one whole
+   * filesystem write fence, so a refused rollover enrolls nothing. It is handed
+   * the read-only archive preflight and runs it ONLY while this store is not yet
+   * registered, so a physical archive refusal leaves no registration and no
+   * aggregate row, while an already registered store pays no second archive
+   * preparation. A direct domain caller that omits it keeps the original
+   * behavior.
+   */
+  async rolloverReceipts(ownerId: string, expectedEpoch: number, enroll?: (check: () => Promise<void>) => Promise<void>): Promise<unknown> {
+    return this.mutex.run(async () => {
+      const data = this.requireOpen(); this.mutationGuard?.();
+      const epoch = currentEpoch(data, ownerId);
+      const pending = data.receiptArchivePublications ?? [];
+      // A pending intent belongs to its initiating owner and exact fromEpoch: no
+      // other owner and no other epoch may publish under its authority.
+      const own = pending.find(intent => intent.namespace === digest(this.root) && intent.ownerId === ownerId);
+      if (own) {
+        if (own.fromEpoch !== expectedEpoch || epoch !== expectedEpoch) {
+          throw new WorkerError('revision_conflict', `This owner still has a pending receipt archive publication for epoch ${own.fromEpoch}. Retry the rollover with expectedEpoch ${own.fromEpoch} to finish it; no other epoch can be published first.`);
+        }
+        // Recovering a durable pending publication follows the same first
+        // registration rule: this exact owner and epoch were accepted above, so it
+        // enrolls before the store write fence resumes the publication. A store that
+        // is not registered yet first revalidates its own frozen archive read-only.
+        await enroll?.(() => {
+          const frozen = selectPublicationReceipts(own, data.requests);
+          const others = pending.filter(intent => intent.namespace !== own.namespace
+            || intent.ownerId !== own.ownerId || intent.fromEpoch !== own.fromEpoch);
+          const records = MAX_RECEIPT_ARCHIVE_FILES - (data.receiptArchives?.length ?? 0) - (data.receiptArchiveDeletes?.length ?? 0) - this.reservedArchiveRecords(others);
+          return preflightArchivePublication(path.join(this.directory, 'board-retention'), own, frozen, records);
+        });
+        const resumed = await this.resumeArchivePublication(own);
+        return this.rolloverResult(own.toEpoch, resumed.archives, resumed.retained, true);
+      }
+      if (epoch === expectedEpoch + 1) {
+        return { epoch, replay: true, retainedUnscopedLegacyReceipts: Object.keys(data.requests).length };
+      }
+      if (epoch !== expectedEpoch || !Number.isSafeInteger(epoch + 1)) {
+        throw new WorkerError('revision_conflict', 'Receipt epoch changed; inspect before rolling over.');
+      }
+      // One epoch can need several deterministic parts, so the record and
+      // directory caps are checked before any part is published. Records already
+      // reserved by any owner's pending intent stay unavailable here.
+      const archiveCapacity = MAX_RECEIPT_ARCHIVE_FILES - (data.receiptArchives?.length ?? 0) - (data.receiptArchiveDeletes?.length ?? 0) - this.reservedArchiveRecords(pending);
+      if (archiveCapacity < 1) {
+        throw new WorkerError('receipt_capacity', `${MAX_RECEIPT_ARCHIVE_FILES} receipt archives are retained, pending deletion or reserved by ${pending.length} pending publication(s). Finish that owner's rollover or collect unreferenced archives before rollover.`);
+      }
+      const selected: BoardData['requests'] = {};
+      for (const [key, receipt] of Object.entries(data.requests)) {
+        const team = teamSchema.safeParse(receipt.result); const task = taskSchema.safeParse(receipt.result);
+        const owner = team.success ? team.data.coordinatorOwnerId : task.success ? this.findTeam(data, task.data.teamId).coordinatorOwnerId : undefined;
+        if (owner !== ownerId) {
+          continue;
+        }
+        selected[key] = receipt;
+      }
+      const referenceHistory = this.referenceHistoryFor(data, selected);
+      const publication = planArchivePublication(digest(this.root), ownerId, epoch, selected);
+      if (publication.archives.length > archiveCapacity) {
+        throw new WorkerError('receipt_capacity', `Receipt archive records are bounded to ${MAX_RECEIPT_ARCHIVE_FILES} and only ${archiveCapacity} remain, but this epoch needs ${publication.archives.length} parts. Collect unreferenced expired archives before rollover; no requests were expired and no archive part was published.`);
+      }
+      const folder = path.join(this.directory, 'board-retention');
+      // A physical archive refusal must not register this store, so the whole
+      // read-only archive preflight is handed to the host: it runs under this mutex
+      // and BEFORE any first registration, never for an already registered store.
+      await enroll?.(() => preflightArchivePublication(folder, publication, selected, archiveCapacity));
+      // Every bound is proven before the intent is durable and before any part
+      // is opened, so a rejected rollover leaves no metadata and no file. The
+      // durable filesystem phase - preflight, publication intent, every archive
+      // part and the epoch commit - runs under ONE store write fence, and no
+      // resource admission runs inside it: a reclaiming rollover never waits for
+      // a permit, so it stays available when the lane is exhausted. The read-only
+      // preflight above proved this archive directory usable while the store was
+      // still unregistered; the fenced preflight revalidates it under this same
+      // single fence before the intent becomes durable.
+      const committed = await this.withStorageWrite(async () => {
+        await preflightArchivePublication(folder, publication, selected, archiveCapacity);
+        const intent = structuredClone(data);
+        intent.receiptArchivePublications = [...pending, publication];
+        await this.commitPublicationIntent(intent);
+        // Parts are opened only after the intent is durable. An interruption from
+        // here on is recoverable by this owner's exact retry, never an orphan file.
+        const archives = await publishArchivePublication(folder, publication, selected, archiveCapacity);
+        const draft = structuredClone(this.requireOpen());
+        this.applyArchivePublication(draft, publication, selected, archives, referenceHistory);
+        await this.commit(draft);
+        return { archives, retained: Object.keys(draft.requests).length };
+      });
+      return this.rolloverResult(epoch + 1, committed.archives, committed.retained, false);
+    });
+  }
+
+  async collectReceiptArchives(ownerId: string, retained: ReadonlySet<string>): Promise<number> {
+    return this.mutex.run(async () => {
+      const data = this.requireOpen();
+      const folder = path.join(this.directory, 'board-retention');
+      const keep = new Set([...retained, ...this.retainedUris()]);
+      const pending = data.receiptArchiveDeletes ?? [];
+      // Only this owner's proven-unretained entries are completed. Another
+      // owner's intent, and any identity still pinned or referenced here, stay
+      // published for its own explicit retry after the reference is released.
+      const others = pending.filter(archive => archive.ownerId !== ownerId);
+      const retainedIntent = pending.filter(archive => archive.ownerId === ownerId && keep.has(archive.uri));
+      const work = pending.filter(archive => archive.ownerId === ownerId && !keep.has(archive.uri));
+      const removed = (data.receiptArchives ?? []).filter(archive => archive.ownerId === ownerId && !keep.has(archive.uri));
+      for (const archive of removed) {
+        if (!work.some(done => done.hash === archive.hash)) {
+          work.push(archive);
+        }
+      }
+      const intent = [...others, ...retainedIntent, ...work];
+      if (intent.length > MAX_RECEIPT_ARCHIVE_FILES) {
+        throw new WorkerError('receipt_capacity', 'Archive deletions for this board are already pending. Retry this collection to finish them before removing more archives.');
+      }
+      if (!removed.length && !work.length) {
+        return 0;
+      }
+      // Durable intent published with the reference removal; a crash after this
+      // point leaves exact recoverable identities, never unreachable files.
+      const draft = structuredClone(data);
+      if (removed.length) {
+        draft.receiptArchives = (data.receiptArchives ?? []).filter(archive => !removed.some(r => r.hash === archive.hash));
+      }
+      if (intent.length) {
+        draft.receiptArchiveDeletes = intent;
+      } else {
+        delete draft.receiptArchiveDeletes;
+      }
+      await this.commit(draft);
+      if (!work.length) {
+        return 0;
+      }
+      // Verified, scoped unlink of exactly the unreferenced identities.
+      const outcome = await completeArchiveDeletions(folder, work);
+      const left = [...others, ...retainedIntent, ...outcome.remaining];
+      const final = structuredClone(this.requireOpen());
+      if (left.length) {
+        final.receiptArchiveDeletes = left;
+      } else {
+        delete final.receiptArchiveDeletes;
+      }
+      await this.commit(final);
+      if (outcome.remaining.length) {
+        throw new WorkerError('receipt_unavailable', `Receipt archive cleanup could not finish ${outcome.remaining.length} pending deletion(s) in ${folder}. The immutable intent was kept; retry this collection after restoring access. ${outcome.diagnostics.join(' ')}`, true);
+      }
+      return outcome.deleted.length;
+    });
+  }
+  async withReferences<T>(action: (uris: Set<string>) => Promise<T>): Promise<T> {
+    return this.mutex.run(async () => action(this.retainedUris()));
+  }
+  retainedUris(): Set<string> {
+    const data = this.requireOpen(); const uris = new Set<string>();
+    for (const task of data.tasks) {
+      for (const ref of [...task.candidates, ...task.agreedContracts, ...task.validations.flatMap(v => v.resultRef ? [v.resultRef] : [])]) {
+        uris.add(ref.uri);
+      }
+    }
+    for (const receipt of Object.values(data.requests)) {
+      const task = taskSchema.safeParse(receipt.result);
+      if (task.success) {
+        for (const ref of [...task.data.candidates, ...task.data.agreedContracts, ...task.data.validations.flatMap(v => v.resultRef ? [v.resultRef] : [])]) {
+          uris.add(ref.uri);
+        }
+      }
+    }
+    return uris;
+  }
+  /** Atomic, explicit coordinator setup; never inference or task planning. */
+  async assignStartup(ownerId: string, input: { requestId: string; teamId: string; taskId: string; workerId: string; teamRevision: number; taskRevision: number }, guard?: () => void): Promise<BoardTask> {
+    const actor = boardActor.parse({ kind: 'coordinator', ownerId });
+    return this.mutate(actor, 'assignStartup', 'task:' + input.taskId, input,
+      data => {
+        const team = this.findTeam(data, input.teamId);
+        if (team.coordinatorOwnerId !== ownerId) {
+          throw new WorkerError('forbidden', 'Startup team belongs to another coordinator.');
+        }
+        this.requireEligibleMember(team, input.workerId);
+      }, data => {
+        const team = this.findTeam(data, input.teamId); const task = this.findTask(data, input.taskId);
+        if (task.teamId !== team.id || team.revision !== input.teamRevision || task.revision !== input.taskRevision) {
+          throw new WorkerError('revision_conflict', 'Startup team/task changed. Inspect setup; the original request remains stopped.');
+        }
+        if (task.state !== 'ready' || (task.assigneeWorkerId && task.assigneeWorkerId !== input.workerId)
+          || this.busyTask(data, input.workerId)) {
+          throw new WorkerError('assignment_conflict', 'Startup requires a ready, unassigned task and an unoccupied worker.');
+        }
+        if (!team.memberWorkerIds.includes(input.workerId)) {
+          if (team.memberWorkerIds.length >= limits.members) {
+            throw new WorkerError('capacity_exceeded', 'Team member limit reached.');
+          }
+          team.memberWorkerIds.push(input.workerId); team.revision++; team.updatedAt = new Date().toISOString();
+          this.pushHistory(team.history, actor, { revision: team.revision, reason: 'isolated startup membership' });
+        }
+        task.assigneeWorkerId = input.workerId; task.revision++; task.updatedAt = new Date().toISOString();
+        this.pushHistory(task.history, actor, { revision: task.revision, reason: 'isolated startup assignment' });
+        return task;
+      }, taskSchema, guard);
+  }
   async createTeam(actor: BoardActor, input: TeamCreateInput): Promise<Team> {
     const trusted = boardActor.parse(actor);
     const parsed = teamCreateInput.parse(input);

@@ -13,8 +13,10 @@ import { captureProject } from './project-snapshot';
 import { RunnerExecution } from './runner-execution';
 import type { RunnerCommandResult } from './runner-results';
 import type { RunnerPoolCleanupResult, RunnerPoolStatus } from './runner-pool';
+import { EvidenceRetention } from './evidence-retention';
 import { digest, SessionStore } from './storage';
 import { Session, Settings, WorkerError, WorkspaceTools } from './types';
+import type { RunnerAdmission } from './resource-governor';
 import type { WorkerEngine } from './engine';
 import type { ToolResult } from './api';
 import { fileToolSchemas } from './workspace-tools';
@@ -88,6 +90,7 @@ type RunnerStatusArgs = { ownerId: string; teamId: string; kind: 'leases' | 'que
 
 /** Lazy lifecycle handle, always drained before its SessionStore owner unlocks. */
 export class IsolatedViewHost {
+  readonly evidence: EvidenceRetention;
   private views?: IsolatedViews;
   private opening?: Promise<IsolatedViews>;
   private runners?: RunnerExecution;
@@ -99,6 +102,10 @@ export class IsolatedViewHost {
     private readonly store: SessionStore,
     private readonly board: IsolationBoard,
     private readonly options: {
+      governanceEnabled?: () => boolean;
+      withStorageWrite?: <T>(action: () => Promise<T>) => Promise<T>;
+      admission?: RunnerAdmission;
+      onRunnerPhase?: (workerId: string, reason?: 'approval' | 'runner_capacity') => Promise<void>;
       enabled: () => boolean;
       guard: () => void;
       canWrite: () => boolean;
@@ -111,7 +118,9 @@ export class IsolatedViewHost {
       /** Existing five-argument approval callback; the adapter adds runner context. */
       approveCommand?: (command: string, cwd: string, signal: AbortSignal, workspaceRoot: string, context?: CommandApprovalContext) => Promise<boolean>;
     }
-  ) {}
+  ) {
+    this.evidence = new EvidenceRetention(store.directory);
+  }
 
   private commitGuard = (): void => {
     if (this.closing) {
@@ -127,6 +136,11 @@ export class IsolatedViewHost {
     this.commitGuard();
     this.opening ??= (async () => {
       const views = new IsolatedViews(path.join(this.store.directory, 'isolated-views'), this.root, {
+        withStorageWrite: this.options.withStorageWrite,
+        // Live, trusted and re-read per request - exactly the same source as the
+        // governed-runner branch below - so an ungoverned namespace may use its
+        // own epoch-looking request IDs. A request argument can never widen this.
+        governanceEnabled: this.options.governanceEnabled,
         guard: this.commitGuard, expectExisting: this.store.list().some(session => session.isolatedView !== undefined)
       });
       try {
@@ -271,18 +285,32 @@ export class IsolatedViewHost {
       const config = this.runnerConfig();
       const manager = new RunnerExecution(this.runnerDirectory, this.root, {
         capacity: config.capacity,
+        withStorageWrite: this.options.withStorageWrite,
+        admission: this.options.admission,
+        retainInputs: owner => !!this.store.get(owner.workerId).startup,
+        inputRequestId: (owner, key) => this.views!.requestId(owner.ownerId, key),
         maxQueue: config.maxQueue,
         guard: this.runnerLifetimeGuard,
         // Always callable: without an approval surface it simply declines, so
         // observation and reconciliation never depend on one. Execution is
         // gated separately, where a missing surface is a hard error.
         approveCommand: async (request, signal) => {
+          const owner = manager.status().pool?.leases.find(l => l.directory === request.executionRoot)?.owner;
+          if (owner) {
+            await this.options.onRunnerPhase?.(owner.workerId, 'approval');
+          }
           const approve = this.options.approveCommand;
-          return approve === undefined
-            ? false
-            : approve(request.command, request.cwd, signal, request.logicalRoot, {
-              kind: 'isolated-runner', executionRoot: request.executionRoot, inputVersion: request.inputVersion
-            });
+          try {
+            return approve === undefined
+              ? false
+              : await approve(request.command, request.cwd, signal, request.logicalRoot, {
+                kind: 'isolated-runner', executionRoot: request.executionRoot, inputVersion: request.inputVersion
+              });
+          } finally {
+            if (owner) {
+              await this.options.onRunnerPhase?.(owner.workerId);
+            }
+          }
         }
       });
       this.openingRunners = (async () => {
@@ -318,7 +346,7 @@ export class IsolatedViewHost {
       authorize?.();
       const current = this.store.get(original.id);
       if (current.createdAt !== original.createdAt || current.ownerId !== original.ownerId || current.workspaceRoot !== this.root
-        || current.schema !== 2 || !current.isolatedView || !original.isolatedView || !sameBinding(current.isolatedView, original.isolatedView)) {
+        || (current.schema !== 2 && current.schema !== 3) || !current.isolatedView || !original.isolatedView || !sameBinding(current.isolatedView, original.isolatedView)) {
         throw new WorkerError('isolation_unavailable', 'This worker instance no longer has its original private binding.');
       }
       if (checkModel) {
@@ -341,7 +369,7 @@ export class IsolatedViewHost {
 
   /** The constructor identity is trusted; editable tool arguments cannot replace it. */
   scoped(session: Session): WorkspaceTools {
-    if (!session.isolatedView || session.schema !== 2 || !session.ownerId) {
+    if (!session.isolatedView || (session.schema !== 2 && session.schema !== 3) || !session.ownerId) {
       throw new WorkerError('isolation_unavailable', 'A private worker requires its permanent binding and owner identity.');
     }
     const identity: IsolatedViewIdentity = { ownerId: session.ownerId, workerId: session.id, workerCreatedAt: session.createdAt };
@@ -350,6 +378,7 @@ export class IsolatedViewHost {
       withView: async (...args) => (await this.open()).withView(...args),
       edit: async (...args) => (await this.open()).edit(...args),
       seal: async (...args) => (await this.open()).seal(...args),
+      withSealedInput: async (...args) => (await this.open()).withSealedInput(...args),
       status: async (...args) => (await this.open()).status(...args)
     };
     const guard = this.workerGuard(session);
@@ -673,7 +702,10 @@ export class IsolatedViewHost {
             if (draft.isolatedView && !sameBinding(draft.isolatedView, marker)) {
               throw new WorkerError('isolation_conflict', 'This worker already has a permanent binding to another snapshot.');
             }
-            draft.schema = 2;
+            if (draft.startup && (draft.startup.snapshotId !== marker.snapshotId || draft.startup.teamId !== marker.teamId)) {
+              throw new WorkerError('isolation_conflict', 'Governed setup cannot bind a different team or snapshot.');
+            }
+            draft.schema = draft.startup ? 3 : 2;
             draft.isolatedView = { ...marker };
           }, bindingGuard);
         }, bindingGuard);
@@ -713,11 +745,128 @@ export class IsolatedViewHost {
       return viewResponse(await views.pin(isolatedViewSchemas.subagent_view_pin.parse(input), guard));
     }
     if (name === 'subagent_view_release') {
-      return viewResponse(await views.release(isolatedViewSchemas.subagent_view_release.parse(input), guard, id => this.presence(id)));
+      return viewResponse(await this.withReferences(retained => views.release(isolatedViewSchemas.subagent_view_release.parse(input), guard, id => this.presence(id), retained)));
     }
-    return viewResponse(await views.cleanup(isolatedViewSchemas.subagent_view_cleanup.parse(input), id => this.presence(id), guard));
+    return viewResponse(await this.withReferences(retained => views.cleanup(isolatedViewSchemas.subagent_view_cleanup.parse(input), id => this.presence(id), guard, retained)));
   }
 
+  async hasReceipt(name: string, input: unknown): Promise<boolean> {
+    if (!input || typeof input !== 'object') {
+      return false;
+    }
+    const a = input as Record<string, unknown>;
+    if (typeof a.ownerId !== 'string' || typeof a.requestId !== 'string') {
+      return false;
+    }
+    if (!this.views && !await fs.lstat(path.join(this.store.directory, 'isolated-views', 'index.json')).then(() => true, () => false)) {
+      return false;
+    }
+    const views = await this.open(); let key: string | undefined;
+    if (name === 'subagent_snapshot_create') {
+      key = digest(['create', views.namespace, a.ownerId, a.requestId]);
+    } else if (name === 'subagent_view_pin') {
+      key = digest(['pin', views.namespace, a.ownerId, a.teamId, a.requestId]);
+    } else if (typeof a.id === 'string') {
+      let session: Session;
+      try {
+        session = this.store.get(a.id);
+      } catch {
+        return false;
+      }
+      if (name === 'subagent_view_bind') {
+        key = digest(['bind', views.namespace, session.id, session.createdAt, a.requestId]);
+      } else if (name === 'subagent_view_seal' && session.isolatedView) {
+        key = digest(['seal', views.namespace, session.isolatedView.overlayId, a.ownerId, a.requestId]);
+      }
+    }
+    return key !== undefined && views.hasReceipt(key);
+  }
+  async assertEvidence(input: { ownerId: string; teamId: string; uri: string }, engine: WorkerEngine, signal?: AbortSignal): Promise<void> {
+    if (input.uri.startsWith('urn:codex-runner-result:')) {
+      const manager = await this.runnerStore();
+      const id = input.uri.split(':').at(-1)!;
+      if (!manager || manager.results.get(id, { ownerId: input.ownerId, teamId: input.teamId }).uri !== input.uri) {
+        throw new WorkerError('retention_missing', 'Result is unavailable in this scope.');
+      }
+    } else if (input.uri.startsWith('codex-subagent://submission/')) {
+      const views = await this.open(); const parts = input.uri.split('/');
+      const id = parts.at(-2)!;
+      await views.withSubmission(input.ownerId, input.teamId, id, (_view, submission) => {
+        if (submission.uri !== input.uri) {
+          throw new WorkerError('retention_missing', 'Submission URI/version differs.');
+        }
+      });
+    }
+    void engine; signal?.throwIfAborted();
+  }
+  private async withReferences<T>(action: (uris: () => ReadonlySet<string>) => Promise<T>): Promise<T> {
+    const governed = await this.store.hasGovernedHistory() || await this.evidence.exists() || this.options.governanceEnabled?.() === true;
+    if (!governed) {
+      return action(() => new Set());
+    }
+    return this.evidence.withReferences(pins => this.board.open().then(board => board.withReferences(async references => {
+      const retained = new Set([...pins, ...references]);
+      const manager = await this.runnerStore();
+      // Resolve runner edges only after the view mutex is acquired. A command
+      // can publish its pending record while this cleanup waits for that mutex.
+      return action(() => {
+        const current = this.runners ?? manager;
+        return current ? current.results.inputReferences(retained) : retained;
+      });
+    })));
+  }
+  async collectResources(scope: { ownerId: string; teamId: string }, ids: readonly string[], retained: ReadonlySet<string>): Promise<unknown> {
+    this.commitGuard(); await this.board.open(); this.board.assertTeam(scope.ownerId, scope.teamId);
+    const manager = await this.runnerStore();
+    if (!manager) {
+      return { removed: [], retained: [], leases: 0 };
+    }
+    const activeWorkers = new Set(this.store.list().filter(s => ['queued', 'running'].includes(s.state)).map(s => digest([s.id, s.createdAt])));
+    const board = await this.board.open();
+    for (const task of board.snapshot().tasks) {
+      if (task.assigneeWorkerId && ['ready', 'in_progress', 'submitted', 'validating'].includes(task.state)) {
+        activeWorkers.add(task.assigneeWorkerId);
+      }
+    }
+    // PROOF BEFORE DELETION. A durable result is the only exact evidence that a
+    // specific sealed submission was auto-sealed for one command, and this
+    // collection deletes that evidence. Each authorized, still-existing exact
+    // result id therefore proves its input first, durably and inside the view
+    // mutex, so the marker sweep below can resume with no ids - and after a
+    // crash, a throw or a reopen - even though the result is already gone. Only
+    // runner_results_not_found is skipped: a scope denial or any other failure
+    // still propagates before anything is deleted.
+    const views = await this.open();
+    const proofs: { id: string; uri: string }[] = [];
+    for (const id of new Set(ids)) {
+      let result: RunnerCommandResult;
+      try {
+        result = manager.results.get(id, scope);
+      } catch (error) {
+        if (error instanceof WorkerError && error.code === 'runner_results_not_found') {
+          continue;
+        }
+        throw error;
+      }
+      const artifact = result.attempt.inputArtifact;
+      if (artifact !== undefined) {
+        proofs.push({ id: artifact.id, uri: artifact.uri });
+      }
+    }
+    await views.proveRunnerInputs(scope, proofs, this.commitGuard);
+    const outcome = await manager.collect(scope, ids, retained, activeWorkers) as { removed: RunnerCommandResult[] };
+    // ONE marker sweep now handles the lifecycle leak, and it runs even with no
+    // result id at all: an abandoned governed setup can seal its exact input and
+    // fail before any attempt record owns it, and a collected result's input is
+    // proven above. Fresh references are resolved INSIDE the view mutex, after
+    // this collection committed, from the caller-held board/evidence references
+    // plus every durable pending/final attempt (adopted at their write commit
+    // point), and the sweep preserves native view pins itself. It commits one
+    // index update with no receipt, so a full receipt map cannot fail
+    // reclamation after a result was deleted.
+    const reclaimed = await views.reclaimInputs(scope, () => manager.results.inputReferences(retained), this.commitGuard);
+    return { ...outcome, reclaimed, removed: outcome.removed.map(result => ({ id: result.id, uri: result.uri, inputArtifact: result.attempt.inputArtifact })) };
+  }
   async assertWorkerUsable(session: Session, signal?: AbortSignal): Promise<void> {
     this.commitGuard();
     await this.board.open();

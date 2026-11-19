@@ -72,7 +72,7 @@ Implemented in the host runtime and the extension: the setting is read live thro
 - View and full records: the **Task Board** view renders bounded summaries only. `codexSubagent.openBoardRecord` reads the board summaries, takes the team's trusted `coordinatorOwnerId` from the record (never from UI input), and re-reads the team and task through `subagent_team_get`/`subagent_task_get`. The full JSON, including transition entries and reference URIs, opens read-only through the `codex-task-board-record` content-provider scheme, so nothing implies an editable or savable document.
 - Shutdown: root shutdown awaits `board.close()` before the `SessionStore` owner lock is released.
 
-Validation `resultRef` entries remain manual metadata: they record an id, version and URI without automatically fetching or verifying content. Opt-in [isolated file views](isolated-views.md) now provide shared immutable snapshots, private overlays, sealed submissions and explicit retention. Board references do not retain those artifacts automatically. Opt-in isolated runner execution for bound workers is implemented too (see below); integration, dispatch and peer messaging remain unimplemented. Subsequent consumers must pin exact artifacts and preserve the task/worker state separation.
+Validation `resultRef` entries remain manual metadata: they record an id, version and URI without automatically fetching or verifying content. Opt-in [isolated file views](isolated-views.md) now provide shared immutable snapshots, private overlays, sealed submissions and explicit retention. Governed view cleanup now treats current board references and retained evidence pins as retention roots; consumers must still pin exact inputs before use. Opt-in isolated runner execution for bound workers is implemented too (see below); integration, automatic dispatch and peer messaging remain unimplemented. Subsequent consumers must pin exact artifacts and preserve the task/worker state separation.
 
 ## Isolated runner workspaces
 
@@ -86,4 +86,22 @@ Isolated runner execution is a separate, opt-in service layered on the existing 
 - **Caches.** Only `npm`/`pip` download caches are reused. Installed dependencies, build output and temporary directories are fresh per slot, so a run never inherits another run's tree, and nothing installs without approval; combine steps inside one approved command (for example `npm ci && npm test`).
 - **Containment.** Windows uses a Job Object with a suspended assign, no breakaway and an active-zero drain proof; POSIX uses an owned process group plus an inherited marker discovered through readable `/proc` or `ps`. Incomplete or failed scans quarantine instead of guessing, no path kills by bare PID, and runtime identity is validated before recovery. Deliberately scrubbed environment values and changed OS identity are outside this contract: containment is not an OS sandbox.
 - **MCP surface.** `subagent_runner_status` pages leases, queue entries or result summaries for the caller's owner and team with a bounded summary block; `subagent_runner_result` returns one full immutable result plus derived current-revision and staleness fields that are null when the current index is unavailable, never rewriting the evidence; `subagent_runner_cleanup` reconciles the scope with no new command and carries a `destructiveHint` tool annotation so clients can warn before calling it.
-- **No automation.** No dispatch, integration, acceptance or peer messaging exists. A stored command result is evidence only: it is not an artifact pin and not a validation verdict, and a command that ran on one input revision never validates a later one.
+- **Coordinator control.** Governed step-4 startup now executes explicit create-bind-start decisions; no task planner, automatic integration/acceptance or peer messaging exists. A stored command result is evidence only: it is not an artifact pin and not a validation verdict, and a command that ran on one input revision never validates a later one.
+
+## Resource governance and create-bind-start
+
+Step 4 is implemented behind the User-only resources flag. Its
+[configuration and contracts](resource-governance.md) distinguish inference,
+runnable effects, dependency/message waits, physical runner ownership and
+retained storage. Schema-3 startup persists a non-runnable gate before the
+atomic board membership/assignment transaction and private-view binding. An
+OS-user ledger grants explicit coordinator decisions through fair eligible
+queues, reserves service capacity and retains uncertain ownership through
+cancellation/reload. Legacy schemas, histories and per-root pool dimensions
+remain supported.
+
+Owner receipt epochs, compressed archives, compact reference identity history,
+evidence pins and explicit collection bound metadata alongside content GC.
+Missing namespace documents fail closed and expired requests cannot become
+fresh mutations. Validation, integration and peer messaging remain subsequent
+stages with exact input revision, retention and explicit wakeup obligations.

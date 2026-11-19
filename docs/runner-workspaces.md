@@ -268,3 +268,24 @@ in 92.6 s; the production webpack build and `build:test` were clean;
 10 skips are platform- or privilege-specific: 2 POSIX engine cases, 1
 registration file-symlink privilege case, 1 POSIX `chmod` snapshot case and 6
 POSIX runner-process cases. No real VS Code `npm run test:host` run is claimed.
+
+## Governed lifecycle and reclamation (step 4)
+
+The optional [resource-governance workflow](resource-governance.md) creates,
+assigns and binds schema-3 workers before their first turn. Older hosts reject
+new governed sessions instead of treating incomplete setup as a legacy worker.
+Schema-1 workers and schema-2 explicitly bound workers keep their existing paths.
+
+Governed physical commands acquire an additional OS-user aggregate permit
+before a local slot is reserved. It lasts through setup, approval, import and
+cleanup. Quarantine stays charged until exact process proof permits release.
+A service reservation protects validation/integration in pools with at least
+two slots; capacity-one pools serialize. Pool dimensions still apply on reopen.
+Legacy runners keep their prior admission and approval behavior.
+
+Governed results carry an exact retained input submission in the optional
+`attempt.inputArtifact` field. Collection consults active work, board references
+and explicit evidence pins before deleting named final results or released lease
+history. Receipt epochs reclaim metadata without resetting immutable identities
+or replaying expired requests. These operations do not validate imports or
+implement integration.

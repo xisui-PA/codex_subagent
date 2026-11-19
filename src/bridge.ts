@@ -190,7 +190,7 @@ export async function forward(registry: string, cwd: string, name: string, args:
     });
     const requestedWait = args && typeof args === 'object' && 'timeoutMs' in args ? args.timeoutMs : undefined;
     const waitDeadlineMs = typeof requestedWait === 'number' && Number.isInteger(requestedWait) && requestedWait >= 0 && requestedWait <= MAX_WAIT_MS ? requestedWait : MAX_WAIT_MS;
-    const responseTimeoutMs = name === 'subagent_wait' ? Math.max(32_000, waitDeadlineMs + 10_000) : isSlowViewTool(name) ? 370_000 : 32_000;
+    const responseTimeoutMs = name === 'subagent_wait' ? Math.max(32_000, waitDeadlineMs + 10_000) : (isSlowViewTool(name) || ['subagent_isolated_spawn', 'subagent_resource_collect', 'subagent_metadata_rollover'].includes(name)) ? 370_000 : 32_000;
     req.setTimeout(responseTimeoutMs, () => req.destroy(new Error('Bridge timed out. Retry with the SAME requestId; work continues in VS Code.')));
     req.on('error', error => reject(new WorkerError('bridge_unavailable', `${error.message} Work may already be accepted. Retry with the SAME requestId.`, true)));
     req.end(body);

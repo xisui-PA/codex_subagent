@@ -113,6 +113,21 @@ function createCasSnapshot(fx, request, openDocuments) {
     }));
 }
 
+test('an expired sealed-input acknowledgement cannot publish a consumer for collected content', async t => {
+  const fx = await fixture(t); await fs.writeFile(path.join(fx.root, 'base.txt'), 'base');
+  const snapshot = await createCasSnapshot(fx, { ownerId: OWNER, teamId: TEAM, requestId: 'input-base', selectionKey: 'default' });
+  const binder = binderOf(fx, 'consumer', snapshot.id);
+  const record = await fx.views.bind(binder.input('input-bind'), async () => {});
+  const binding = { teamId: TEAM, snapshotId: snapshot.id, overlayId: record.overlayId };
+  const input = { requestId: 'input-seal', expectedRevision: 0 };
+  const sealed = await fx.views.seal(binding, binder.identity, input);
+  await fx.views.release({ ownerId: OWNER, teamId: TEAM, requestId: 'input-release', kind: 'submission', id: sealed.id });
+  await fx.views.cleanup({ ownerId: OWNER, teamId: TEAM, requestId: 'input-cleanup' });
+  let consumed = false;
+  await assert.rejects(fx.views.withSealedInput(binding, binder.identity, input, () => { consumed = true; }), e => e.code === 'isolation_released');
+  assert.equal(consumed, false); assert.equal((await fx.views.inspect(OWNER, TEAM)).submissions.length, 0);
+});
+
 test('1) shared non-Git snapshot: one capture, ACK replay, stable bytes, editor docs, sibling store', async t => {
   const fx = await fixture(t);
   await fs.writeFile(path.join(fx.root, 'base.txt'), 'base original\n');

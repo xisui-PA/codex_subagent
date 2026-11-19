@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { receiptArchiveDeletesSchema, receiptArchivePublicationsSchema, receiptArchiveSchema, receiptEpochsSchema } from './receipt-retention';
 
 /** Bounded sizes for every board record; the board enforces these instead of evicting silently. */
 export const limits = {
@@ -130,10 +131,18 @@ export const requestRecordSchema = z.object({
 export type RequestRecord = z.infer<typeof requestRecordSchema>;
 
 export const boardDataSchema = z.object({
-  schema: z.literal(1),
+  schema: z.union([z.literal(1), z.literal(2)]),
   workspaceRoot: z.string().min(1).max(limits.workspaceRoot),
   teams: boundedList(teamSchema, limits.teams),
   tasks: boundedList(taskSchema, limits.tasks),
+  receiptEpochs: receiptEpochsSchema.optional(),
+  legacyRequestKeys: z.array(z.string().min(1).max(400)).max(limits.requests).optional(),
+  receiptArchives: z.array(receiptArchiveSchema).max(64).optional(),
+  /** Durable archive-deletion intent; completed by a retry or the next open. */
+  receiptArchiveDeletes: receiptArchiveDeletesSchema.optional(),
+  /** Durable archive-publication intents (one per owner); each is completed only by that owner's exact rollover retry. */
+  receiptArchivePublications: receiptArchivePublicationsSchema.optional(),
+  referenceHistory: z.array(z.strictObject({ taskId: id32, kind: z.enum(['candidate', 'contract', 'report']), ref: refSchema })).max(8192).optional(),
   /** Keyed by a digest of [actor.kind, actorId, requestId]. Bounded; a full map is a capacity error, never silent eviction. */
   requests: z.record(z.string().min(1).max(400), requestRecordSchema).refine(
     value => Object.keys(value).length <= limits.requests,

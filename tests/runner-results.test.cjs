@@ -871,3 +871,294 @@ test('an uncommitted namespace temp after a hard crash recovers, and nothing els
   }
   await fs.rm(linkDirectory, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// Post-publication failures.
+//
+// A managed record commits at the rename inside `storage.atomicWrite`. A
+// storage write wrapper can still fail AFTER that rename -- while measuring or
+// accounting the write it just made. The record is durable at that point, so
+// the in-memory maps and the byte account must already describe it: otherwise
+// result references omit a durable pending attempt (and its sealed input could
+// be released while the next open recovers that very attempt) or hide a final
+// result that reads and a reopen would find. A write that never committed must
+// adopt nothing, so the same call can be retried.
+// ---------------------------------------------------------------------------
+
+/**
+ * A store whose injected storage write wrapper can fail exactly one publication
+ * AFTER the record is durable (`failOn`, 1-based count of committed writes) or
+ * before it runs at all (`failBefore`).
+ */
+async function makeFailureStore(t, options = {}) {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'runner-results-post-'));
+  const project = path.join(base, 'project');
+  const directory = path.join(base, 'store', 'results');
+  await fs.mkdir(project, { recursive: true });
+  const control = { failOn: 0, failBefore: false, publications: 0 };
+  const store = new RunnerResults(directory, project, {
+    ...options,
+    withStorageWrite: async action => {
+      if (control.failBefore) {
+        throw new Error('accounting failed before the write');
+      }
+      const value = await action();
+      control.publications += 1;
+      if (control.failOn !== 0 && control.publications === control.failOn) {
+        throw new Error('accounting failed after the write');
+      }
+      return value;
+    }
+  });
+  await store.open();
+  t.after(async () => {
+    await store.close().catch(() => undefined);
+    await fs.rm(base, { recursive: true, force: true });
+  });
+  return { base, project, directory, store, control };
+}
+
+/** A sealed-input artifact a result references for retention. */
+const sealedInput = label => ({ id: hex(`artifact:${label}`), version: 1, uri: `artifact://runner/results/${label}`, revision: 0 });
+
+test('a start that fails after publication adopts the durable pending attempt and its sealed input', async t => {
+  const { directory, store, control } = await makeFailureStore(t);
+  const inputArtifact = sealedInput('post-start');
+  const attempt = attemptFor(store, 'post-start', { inputArtifact });
+  const pendingFile = path.join(directory, 'pending', `${attempt.id}.json`);
+  assert.equal(attempt.inputArtifact.uri, inputArtifact.uri);
+
+  // The rename commits, then the wrapper fails: the caller sees the storage
+  // error, but the durable record must already be visible in memory.
+  control.failOn = control.publications + 1;
+  await assert.rejects(store.start(attempt), { code: 'runner_results_storage' });
+  assert.equal(await exists(pendingFile), true, 'the pending attempt is durable');
+  assert.deepEqual(await readJson(pendingFile).then(record => record.attempt), attempt, 'the durable attempt is the caller attempt');
+  assert.equal(store.status().pending, 1, 'the durable pending attempt is adopted despite the error');
+  assert.equal(store.status().results, 0);
+  assert.equal(store.inputReferences(new Set()).has(inputArtifact.uri), true,
+    'the adopted attempt still references its sealed input');
+  assert.equal(store.list(scopeOf('post-start')).total, 0, 'a pending attempt is never a final result');
+
+  // Adopted exactly once: the account is namespace + one pending record.
+  const pendingText = await fs.readFile(pendingFile, 'utf8');
+  const namespaceText = await fs.readFile(path.join(directory, 'namespace.json'), 'utf8');
+  assert.equal(store.status().totalBytes, Buffer.byteLength(namespaceText) + Buffer.byteLength(pendingText));
+
+  // A retry replays the adopted attempt and writes nothing new.
+  const replay = await store.start(attempt);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.state, 'pending');
+  assert.deepEqual(replay.attempt, attempt);
+  assert.equal(await fs.readFile(pendingFile, 'utf8'), pendingText, 'the pending bytes are unchanged by the replay');
+  assert.equal(store.status().pending, 1);
+  assert.equal(store.status().totalBytes, Buffer.byteLength(namespaceText) + Buffer.byteLength(pendingText));
+
+  // A write that never committed adopts nothing and stays retryable.
+  const unpublished = attemptFor(store, 'post-start-unpublished');
+  const unpublishedFile = path.join(directory, 'pending', `${unpublished.id}.json`);
+  control.failBefore = true;
+  await assert.rejects(store.start(unpublished), { code: 'runner_results_storage' });
+  assert.equal(await exists(unpublishedFile), false, 'a failed publication leaves no record on disk');
+  assert.equal(store.status().pending, 1, 'a failed publication adopts nothing');
+  control.failBefore = false;
+  const started = await store.start(unpublished);
+  assert.equal(started.replayed, false);
+  assert.equal(started.state, 'pending');
+  assert.equal(await exists(unpublishedFile), true);
+  assert.equal(store.status().pending, 2);
+});
+
+test('a finish that fails after publication adopts the immutable final, then retries cleanly', async t => {
+  const { project, directory, store, control } = await makeFailureStore(t);
+  const inputArtifact = sealedInput('post-finish');
+  const attempt = attemptFor(store, 'post-finish', { inputArtifact });
+  await store.start(attempt);
+  const pendingFile = path.join(directory, 'pending', `${attempt.id}.json`);
+  const resultFile = path.join(directory, 'results', `${attempt.id}.json`);
+  const pendingText = await fs.readFile(pendingFile, 'utf8');
+  const namespaceText = await fs.readFile(path.join(directory, 'namespace.json'), 'utf8');
+  const details = importedDetails(attempt);
+
+  control.failOn = control.publications + 1;
+  await assert.rejects(store.finish(attempt.id, details), { code: 'runner_results_storage' });
+  assert.equal(await exists(resultFile), true, 'the final result is durable');
+  const durable = await readJson(resultFile);
+  assert.equal(durable.outcome, 'succeeded');
+  assert.equal(durable.afterVersion.revision, 1);
+  const resultText = await fs.readFile(resultFile, 'utf8');
+
+  // The durable final is adopted: reads, references and the counts agree.
+  const adopted = store.get(attempt.id, scopeOf('post-finish'));
+  assert.equal(adopted.uri, durable.uri);
+  assert.equal(adopted.completedAt, durable.completedAt);
+  assert.equal(Object.isFrozen(adopted), true);
+  assert.equal(store.status().results, 1, 'the durable final is adopted despite the error');
+  assert.equal(store.status().pending, 1, 'the leftover pending waits for the retry or the next open');
+  assert.equal(await exists(pendingFile), true);
+  assert.equal(store.inputReferences(new Set()).has(inputArtifact.uri), true);
+  assert.equal(store.list(scopeOf('post-finish')).total, 1);
+
+  // Adopted exactly once: namespace + the pending + the final, no double count.
+  assert.equal(store.status().totalBytes,
+    Buffer.byteLength(namespaceText) + Buffer.byteLength(pendingText) + Buffer.byteLength(resultText));
+
+  // An exact retry is idempotent, never rewrites the final and drops the leftover.
+  const retried = await store.finish(attempt.id, details);
+  assert.deepEqual(retried, adopted);
+  assert.equal(await fs.readFile(resultFile, 'utf8'), resultText, 'the durable final is never rewritten');
+  assert.equal(await exists(pendingFile), false, 'the retry removes the leftover pending');
+  assert.equal(store.status().pending, 0);
+  assert.equal(store.status().results, 1);
+  assert.equal(store.status().totalBytes, Buffer.byteLength(namespaceText) + Buffer.byteLength(resultText));
+
+  // Conflicting final data still conflicts without an overwrite.
+  await assert.rejects(store.finish(attempt.id, { ...details, output: 'different' }), { code: 'runner_results_conflict' });
+  assert.equal(await fs.readFile(resultFile, 'utf8'), resultText);
+
+  // The adopted final is exactly what a fresh handle loads back.
+  const reread = new RunnerResults(directory, project);
+  await reread.open();
+  t.after(() => reread.close().catch(() => undefined));
+  assert.deepEqual(reread.get(attempt.id, scopeOf('post-finish')), adopted);
+  assert.equal(reread.status().totalBytes, store.status().totalBytes);
+});
+
+test('recovery keeps its durable uncertain final when its own storage write fails after publication', async t => {
+  const { project, directory, store } = await makeFailureStore(t);
+  const attempt = attemptFor(store, 'post-recovery');
+  await store.start(attempt);
+  const pendingFile = path.join(directory, 'pending', `${attempt.id}.json`);
+  const resultFile = path.join(directory, 'results', `${attempt.id}.json`);
+
+  // The recovery write commits and the wrapper then fails: open() must report
+  // the error and stay unusable, but the durable final is left for the next open.
+  const failing = new RunnerResults(directory, project, {
+    withStorageWrite: async action => {
+      await action();
+      throw new Error('accounting failed after the recovery write');
+    }
+  });
+  await assert.rejects(failing.open(), { code: 'runner_results_storage' });
+  await assert.rejects(failing.start(attempt), { code: 'runner_results_unavailable' }, 'a failed handle stays unusable');
+  assert.equal(await exists(resultFile), true, 'the recovered final is durable');
+  assert.equal(await exists(pendingFile), true, 'the pending file is removed only after a clean recovery write');
+
+  const reopened = new RunnerResults(directory, project);
+  await reopened.open();
+  t.after(() => reopened.close().catch(() => undefined));
+  const recovered = reopened.get(attempt.id, scopeOf('post-recovery'));
+  assert.equal(recovered.outcome, 'uncertain');
+  assert.equal(recovered.import, 'uncertain');
+  assert.deepEqual(recovered.attempt.inputVersion, attempt.inputVersion);
+  assert.equal(await exists(pendingFile), false, 'the next open drops the leftover pending of the durable final');
+  assert.equal(await exists(resultFile), true);
+  assert.equal(reopened.status().results, 1);
+  assert.equal(reopened.status().pending, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Replay-only reconciliation of an already adopted final.
+//
+// A caller whose finish() reported an error it cannot interpret (a storage write
+// wrapper that failed AFTER the rename committed) needs a lookup that can adopt
+// the durable record or say why it cannot -- and that can never publish.
+// ---------------------------------------------------------------------------
+
+test('replayFinal adopts only an exact scoped final and can never publish', async t => {
+  const { project, directory, store, control } = await makeFailureStore(t);
+  const attempt = attemptFor(store, 'replay');
+  const details = { outcome: 'failed', import: 'not_started', exitCode: 7, drained: true };
+  const pendingFile = path.join(directory, 'pending', `${attempt.id}.json`);
+  const resultFile = path.join(directory, 'results', `${attempt.id}.json`);
+
+  // Nothing durable yet: reported as missing, and nothing is written for it.
+  assert.deepEqual(await store.replayFinal(attempt.id, details, scopeOf('replay')), { status: 'missing', result: null });
+  assert.equal(await exists(pendingFile), false);
+  assert.equal(await exists(resultFile), false);
+  assert.equal(store.status().results, 0);
+  assert.equal(store.status().pending, 0);
+
+  // A pending attempt is not a final: still missing, and the pending is untouched.
+  await store.start(attempt);
+  const pendingText = await fs.readFile(pendingFile, 'utf8');
+  assert.deepEqual(await store.replayFinal(attempt.id, details, scopeOf('replay')), { status: 'missing', result: null });
+  assert.equal(await fs.readFile(pendingFile, 'utf8'), pendingText);
+  assert.equal(await exists(resultFile), false);
+  assert.equal(store.status().results, 0);
+
+  // The realistic state: the final write committed (and was adopted) while its
+  // write wrapper failed afterwards, so finish() threw and the pending stayed.
+  control.failOn = control.publications + 1;
+  await assert.rejects(store.finish(attempt.id, details), { code: 'runner_results_storage' });
+  const final = store.get(attempt.id, scopeOf('replay'));
+  const finalText = await fs.readFile(resultFile, 'utf8');
+  assert.equal(store.status().results, 1);
+  assert.equal(store.status().pending, 1, 'the leftover pending is still there');
+  assert.equal(await exists(pendingFile), true);
+
+  // Different final data conflicts, never overwrites.
+  assert.deepEqual(await store.replayFinal(attempt.id, { ...details, exitCode: 8 }, scopeOf('replay')),
+    { status: 'conflict', result: null });
+  // Another scope cannot adopt this record even with identical data.
+  assert.deepEqual(await store.replayFinal(attempt.id, details, { ownerId: 'owner-someone-else', teamId: TEAM }),
+    { status: 'conflict', result: null });
+  assert.equal(await fs.readFile(pendingFile, 'utf8'), pendingText, 'a refused replay removes nothing');
+  assert.equal(await fs.readFile(resultFile, 'utf8'), finalText);
+  // A malformed scope is refused exactly like every other scoped call.
+  await assert.rejects(store.replayFinal(attempt.id, details, { ownerId: '', teamId: TEAM }),
+    { code: 'invalid_runner_scope' });
+  assert.equal(await fs.readFile(pendingFile, 'utf8'), pendingText);
+  assert.equal(store.status().pending, 1);
+
+  // The exact replay adopts the durable final, drops the leftover pending and
+  // leaves the final bytes untouched.
+  const replay = await store.replayFinal(attempt.id, details, scopeOf('replay'));
+  assert.equal(replay.status, 'replayed');
+  assert.deepEqual(replay.result, final);
+  assert.equal(await fs.readFile(resultFile, 'utf8'), finalText, 'the durable final is never rewritten');
+  assert.equal(await exists(pendingFile), false, 'the leftover pending of the adopted final is dropped');
+  assert.equal(store.status().results, 1);
+  assert.equal(store.status().pending, 0);
+  // Idempotent: repeating it changes nothing.
+  assert.deepEqual(await store.replayFinal(attempt.id, details, scopeOf('replay')), replay);
+  assert.equal(await fs.readFile(resultFile, 'utf8'), finalText);
+
+  // A fresh handle reads back the very same final, so nothing was fabricated.
+  const reread = new RunnerResults(directory, project);
+  await reread.open();
+  t.after(() => reread.close().catch(() => undefined));
+  assert.deepEqual(reread.get(attempt.id, scopeOf('replay')), final);
+});
+
+test('an attempt whose lease id differs from its id still finishes and replays, but is not a runner replay', async t => {
+  const { directory, store } = await makeStore(t);
+  const leaseId = hex('lease:distinct', 32);
+  const attempt = attemptFor(store, 'distinct-lease', { leaseId });
+  assert.notEqual(attempt.leaseId, attempt.id, 'the fixtures really differ');
+  const details = { outcome: 'failed', import: 'not_started', exitCode: 3, drained: true };
+  const resultFile = path.join(directory, 'results', `${attempt.id}.json`);
+  await store.start(attempt);
+
+  // The low-level schema allows a stored lease id that differs from the attempt
+  // id, so the first finish must publish and keep that lease id verbatim.
+  const final = await store.finish(attempt.id, details);
+  assert.equal(final.id, attempt.id);
+  assert.equal(final.attempt.id, attempt.id);
+  assert.equal(final.attempt.leaseId, leaseId);
+  const finalText = await fs.readFile(resultFile, 'utf8');
+
+  // An exact ORDINARY finish replay still compares the canonical record and is
+  // idempotent for that valid shape, without rewriting anything.
+  assert.deepEqual(await store.finish(attempt.id, details), final);
+  assert.equal(await fs.readFile(resultFile, 'utf8'), finalText, 'the durable final is never rewritten');
+  assert.equal(store.status().results, 1);
+  assert.equal(store.status().pending, 0);
+
+  // The runner-specific replay requires id === leaseId, so this record conflicts
+  // even though the caller's scope matches.
+  assert.deepEqual(await store.replayFinal(attempt.id, details, scopeOf('distinct-lease')),
+    { status: 'conflict', result: null });
+  assert.equal(await fs.readFile(resultFile, 'utf8'), finalText);
+  assert.equal(store.status().results, 1);
+});

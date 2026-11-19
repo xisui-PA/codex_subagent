@@ -3,9 +3,10 @@ const { test } = require('node:test');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { TaskBoard } = require('../.test-build/task-board');
-const { limits } = require('../.test-build/task-board-types');
-const storage = require('../.test-build/storage');
+const buildDir = path.join(__dirname, '..', String(process.env.CODEX_TEST_BUILD || '.test-build').trim());
+const { TaskBoard } = require(path.join(buildDir, 'task-board'));
+const { limits } = require(path.join(buildDir, 'task-board-types'));
+const storage = require(path.join(buildDir, 'storage'));
 
 const coordinator = ownerId => ({ kind: 'coordinator', ownerId });
 const workerActor = workerId => ({ kind: 'worker', workerId });
@@ -577,4 +578,44 @@ test('close drains in-flight mutations then rejects new and queued calls', async
   await closing;
   assert.equal((JSON.parse(await fs.readFile(fx.file, 'utf8')).teams[0]).name, 'Draining');
   assert.throws(() => board.getTeam(co, team.id), { code: 'host_stopping' });
+});
+
+test('a revoked authorization aborts the board write immediately before the rename', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-board-guard-'));
+  const workspaceRoot = path.join(root, 'workspace');
+  const boardDir = path.join(root, 'sessions');
+  await fs.mkdir(workspaceRoot);
+  await fs.mkdir(boardDir);
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const workerId = w(9);
+  const workers = new Map([[workerId, { id: workerId, workspaceRoot, ownerId: 'co-1' }]]);
+  let boardGuardCalls = 0;
+  const board = new TaskBoard(boardDir, workspaceRoot, id => workers.get(id), () => { boardGuardCalls += 1; });
+  await board.open();
+  const co = coordinator('co-1');
+  const team = await board.createTeam(co, { requestId: 'g-team', name: 'Guard', description: '' });
+  const task = await board.createTask(co, { requestId: 'g-task', teamId: team.id, title: 'guarded', description: '' });
+  const file = path.join(boardDir, 'task-board.json');
+  const before = await fs.readFile(file, 'utf8');
+  const startup = { requestId: 'g-start', teamId: team.id, taskId: task.id, workerId, teamRevision: team.revision, taskRevision: task.revision };
+
+  // The isolated startup's own authorization is revoked after the in-memory
+  // checks, so only the pre-rename check can stop membership and assignment.
+  let authorizeCalls = 0;
+  const revoked = () => { authorizeCalls += 1; if (authorizeCalls >= 2) throw new Error('startup authorization revoked'); };
+  await assert.rejects(board.assignStartup('co-1', startup, revoked), /startup authorization revoked/);
+  assert.equal(authorizeCalls, 2, 'authorization is re-applied immediately before the rename');
+  assert.equal(await fs.readFile(file, 'utf8'), before, 'the revoked assignment was never published');
+  assert.deepEqual((await board.getTeam(co, team.id)).memberWorkerIds, []);
+  assert.equal((await board.getTask(co, task.id)).assigneeWorkerId, null);
+  assert.equal(board.hasRequest('co-1', 'g-start'), false);
+  assert.ok(boardGuardCalls > 0);
+
+  // The same paused assignment publishes when authorization still holds.
+  const allowed = await board.assignStartup('co-1', startup, () => { authorizeCalls += 1; });
+  assert.equal(allowed.assigneeWorkerId, workerId);
+  assert.deepEqual((await board.getTeam(co, team.id)).memberWorkerIds, [workerId]);
+  assert.equal((await board.getTask(co, task.id)).assigneeWorkerId, workerId);
+  assert.equal(board.hasRequest('co-1', 'g-start'), true);
+  assert.ok(authorizeCalls >= 2);
 });

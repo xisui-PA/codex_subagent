@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { ToolResult } from './api';
+import type { WorkLane } from './resource-governor';
 import type { BoardActor, CoordinatorActor, WorkerActor } from './task-board-types';
 import { boardGetInput, boardListInput, coordinatorTaskUpdateInput, taskCreateInput, teamCreateInput, teamUpdateInput, workerTaskUpdateInput } from './task-board-types';
 import { failure, Session, Tool, WorkerError, WorkspaceTools } from './types';
@@ -33,18 +34,33 @@ const paging = {
 const teamListPage = z.object({ ...paging }).strict();
 const taskListPage = boardListInput.extend(paging).strict();
 
+/** Admission routing only: it never enters task data or durable request fingerprints. */
+const lane = z.enum(['work', 'validation', 'integration']).optional().describe('Explicit governed storage lane for this coordinator mutation. Defaults to work; validation/integration may use reserved service headroom. This hint does not dispatch a worker, persist a task lane, validate, accept or integrate work.');
+
 /** Coordinator schemas: shared domain inputs plus a required ownerId, strict throughout. */
 const schemas = {
-  subagent_team_create: teamCreateInput.extend({ ownerId }).strict(),
+  subagent_team_create: teamCreateInput.extend({ ownerId, lane }).strict(),
   subagent_team_get: boardGetInput.extend({ ownerId }).strict(),
   subagent_team_list: teamListPage.extend({ ownerId }).strict(),
-  subagent_team_update: teamUpdateInput.extend({ ownerId }).strict(),
-  subagent_task_create: taskCreateInput.extend({ ownerId }).strict(),
+  subagent_team_update: teamUpdateInput.extend({ ownerId, lane }).strict(),
+  subagent_task_create: taskCreateInput.extend({ ownerId, lane }).strict(),
   subagent_task_get: boardGetInput.extend({ ownerId }).strict(),
   subagent_task_list: taskListPage.extend({ ownerId }).strict(),
-  subagent_task_update: coordinatorTaskUpdateInput.extend({ ownerId }).strict()
+  subagent_task_update: coordinatorTaskUpdateInput.extend({ ownerId, lane }).strict()
 };
 export type BoardToolName = keyof typeof schemas;
+/** Parse before storage admission so malformed or worker-only inputs cannot select a lane. */
+export function boardAdmissionLane(name: BoardToolName, input: unknown): WorkLane {
+  return (strict(schemas[name], input).lane as WorkLane | undefined) ?? 'work';
+}
+/**
+ * One coordinator mutation changes one bounded team/task record and saves
+ * one receipt with the result. Four MiB covers their retained growth,
+ * including escaped JSON, within the smallest service storage reserve.
+ */
+export function boardStorageReservation(lane: WorkLane): number {
+  return (lane === 'work' ? 32 : 4) * 1024 ** 2;
+}
 export const boardToolNames = Object.keys(schemas) as BoardToolName[];
 
 const descriptions: Record<BoardToolName, string> = {
@@ -201,7 +217,7 @@ export async function invokeBoard(board: BoardPort, name: string, input: unknown
     }
     const args = record(schemas[name].parse(input ?? {}));
     const actor: CoordinatorActor = { kind: 'coordinator', ownerId: String(args.ownerId) };
-    delete args.ownerId;
+    delete args.ownerId; delete args.lane;
     const result = await coordinatorCall(board, name, actor, args);
     return { content: [{ type: 'text', text: JSON.stringify(result ?? null) }] };
   } catch (error) {

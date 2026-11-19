@@ -30,6 +30,16 @@ import { WorkerError } from './types';
 // crash happened after the final write but before the pending removal, the
 // original final result is preserved and the leftover pending file is dropped.
 //
+// The commit point of a record is the rename inside `storage.atomicWrite`, so a
+// record is adopted into the in-memory maps and the byte account as soon as
+// that rename succeeds -- never later. A storage write wrapper that fails while
+// doing its own work AFTER the write committed therefore cannot hide a durable
+// pending attempt or final result from references, reads or a safe retry.
+// That failure still reaches the caller, so the store also answers "which record
+// is already durable for this exact attempt?" as a lookup under its own mutex:
+// replayStart() for a pending attempt and replayFinal() for a final result, both
+// of which can never publish, rewrite or replay anything.
+//
 // Capacity is explicit and checked before any write: at most 1024 logical
 // records (results + pending), at most 128 MiB of managed JSON, and at most
 // 1 MiB for one result. Nothing is evicted automatically and unknown entries
@@ -71,6 +81,12 @@ const MAX_DIAGNOSTIC_LENGTH = 1000;
 const MAX_STORE_DIAGNOSTICS = 50;
 const MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const RECOVERY_DIAGNOSTIC = 'The host restarted before this command recorded a final result. Its outcome is uncertain; the command was not replayed.';
+/** Shared immutable answers for a replay-only lookup that adopted nothing. */
+const MISSING_REPLAY: RunnerResultReplay = Object.freeze({ status: 'missing', result: null });
+const CONFLICT_REPLAY: RunnerResultReplay = Object.freeze({ status: 'conflict', result: null });
+/** The same two answers for the pending-attempt lookup, never a final result. */
+const MISSING_PENDING: RunnerAttemptReplay = Object.freeze({ status: 'missing', attempt: null });
+const CONFLICT_PENDING: RunnerAttemptReplay = Object.freeze({ status: 'conflict', attempt: null });
 
 const ID32_RE = /^[0-9a-f]{32}$/;
 const ID64_RE = /^[0-9a-f]{64}$/;
@@ -111,6 +127,7 @@ export interface RunnerCommandAttempt {
   readonly executionDirectory: string;
   readonly command: string;
   readonly timeoutMs: number;
+  readonly inputArtifact?: { readonly id: string; readonly version: number; readonly uri: string; readonly revision: number };
   readonly inputVersion: RunnerInputVersion;
   readonly setup: RunnerSetup;
   readonly startedAt: string;
@@ -169,6 +186,28 @@ export interface RunnerAttemptStart {
   readonly result: RunnerCommandResult | null;
 }
 
+/**
+ * Replay-only outcome vocabulary shared by both reconciliation lookups: an
+ * already durable exact record (a final result or a pending attempt) was adopted
+ * ('replayed'), or there is no such record ('missing'), or the durable record
+ * says something else ('conflict'). Nothing else may be reported, because these
+ * paths cannot publish.
+ */
+export const RUNNER_REPLAY_STATUSES = ['replayed', 'missing', 'conflict'] as const;
+export type RunnerReplayStatus = (typeof RUNNER_REPLAY_STATUSES)[number];
+
+/** Result of replayFinal(): an adopted final, or why nothing may be adopted. */
+export interface RunnerResultReplay {
+  readonly status: RunnerReplayStatus;
+  readonly result: RunnerCommandResult | null;
+}
+
+/** Result of replayStart(): an adopted pending attempt, or why not. */
+export interface RunnerAttemptReplay {
+  readonly status: RunnerReplayStatus;
+  readonly attempt: RunnerCommandAttempt | null;
+}
+
 /** Trusted caller scope; only ownerId + teamId are compared. */
 export interface RunnerResultScope {
   readonly ownerId: string;
@@ -203,6 +242,7 @@ export interface RunnerResultsStatus {
 
 /** Injectable caps for focused tests; production defaults are bounded. */
 export interface RunnerResultsOptions {
+  readonly withStorageWrite?: <T>(action: () => Promise<T>) => Promise<T>;
   readonly maxRecords?: number;
   readonly maxTotalBytes?: number;
   readonly maxResultBytes?: number;
@@ -244,6 +284,7 @@ const attemptSchema = z.strictObject({
   executionDirectory: absolutePath,
   command: z.string().min(1).max(RUNNER_RESULTS_MAX_COMMAND_CHARS),
   timeoutMs: z.number().int().min(1).max(MAX_TIMEOUT_MS),
+  inputArtifact: z.strictObject({ id: z.string().regex(/^[a-f0-9]{64}$/), version: z.number().int().positive(), uri: z.string().min(1).max(2048), revision: z.number().int().nonnegative() }).optional(),
   inputVersion: inputVersionSchema,
   setup: setupSchema,
   startedAt: isoDate
@@ -426,6 +467,7 @@ function freezeAttempt(attempt: RunnerCommandAttempt): RunnerCommandAttempt {
     executionDirectory: attempt.executionDirectory,
     command: attempt.command,
     timeoutMs: attempt.timeoutMs,
+    ...(attempt.inputArtifact ? { inputArtifact: Object.freeze({ ...attempt.inputArtifact }) } : {}),
     inputVersion: freezeVersion(attempt.inputVersion),
     setup: freezeSetup(attempt.setup),
     startedAt: attempt.startedAt
@@ -686,6 +728,7 @@ export class RunnerResults {
   readonly maxResultBytes: number;
 
   private readonly mutex = new Mutex();
+  private readonly withStorageWrite: <T>(action: () => Promise<T>) => Promise<T>;
   private readonly namespaceFile: string;
   private readonly results = new Map<string, RunnerCommandResult>();
   private readonly pending = new Map<string, PendingEntry>();
@@ -718,6 +761,7 @@ export class RunnerResults {
       throw new WorkerError('invalid_runner_results_config',
         `maxResultBytes must be an integer between 128 and ${RUNNER_RESULTS_MAX_RESULT_BYTES} bytes, and at most maxTotalBytes.`);
     }
+    this.withStorageWrite = options.withStorageWrite ?? (action => action());
     this.directory = path.resolve(directory);
     this.logicalRoot = path.resolve(logicalProjectRoot);
     this.namespace = runnerResultsNamespace(this.directory, this.logicalRoot);
@@ -792,10 +836,53 @@ export class RunnerResults {
       const text = JSON.stringify({ schema: RUNNER_RESULTS_SCHEMA, version: RUNNER_RESULTS_VERSION, namespace: this.namespace, attempt });
       const bytes = byteLength(text);
       this.assertStartCapacity(bytes);
-      await this.writeManaged(PENDING_DIRECTORY, attempt.id, text);
-      this.pending.set(attempt.id, { attempt, bytes });
-      this.totalBytes += bytes;
+      await this.writeManaged(PENDING_DIRECTORY, attempt.id, text, () => {
+        // The rename committed: this pending attempt is durable and owns its
+        // sealed input from now on, even if the storage wrapper fails next. A
+        // retry then replays this attempt instead of writing a second one.
+        this.pending.set(attempt.id, { attempt, bytes });
+        this.totalBytes += bytes;
+      });
       return this.startSnapshot(attempt, 'pending', false, null);
+    });
+  }
+
+  /**
+   * Replay-only reconciliation of a pending attempt that may ALREADY be durable.
+   *
+   * This is the entry point a caller uses when its own start() reported an error
+   * it cannot interpret: a pending attempt is adopted at the rename that commits
+   * it, so a storage write wrapper that fails while doing its own work AFTER that
+   * rename leaves exactly this state -- a durable, adopted pending record that
+   * start() nevertheless reported as a failure. The lookup runs under the SAME
+   * mutex as start(), so no record can appear or disappear between it and the
+   * decision, and it has NO path to publication: nothing is written, adopted,
+   * removed or replayed here, so asking can never manufacture adoption.
+   *
+   * 'replayed' carries the already adopted pending attempt only when that record
+   * is this exact attempt: the record id IS the attempt id and the lease id (a
+   * runner attempt is identified by its lease), the owner matches `scope`, and
+   * every field of the durably stored, canonically parsed attempt equals the
+   * caller's canonically parsed one -- `startedAt` included, so a merely similar
+   * attempt can never be adopted. Anything else is 'missing' (this id has no
+   * pending attempt) or 'conflict' (a durable final result or a different pending
+   * attempt owns this id), and is reported, never overwritten or reinterpreted.
+   */
+  async replayStart(input: RunnerCommandAttempt, scope: RunnerResultScope): Promise<RunnerAttemptReplay> {
+    this.assertReady();
+    const attempt = parseAttempt(input);
+    if (path.resolve(attempt.logicalRoot) !== this.logicalRoot) {
+      invalidAttempt('The attempt logicalRoot must match this store\'s logical project root.');
+    }
+    // Same trusted-scope validation as get()/list(): a malformed scope is an
+    // error, never a silent miss, and nothing is read or removed for it.
+    const validated = parseScope(scope);
+    return this.mutex.run(async () => {
+      // Same serialized re-check as start() and finish(): a close() queued first
+      // wins, so no record may be read here after the store was closed.
+      this.assertReady();
+      const replay = this.adoptedPending(attempt, validated);
+      return Object.freeze({ status: replay.status, attempt: replay.attempt });
     });
   }
 
@@ -812,14 +899,14 @@ export class RunnerResults {
       // Same serialized re-check as start(): a close() queued first wins and no
       // final record or pending removal may happen after the store is closed.
       this.assertReady();
-      const existing = this.results.get(recordId);
-      if (existing !== undefined) {
-        const candidate = buildResult(existing.attempt, this.namespace, finish, finish.completedAt ?? existing.completedAt);
-        if (JSON.stringify(candidate) !== JSON.stringify(existing)) {
+      if (this.results.has(recordId)) {
+        // ONE shared exact-replay comparison and pending cleanup, so a repeat of
+        // the same final data is idempotent and anything else still conflicts.
+        const replay = await this.adoptedFinal(recordId, finish);
+        if (replay.status !== 'replayed' || replay.result === null) {
           throw new WorkerError('runner_results_conflict', `Result ${recordId} is immutable and already records different final data.`);
         }
-        await this.cleanupPending(recordId);
-        return existing;
+        return replay.result;
       }
       const pending = this.pending.get(recordId);
       if (pending === undefined) {
@@ -832,11 +919,48 @@ export class RunnerResults {
       const text = JSON.stringify(result);
       const bytes = byteLength(text);
       this.assertFinishCapacity(bytes, pending.bytes);
-      await this.writeManaged(RESULTS_DIRECTORY, recordId, text);
-      this.results.set(recordId, result);
-      this.totalBytes += bytes;
+      await this.writeManaged(RESULTS_DIRECTORY, recordId, text, () => {
+        // Same commit-point adoption for the immutable final: an accounting
+        // error after the rename must never leave a durable result that reads,
+        // references and a reopen would find but this handle does not know.
+        // The leftover pending is dropped by the retry or by the next recovery.
+        this.results.set(recordId, result);
+        this.totalBytes += bytes;
+      });
       await this.cleanupPending(recordId);
       return result;
+    });
+  }
+
+  /**
+   * Replay-only reconciliation of a final that may ALREADY be durable.
+   *
+   * This is the entry point a caller uses when its own finish() reported an error
+   * it cannot interpret -- a storage write wrapper can fail after the rename that
+   * committed and adopted the final. It runs under the SAME mutex as finish(), so
+   * no record can appear or disappear between the lookup and the decision, and it
+   * has NO path to publication: it either returns an already adopted final whose
+   * record id, attempt id AND lease id are this exact id (a runner attempt is
+   * identified by its lease), whose owner matches `scope`, and whose every final
+   * field matches `details` exactly (dropping that attempt's leftover pending,
+   * exactly as an idempotent finish() would), or it reports 'missing' (nothing
+   * durable for this id) or 'conflict' (a durable record that is not this attempt
+   * and lease, is not visible to this scope, or records different final data).
+   * Missing and conflicting state is reported, never overwritten.
+   */
+  async replayFinal(id: string, details: RunnerCommandFinish, scope: RunnerResultScope): Promise<RunnerResultReplay> {
+    this.assertReady();
+    const recordId = requireId(id);
+    const finish = parseFinish(details);
+    // Same trusted-scope validation as get()/list(): a malformed scope is an
+    // error, never a silent miss, and nothing is read or removed for it.
+    const validated = parseScope(scope);
+    return this.mutex.run(async () => {
+      // Same serialized re-check as finish(): a close() queued first wins, so no
+      // pending removal may happen after the store was closed.
+      this.assertReady();
+      const replay = await this.adoptedFinal(recordId, finish, validated);
+      return Object.freeze({ status: replay.status, result: replay.result });
     });
   }
 
@@ -873,6 +997,44 @@ export class RunnerResults {
     });
   }
 
+  /** A managed pending/final attempt owns its exact sealed input until collection. */
+  inputReferences(retained: ReadonlySet<string>): Set<string> {
+    this.assertReady();
+    const references = new Set(retained);
+    for (const entry of [...this.results.values(), ...this.pending.values()]) {
+      if (entry.attempt.inputArtifact) {
+        references.add(entry.attempt.inputArtifact.uri);
+      }
+    }
+    return references;
+  }
+
+  /** Explicit candidates only. References, active work and uncertainty win over GC. */
+  async collect(scope: RunnerResultScope, ids: readonly string[], retained: ReadonlySet<string>, leases: ReadonlySet<string>, activeWorkers: ReadonlySet<string>): Promise<{ removed: RunnerCommandResult[]; retained: { id: string; reason: string }[] }> {
+    const validated = parseScope(scope);
+    return this.mutex.run(async () => {
+      this.assertReady();
+      const outcome: { removed: RunnerCommandResult[]; retained: { id: string; reason: string }[] } = { removed: [], retained: [] };
+      for (const id of new Set(ids)) {
+        const result = this.results.get(id);
+        if (!result) {
+          continue;
+        }
+        this.authorize(result, validated);
+        const reason = result.outcome === 'uncertain' ? 'uncertain outcome' : this.pending.has(id) ? 'pending attempt' : retained.has(result.uri) ? 'retained evidence/reference' : leases.has(result.attempt.leaseId) ? 'active or quarantined lease' : (activeWorkers.has(result.attempt.owner.workerId) || activeWorkers.has(digest([result.attempt.owner.workerId, result.attempt.owner.workerCreatedAt]))) ? 'active worker' : undefined;
+        if (reason) {
+          outcome.retained.push({ id, reason }); continue;
+        }
+        const text = await this.readManagedText(RESULTS_DIRECTORY, id, this.maxResultBytes, 'corrupt');
+        if (digest(JSON.parse(text)) !== digest(result)) {
+          throw new WorkerError('runner_results_corrupt', 'Result bytes changed before collection.');
+        }
+        await fs.unlink(this.recordPath(RESULTS_DIRECTORY, id));
+        this.results.delete(id); this.totalBytes -= byteLength(text); outcome.removed.push(result);
+      }
+      return outcome;
+    });
+  }
   /** Counts, caps and unknown entries; read-only and never evicts anything. */
   status(): RunnerResultsStatus {
     if (this.failed) {
@@ -1206,16 +1368,106 @@ export class RunnerResults {
       if (this.totalBytes - entry.bytes + bytes > this.maxTotalBytes) {
         capacity(`Recovered result ${id} would exceed the total results byte limit.`);
       }
-      await this.writeManaged(RESULTS_DIRECTORY, id, text);
-      this.results.set(id, result);
-      this.totalBytes += bytes;
+      await this.writeManaged(RESULTS_DIRECTORY, id, text, () => {
+        // Recovery commits through the same write path: adopt the uncertain
+        // final the instant it is durable so the count and bytes stay true.
+        this.results.set(id, result);
+        this.totalBytes += bytes;
+      });
       if (await this.cleanupPending(id)) {
         this.diagnose(`Pending attempt ${id} was recovered as uncertain after restart; it was not replayed.`);
       }
     }
   }
 
-  private async writeManaged(kind: string, id: string, text: string): Promise<void> {
+  /**
+   * The ONE exact-replay comparison. finish()'s already-recorded branch and
+   * replayFinal() both call it, so the two paths can never disagree about what an
+   * exact repeat is, and the lookup, the comparison and the leftover-pending
+   * cleanup always happen inside the same critical section.
+   *
+   * 'missing' means no adopted final exists for this id. A record whose rebuilt
+   * final bytes differ in ANY field is a 'conflict' for every caller, and an exact
+   * match removes the leftover pending. The attempt-id/lease-id and owner checks
+   * apply ONLY when a `scope` is supplied, i.e. to replayFinal()'s runner-specific
+   * path: an ordinary finish() replay keeps comparing exactly the canonical
+   * immutable record, so the low-level schema's valid case of an attempt whose
+   * `leaseId` differs from its `id` still replays. Nothing here can publish,
+   * rewrite or reinterpret a record.
+   */
+  private async adoptedFinal(
+    recordId: string,
+    finish: NormalizedFinish,
+    scope?: RunnerResultScope
+  ): Promise<RunnerResultReplay> {
+    const existing = this.results.get(recordId);
+    if (existing === undefined) {
+      return MISSING_REPLAY;
+    }
+    if (scope !== undefined) {
+      // Runner attempts use their lease id as their identity, and only that exact
+      // attempt, visible to the calling scope, may be adopted by that path.
+      if (existing.id !== recordId || existing.attempt.id !== recordId || existing.attempt.leaseId !== recordId) {
+        return CONFLICT_REPLAY;
+      }
+      if (existing.attempt.owner.ownerId !== scope.ownerId || existing.attempt.owner.teamId !== scope.teamId) {
+        return CONFLICT_REPLAY;
+      }
+    }
+    // The same rebuild the first write performed, so the writer's own normalized
+    // finish shape IS the comparator: identical data matches, anything else does
+    // not. An explicit completedAt must match the durable one exactly.
+    const candidate = buildResult(existing.attempt, this.namespace, finish, finish.completedAt ?? existing.completedAt);
+    if (JSON.stringify(candidate) !== JSON.stringify(existing)) {
+      return CONFLICT_REPLAY;
+    }
+    await this.cleanupPending(recordId);
+    return Object.freeze({ status: 'replayed', result: existing });
+  }
+
+  /**
+   * The ONE exact-pending comparison behind replayStart(), called only under the
+   * store mutex. It never writes: the pending map is populated at a committed
+   * rename only, so an entry in it IS a durable record, and a final result for
+   * the same id means this attempt already reached a final (the normal finish()
+   * or replayFinal() path) and is never adopted as a pending replay.
+   */
+  private adoptedPending(attempt: RunnerCommandAttempt, scope: RunnerResultScope): RunnerAttemptReplay {
+    if (this.results.has(attempt.id)) {
+      return CONFLICT_PENDING;
+    }
+    const pending = this.pending.get(attempt.id);
+    if (pending === undefined) {
+      return MISSING_PENDING;
+    }
+    // A runner attempt is identified by its lease, in the caller's attempt AND in
+    // the durable one; an attempt whose lease id is not its own id is not this
+    // identity and is never adopted.
+    if (attempt.id !== attempt.leaseId || pending.attempt.id !== pending.attempt.leaseId) {
+      return CONFLICT_PENDING;
+    }
+    if (pending.attempt.owner.ownerId !== scope.ownerId || pending.attempt.owner.teamId !== scope.teamId) {
+      return CONFLICT_PENDING;
+    }
+    // The caller's canonically parsed attempt IS the comparator, exactly like
+    // start()'s own idempotency comparison of normalized attempts.
+    if (JSON.stringify(pending.attempt) !== JSON.stringify(attempt)) {
+      return CONFLICT_PENDING;
+    }
+    return Object.freeze({ status: 'replayed', attempt: pending.attempt });
+  }
+
+  /**
+   * Write one managed record. `adopt` runs synchronously the instant the atomic
+   * publication (the rename inside `atomicWrite`) resolves -- INSIDE the
+   * storage write wrapper, so the in-memory maps and byte account describe a
+   * record whose rename committed even when that wrapper fails afterwards,
+   * during its own post-write measurement or accounting. A write that never
+   * committed never calls it: nothing is adopted and the same call can be
+   * retried. `adopt` runs at most once, so a wrapper that performs the action
+   * twice can never count the same record twice.
+   */
+  private async writeManaged(kind: string, id: string, text: string, adopt: () => void): Promise<void> {
     await this.assertPlainRoot(`before writing ${kind}`);
     const directory = path.join(this.directory, kind);
     if (await plainDirectory(directory) !== 'plain') {
@@ -1225,8 +1477,16 @@ export class RunnerResults {
     if (!isStrictlyInside(this.directory, file)) {
       invalidPath(`A ${kind} record path escapes the results store.`);
     }
-    try {
+    let adopted = false;
+    const publish = async (): Promise<void> => {
       await atomicWrite(file, text, 0o600);
+      if (!adopted) {
+        adopted = true;
+        adopt();
+      }
+    };
+    try {
+      await this.withStorageWrite(publish);
     } catch (error) {
       storage(`A ${kind} record could not be persisted: ${error instanceof Error ? error.message : String(error)}`);
     }

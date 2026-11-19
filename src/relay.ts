@@ -19,7 +19,7 @@ async function main(): Promise<void> {
         throw new Error('Unknown MCP tool.');
       }
       const result = await forward(registry, process.cwd(), request.params.name, request.params.arguments || {}, extra.signal);
-      if (!result.isError && ['subagent_spawn', 'subagent_send', 'subagent_resume'].includes(request.params.name)) {
+      if (!result.isError && ['subagent_spawn', 'subagent_isolated_spawn', 'subagent_send', 'subagent_resume'].includes(request.params.name)) {
         const worker = JSON.parse(result.content[0].text) as { id: string; state: string; workspaceRoot?: string };
         tracked.set(worker.id, { state: worker.state, workspaceRoot: worker.workspaceRoot });
       }
