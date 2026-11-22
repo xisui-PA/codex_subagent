@@ -87,6 +87,101 @@ work, explain the observed failures and the proposed model change, then ask
 the user for approval. The mere availability of another model, or a single
 failed turn, is not approval to abandon the current model.
 
+## Coordinator workflow
+
+Use an ordinary MCP worker for a standalone assignment. For parallel work,
+use the [task board](README.md#task-board-opt-in) when enabled. It records
+plans, assignments and verdicts. The coordinator dispatches each task
+explicitly and supplies its inputs. For parallel edits, prefer one shared
+immutable snapshot with a private overlay per worker.
+
+### Check capabilities and record the plan
+
+Check the host's tool schemas and the applicable **User Settings**. The flags
+below use the `codexSubagent.` prefix. Repository settings cannot enable them.
+
+- `taskBoard.enabled` enables team and task records.
+- `isolatedViews.enabled` adds snapshots, overlays and sealed submissions
+  with the task board enabled.
+- `resources.enabled` adds governed create-bind-start and aggregate
+  budgets with the board and views enabled.
+- `isolatedViews.runners.enabled` allows bound workers to run approved
+  commands in a materialized view.
+- `isolatedViews.integration.enabled` enables coordinator integration with
+  the board, views and resource governance enabled. Publishing also needs
+  runner evidence.
+
+If a required capability is unavailable, identify the blocker before changing
+the workflow. A bound worker must never fall back to live file tools.
+
+Use a stable `ownerId` per conversation. Retain the canonical or returned
+`workspaceRoot` on subsequent calls and group `subagent_wait` IDs by root.
+Where required, use a fresh `requestId` for each new decision and current
+revisions for updates. Retry an ambiguous call with the original request ID
+and identical arguments.
+
+Create a team and narrowly scoped tasks with explicit acceptance criteria.
+Contract dependencies identify tasks that supply versioned agreed interfaces.
+Artifact dependencies identify tasks that supply accepted outputs. Resolve
+both to exact refs and retain the artifacts the task consumes. Schedule
+pre-acceptance validation independently so it can establish the producer's
+verdict. Record each verdict against the exact candidate version. Accept a
+task only when the latest verdict for each current candidate is passing.
+
+### Start workers in the right view
+
+Capture the shared inputs with `subagent_snapshot_create`. Check the
+[isolated view capture rules](docs/isolated-views.md) for working-tree changes,
+editor buffers and untracked files. For governed startup, leave each task ready
+and unassigned. Call `subagent_isolated_spawn` with the snapshot, exact current
+team and task revisions, and an explicit `work`, `validation` or `integration`
+lane. It creates the stopped worker, assigns it, binds the view and starts its
+first turn. If initial revisions are stale, inspect and cancel the stopped
+setup, then make a new decision with current revisions and a new request ID.
+When only board and view support is available, explicitly assign the task and
+use `subagent_view_bind` on an already stopped, owned team member before
+resuming it.
+
+Use the work lane for implementation and preserve service headroom for
+validation and integration. Runner slots and queues are root-local, model
+session ceilings are store-local, and governed budgets span roots for the OS
+user. Inspect scoped `subagent_runner_status` or `subagent_resource_status`
+when capacity blocks work. See [resource governance](docs/resource-governance.md)
+for admission, leases and recovery.
+
+### Seal, validate and publish
+
+Seal the exact overlay revision. Retain exact submissions and runner results
+before consuming them or publishing references to them. Use `subagent_view_pin`
+for snapshots or submissions and `subagent_evidence_retention` for exact evidence
+URIs as applicable. Board references do not retain content. Review the sealed
+changes with `subagent_submission_read` and use the stored IDs, versions and URIs.
+
+[Isolated runner commands](docs/runner-workspaces.md) require
+`workspace-write`, an eligible model with write and shell access, and
+isolated command approval. Use relative project paths. Absolute paths still
+have the OS account's access. For integration validation, match every stored
+result to its exact command and candidate input revision, and require success,
+confirmed drain and no imports. A command that imports changes leaves a new
+revision that needs its own validation.
+
+Use `subagent_integration` for explicit coordinator decisions. For a
+publishing attempt, `begin` pins the exact selected task candidates and
+evidence over a common base and freezes the ordered validation commands.
+Start a `validation`-lane worker on a clean derived seed and keep its overlay
+at revision 0, or use an `integration`-lane worker to resolve conflicts.
+The worker seals the result. `candidate` records that seal and `validate`
+records matching runner evidence. After review, `accept` acknowledges the
+exact conflict paths and `apply` separately publishes against live workspace
+and editor preconditions. Board acceptance is a separate decision.
+
+For a downstream artifact task, compose and retain the consumer's exact
+derived snapshot before starting the worker on it. See
+[coordinator integration](docs/integration.md) for the downstream conflict
+recipe and publication recovery. Inspect `status` after an ambiguous call
+before retrying its original request. An `interrupted` publication requires a
+new attempt. Release retention after consumers finish and effects settle.
+
 ## Line endings and exact-text edits
 
 Before exact-text patches, check the target's working-tree line endings.
