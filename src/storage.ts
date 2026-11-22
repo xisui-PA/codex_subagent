@@ -616,6 +616,53 @@ export class SessionStore {
     });
   }
   /**
+   * Retires ONE stranded pre-creation intent that no attempt can ever consume,
+   * using the same bounded publication path as a consumed record.
+   *
+   * An earlier build wrote the intent before its own bind preflight refused, so
+   * a kept record without a deadline outlived the refusal and gated metadata
+   * maintenance for its owner. The retry that is refused for the exact same
+   * accepted request may retire it, and ONLY that record: identity, argument
+   * fingerprint, lane, policy and the written lease pair must all match, so
+   * changed arguments still answer `changed` (the caller keeps its idempotency
+   * error) and a renewed or shortened lease stays owned by its parent. A record
+   * that matched this way already owns a durable request identity, so it is
+   * retired through the ordinary tombstone fence: recycling that identity for a
+   * different later request would break the restart contract. A refusal with no
+   * such record still writes neither a pending slot nor a retirement id.
+   */
+  async retireStrandedStartupIntent(request: Omit<StartupIntent, 'at'>): Promise<'absent' | 'retired' | 'changed'> {
+    return this.mutex.run(async () => {
+      if (!this.lock) {
+        return 'absent';
+      }
+      if (this.startupIntentError) {
+        throw this.startupIntentError;
+      }
+      const id = this.startupIdentity(request.ownerId, request.requestId, request.workspaceRoot);
+      const existing = this.startupIntents.get(id);
+      if (existing === undefined || this.sessions.has(id)) {
+        // No record, or a checkpoint already owns this identity.
+        return 'absent';
+      }
+      if (existing.ownerId !== request.ownerId || existing.requestId !== request.requestId || existing.workspaceRoot !== request.workspaceRoot) {
+        return 'absent';
+      }
+      if (existing.fingerprint !== request.fingerprint) {
+        return 'changed';
+      }
+      if (existing.policy !== request.policy || existing.lane !== request.lane
+        || existing.leaseSeconds !== request.leaseSeconds || existing.expiresAt !== request.expiresAt) {
+        // A different policy, lane or lease is a different durable decision and
+        // is never retired from here; an expired cancel-on-expiry record keeps
+        // its own reclaim rule.
+        return 'absent';
+      }
+      await this.retireStartupIntentsLocked(existing);
+      return 'retired';
+    });
+  }
+  /**
    * Renews every persisted pre-creation deadline of one parent, including
    * requests that a previous host accepted. A heartbeat is explicit coordinator
    * intent, so it renews even a record whose deadline already passed; starting

@@ -32,8 +32,21 @@ class WorkerTree implements vscode.TreeDataProvider<TreeNode> {
   private readonly change = new vscode.EventEmitter<void>();
   readonly onDidChangeTreeData = this.change.event;
   sessions: SessionHeader[] = [];
-  refresh(sessions = this.sessions): void {
-    this.sessions = sessions; this.change.fire();
+  refresh(sessions: SessionHeader[]): void {
+    // The host polls even when workers are idle. Rebuild the VS Code tree
+    // only when its visible rows, grouping or order change.
+    const changed = sessions.length !== this.sessions.length || sessions.some((session, index) => {
+      const previous = this.sessions[index];
+      return session.id !== previous.id || session.workspaceRoot !== previous.workspaceRoot
+        || session.ownerId !== previous.ownerId || session.ownerLabel !== previous.ownerLabel
+        || session.title !== previous.title || session.state !== previous.state
+        || session.model.name !== previous.model.name || session.permission !== previous.permission
+        || session.activity !== previous.activity;
+    });
+    this.sessions = sessions;
+    if (changed) {
+      this.change.fire();
+    }
   }
   getTreeItem(node: TreeNode): vscode.TreeItem {
     if (node.kind === 'group') {
@@ -270,12 +283,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
         storage: context.globalStorageUri.fsPath, registry, roots: realRoots, identity, provider,
         taskBoardEnabled: boardEnabled,
         isolatedViewsEnabled,
+        integrationEnabled: () => vscode.workspace.getConfiguration('codexSubagent').inspect<boolean>('isolatedViews.integration.enabled')?.globalValue === true,
         runners: runnerHostConfig,
         resourcesEnabled: () => vscode.workspace.getConfiguration('codexSubagent').inspect<boolean>('resources.enabled')?.globalValue === true,
         resources: () => readResourceConfig(key => vscode.workspace.getConfiguration('codexSubagent').inspect(key)),
         openDocuments: () => vscode.workspace.textDocuments.filter(document => document.isDirty
           && (document.uri.scheme === 'file' || (document.isUntitled && path.isAbsolute(document.uri.fsPath))))
           .map(document => ({ path: document.uri.fsPath, text: document.getText(), version: document.version })),
+        publicationDocuments: () => vscode.workspace.textDocuments.filter(document =>
+          document.uri.scheme === 'file' || (document.isUntitled && path.isAbsolute(document.uri.fsPath)))
+          .map(document => ({ path: document.uri.fsPath, text: '', version: document.version })),
         settings: () => ({
           ...defaults,
           models: modelPool()

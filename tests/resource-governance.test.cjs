@@ -2435,6 +2435,57 @@ test('previous-epoch startup IDs are rejected before a durable intent and never 
   assert.equal(f.state.requests.length, 2);
 });
 
+test('a refused startup retires the exact stranded intent of an earlier attempt through the retirement fence', async t => {
+  const f = await fixture(t), input = await prepared(f, 'stranded-refusal');
+  const { WorkerError } = require('../.test-build/types');
+  const spawn = f.local.engine.spawn.bind(f.local.engine), preflight = f.local.isolation.preflightStartupBind.bind(f.local.isolation);
+  // An earlier attempt wrote the durable intent and then failed before any
+  // checkpoint existed - exactly the state the reviewed defect left behind for a
+  // work-lane startup its own bind preflight refused.
+  f.local.engine.spawn = async () => { throw Error('lost create'); };
+  await assert.rejects(f.call('subagent_isolated_spawn', input), /lost create/);
+  f.local.engine.spawn = spawn;
+  const [stranded] = await readIntents(f);
+  assert.equal(stranded.requestId, input.requestId);
+  assert.equal(stranded.ownerId, 'parent');
+  assert.equal(stranded.policy, 'keep');
+  assert.equal(stranded.expiresAt, undefined, 'a kept intent carries no deadline that could ever age it out');
+  assert.equal(f.local.store.list().length, 0, 'no checkpoint owns the identity yet');
+  // The narrow bind rule refuses this snapshot with the preflight's own error.
+  f.local.isolation.preflightStartupBind = async () => {
+    throw new WorkerError('isolation_conflict', 'This snapshot is a derived integration seed with unresolved merge conflict groups; only its governed integration-lane startup may bind it.');
+  };
+  try {
+    // Changed arguments keep the ordinary idempotency answer and never retire
+    // the accepted record.
+    await assert.rejects(f.call('subagent_isolated_spawn', { ...input, task: input.task + ' changed' }), e => e.code === 'idempotency_conflict');
+    assert.equal((await readIntents(f)).length, 1, 'changed arguments never retire the accepted intent');
+    // The exact retry is refused by the same rule and retires ONLY that record,
+    // through the ordinary retirement fence: the identity this host already
+    // accepted is never recycled for a different later request.
+    await assert.rejects(f.call('subagent_isolated_spawn', input), e => e.code === 'isolation_conflict');
+    assert.deepEqual(await readIntents(f), [], 'the exact retry leaves no pending intent behind');
+    const tombstone = path.join(f.local.store.directory, 'retired-workers', intentIdentity('parent', input.requestId, f.root) + '.json');
+    assert.equal((await fs.readFile(tombstone, 'utf8')).includes(input.requestId), true, 'the retired identity keeps its normal tombstone');
+    assert.equal(f.local.store.list().length, 0);
+    assert.equal(f.state.requests.length, 0);
+  } finally { f.local.isolation.preflightStartupBind = preflight; }
+  // That identity is retired now, so neither an exact retry nor changed
+  // arguments may reuse it.
+  await assert.rejects(f.call('subagent_isolated_spawn', input), e => e.code === 'request_expired');
+  await assert.rejects(f.call('subagent_isolated_spawn', { ...input, task: input.task + ' changed' }), e => e.code === 'request_expired');
+  assert.deepEqual(await readIntents(f), [], 'a retired identity spends no pending slot');
+  assert.equal(f.state.requests.length, 0);
+  // The refusal never held its owner's metadata maintenance closed...
+  const collected = await f.call('subagent_resource_collect', { ownerId: 'parent', teamId: f.team.id });
+  assert.deepEqual(collected.results.removed, []);
+  // ...and a NEW request starts normally.
+  const fresh = await f.call('subagent_isolated_spawn', await prepared(f, 'stranded-fresh'));
+  assert.equal((await f.stopped(fresh.id)).state, 'completed');
+  assert.deepEqual(await readIntents(f), [], 'the checkpoint consumed the fresh intent');
+  assert.equal(f.state.requests.length, 1);
+});
+
 test('a heartbeat before the first durable intent renews its lease pair and the checkpoint', async t => {
   const leaseSeconds = 120, heartbeat = 300;
   const f = await fixture(t), input = { ...await prepared(f, 'early-heartbeat'), parentPolicy: 'cancel-on-expiry', leaseSeconds };

@@ -85,6 +85,8 @@ test('manifest is stable after live edits and removals; exclusions are case-inse
   assert.deepEqual(await store.read(manifest.entries['src/main.js'].hash), Buffer.from('console.log(1)'));
   assert.equal(manifest.fileCount, 2);
   assert.equal(manifest.totalBytes, 9 + 14);
+  // Real captures always record the override set explicitly: none accepted here.
+  assert.deepEqual(manifest.editorPaths, []);
 });
 
 test('unsaved editor text overrides disk once; new docs create virtual directories', async t => {
@@ -111,9 +113,18 @@ test('unsaved editor text overrides disk once; new docs create virtual directori
   assert.equal(manifest.fileCount, 3);
   // Disk bytes 9 + 14, override adjusts by (14 - 9), new doc adds 12.
   assert.equal(manifest.totalBytes, 9 + 14 + ('readme unsaved'.length - 9) + 'const x = 1;'.length);
+  // Only the accepted overrides are listed (ignored/escape/relative docs are
+  // not), as sorted canonical root-relative paths.
+  assert.deepEqual(manifest.editorPaths, ['README.md', 'src/deep/new-doc.ts']);
   await fs.writeFile(path.join(root, 'README.md'), 'disk saved');
   const second = await captureContent(root, store);
+  // The re-capture has no open documents: editorPaths is present and empty,
+  // and it reads the mutated raw disk bytes.
+  assert.deepEqual(second.editorPaths, []);
   assert.deepEqual(await store.read(second.entries['README.md'].hash), Buffer.from('disk saved'));
+  // The original capture's frozen metadata and raw bytes are unchanged by the
+  // later disk edit and re-capture.
+  assert.deepEqual(manifest.editorPaths, ['README.md', 'src/deep/new-doc.ts']);
   assert.deepEqual(await store.read(manifest.entries['README.md'].hash), Buffer.from('readme unsaved'));
   assert.equal(manifest.entries['src/main.js'].hash, second.entries['src/main.js'].hash);
 });

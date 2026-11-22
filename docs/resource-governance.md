@@ -479,7 +479,7 @@ identity, task or registered-store caps, reuse an existing namespace with room
 or export retained records for an operator-managed migration; this stage does
 not implement a migration tool.
 
-## Contracts for steps 5–7
+## Downstream and messaging contracts
 
 - Validation must pin every exact artifact/result it consumes, compare the
   result's **input** revision, record its explicit verdict, then release only
@@ -491,7 +491,8 @@ not implement a migration tool.
   session for another assignment. Scheduling never chooses or rewrites tasks.
 - Integration must use the reserved service lane, retain its source artifacts
   and evidence, recheck live base/editor hashes and path protections, and keep
-  acceptance separate from integration. No integration is implemented here.
+  acceptance separate from integration. The opt-in workflow that implements
+  these decisions is [coordinator integration](integration.md).
 - Future message delivery can use `ScheduleWait`/`ScheduleWakeup` and explicit
   `subagent_schedule` waits/wakes. Waiting stores intent and yields resources;
   it neither delivers peer messages nor chooses tasks. Coordinator decisions,
@@ -533,7 +534,8 @@ re-read the generation before retrying across versions.
 
 Snapshot exclusions, unsupported Git layouts, encodings, capture limits and
 runner reopen/process-containment limits are unchanged. See
-[isolated views](isolated-views.md) and [runner workspaces](runner-workspaces.md).
+[isolated views](isolated-views.md), [runner workspaces](runner-workspaces.md) and
+[coordinator integration](integration.md).
 
 ## Validation
 

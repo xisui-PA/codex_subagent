@@ -37,6 +37,13 @@ export interface StoredSnapshot {
   manifestHash: string;
   backing: SnapshotBacking;
   createdAt: string;
+  /**
+   * Additive provenance of a PRIVATE derived integration seed: the original
+   * base it was composed over, the exact ordered source refs and the merge
+   * conflict groups. Ordinary captures never carry it, so capture semantics
+   * and legacy records stay unchanged.
+   */
+  provenance?: IntegrationSnapshotProvenance;
 }
 
 /** Complete captured candidate, durable before its Git ref is published. */
@@ -107,6 +114,12 @@ export interface ViewPin {
   teamId: string;
   name: string;
   resource: { kind: 'snapshot' | 'submission'; id: string };
+  /**
+   * Additive private integration identity: the durable attempt this pin serves
+   * and its role. A pin carrying it is reserved for that attempt's own durable
+   * service decisions and can never be created or released publicly.
+   */
+  integration?: { attemptId: string; role: 'source' | 'seed' };
   /** Durable stopped-worker binding intent, published before its Session marker. */
   binding?: {
     overlayId: string;
@@ -115,4 +128,75 @@ export interface ViewPin {
     receiptKey: string;
     fingerprint: string;
   };
+}
+
+export interface IntegrationArtifactRef {
+  id: string;
+  version: number;
+  uri: string;
+}
+
+export interface IntegrationScope {
+  ownerId: string;
+  teamId: string;
+  attemptId: string;
+}
+
+export interface IntegrationComposition {
+  snapshot: StoredSnapshot;
+  baseSnapshotId: string;
+  conflicts: { paths: string[]; inputIds: string[]; reason: string }[];
+}
+
+/**
+ * Durable provenance of one derived integration seed. It is the seed's own
+ * composition receipt: the attempt, the exact original base and the exact
+ * ordered source refs are checked on every replay, so a different argument set
+ * for the same attempt is refused without any receipt that epoch GC can move.
+ */
+export interface IntegrationSnapshotProvenance {
+  kind: 'integration-seed';
+  attemptId: string;
+  baseSnapshotId: string;
+  refs: IntegrationArtifactRef[];
+  conflicts: { paths: string[]; inputIds: string[]; reason: string }[];
+}
+
+/**
+ * Internal governed startup identity of ONE bind. The host fills it from the
+ * real Session's durable startup record, never from the request: a caller field
+ * could be forged, a session startup cannot. It is the only thing that may
+ * authorize binding a snapshot whose OWN conflict groups are unresolved.
+ */
+export interface StartupBindIdentity {
+  teamId: string;
+  snapshotId: string;
+  lane: 'work' | 'validation' | 'integration';
+}
+
+/**
+ * One CONFLICTED hop of a composition lineage: a derived seed whose own merge
+ * conflict groups are still unresolved, the exact provenance stored on it, and
+ * the exact artifact refs that hop carried - the begin's own selection for the
+ * immediate base, or the child seed's stored `provenance.refs` for a deeper
+ * parent. The store itself never decides which ref is a resolution; it hands the
+ * chain to the ledger's verifier under its own mutex and fails closed without one.
+ */
+export interface IntegrationConflictHop {
+  snapshotId: string;
+  provenance: IntegrationSnapshotProvenance;
+  refs: IntegrationArtifactRef[];
+}
+
+/**
+ * Exact durable ancestry of one integration source set, read from the store
+ * index only. `sourceSnapshotId` is the ONE immediate base every sealed source
+ * was composed over; `ancestors` lists the derived snapshots that base was
+ * itself composed from, in leaf-to-root order, each with an exact COPY of its
+ * native provenance. The oldest ordinary capture (a stored manifest with no
+ * integration provenance) is the root of that lineage and is never listed.
+ */
+export interface IntegrationSourceAncestry {
+  sourceSnapshotId: string;
+  ancestors: { snapshotId: string; provenance: IntegrationSnapshotProvenance }[];
 }

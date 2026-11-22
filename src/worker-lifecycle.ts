@@ -281,6 +281,12 @@ export class WorkerLifecycle implements ExecutionGovernance {
       if (!this.store.findOperation(digest([a.ownerId, a.requestId]))) {
         board.assertRequest(a.ownerId, a.requestId);
       }
+      // The narrow bind-time lane rule was already answered in the fenced
+      // pre-registration phase of prepare(), BEFORE this request could write a
+      // durable intent, so it still precedes the worker identity, the ready task
+      // assignment and the binding. The bind below re-proves the same rule under
+      // the view mutex from the real Session startup, so a resumed setup keeps
+      // its ordinary checkpoint behavior.
       // create persists the permanent non-runnable gate; no harmless turn and
       // no provider stream or workspace tool is needed to obtain an identity.
       const create = () => this.engine.spawn({ ...spawn, workspaceRoot: this.root }, { ...setup, requestId: a.requestId, phase: 'created' as const }, { authorize: () => {
@@ -338,6 +344,60 @@ export class WorkerLifecycle implements ExecutionGovernance {
     }
     entry.controller.signal.throwIfAborted();
   }
+  /**
+   * Fenced pre-registration preflight of the narrow bind-time lane rule.
+   *
+   * It runs with the synchronous preparation reservation as the only in-memory
+   * fence and publishes nothing, so a refusal can neither spend one of the
+   * bounded intent slots nor hold metadata maintenance closed for its owner.
+   * The parent lease owns the wait: an explicit stop or an expiry aborts the
+   * view read through the preparation controller, and the lease is re-checked
+   * on both sides of it, so a duplicate caller can never carry different work
+   * across this fence. An aborted wait is never a refusal: the caller's own
+   * abort path retires the identity, exactly as it always did.
+   */
+  private async assertStartupBindable(a: IsolatedSpawn, fingerprint: string, preparing: Preparing, signal: AbortSignal): Promise<void> {
+    this.checkPreparing(preparing);
+    try {
+      await this.isolation.preflightStartupBind(a.ownerId, a.setup.teamId, a.setup.snapshotId, a.setup.lane,
+        AbortSignal.any([signal, preparing.controller.signal]));
+      this.checkPreparing(preparing);
+    } catch (error) {
+      // ONLY this exact lane refusal is a known outcome of the branch above. A
+      // generic view-store failure (an unreadable index, a host abort, a storage
+      // error) is no evidence that the request was refused, so it never retires
+      // the accepted identity. An aborted wait is likewise the caller's own
+      // abort path, which retires the identity exactly as it always did.
+      if (error instanceof WorkerError && error.code === 'isolation_conflict'
+        && !signal.aborted && !preparing.controller.signal.aborted) {
+        await this.retireStrandedIntent(a, fingerprint, preparing);
+      }
+      throw error;
+    }
+  }
+  /**
+   * Cleans up the ONE thing an earlier build could leave behind: it wrote this
+   * request's intent BEFORE its own preflight refused, and a kept intent has no
+   * deadline, so only an explicit parent stop could ever free the identity. The
+   * retry that is refused for the exact same accepted request retires that
+   * record through one narrow atomic storage step. That record already owns a
+   * durable request identity, so it takes the ordinary retirement tombstone: a
+   * DIFFERENT later request can never recycle it. A refusal with no such record
+   * writes neither an intent slot nor a retirement id. A concurrent duplicate
+   * keeps the record, because its own preparation still owns the lease, and the
+   * same identity pending with different arguments keeps the ordinary
+   * idempotency answer instead of losing it to the earlier refusal.
+   */
+  private async retireStrandedIntent(a: IsolatedSpawn, fingerprint: string, preparing: Preparing): Promise<void> {
+    if (preparing.users !== 1 || this.registrations.has(digest([a.ownerId, a.requestId]))) {
+      return;
+    }
+    const outcome = await this.store.retireStrandedStartupIntent({ ownerId: a.ownerId, requestId: a.requestId, workspaceRoot: this.root,
+      fingerprint, policy: a.parentPolicy ?? 'keep', lane: a.setup.lane, leaseSeconds: preparing.leaseSeconds, expiresAt: preparing.expiresAt });
+    if (outcome === 'changed') {
+      throw new WorkerError('idempotency_conflict', 'This governed startup request is already pending with different arguments. Retry it exactly as accepted, or use a new requestId for new work.');
+    }
+  }
   private async prepare(a: IsolatedSpawn, signal: AbortSignal, action: (signal: AbortSignal, preparing: Preparing) => Promise<unknown>): Promise<unknown> {
     this.assertNotMaintaining(a.ownerId);
     const key = digest([a.ownerId, a.requestId]); const fingerprint = digest(a);
@@ -373,6 +433,22 @@ export class WorkerLifecycle implements ExecutionGovernance {
         // the block entirely, so setup replay survives a namespace rollover.
         const board = await this.board.open();
         board.assertRequest(a.ownerId, a.requestId);
+        // The durable ownership fence of this exact identity answers before the
+        // view read below, so a retired request keeps its `request_expired`
+        // refusal instead of being reported as a bind conflict.
+        this.store.assertStartupLive(a.ownerId, a.requestId, this.root);
+        // Narrow same-owner/team preflight of the ONE bind-time lane rule,
+        // answered after the epoch above and BEFORE this request writes a fresh
+        // intent: a snapshot whose own merge conflict groups are unresolved may
+        // only be bound by its governed integration-lane startup, and refusing it
+        // here keeps the ready task assignment, the worker identity AND the
+        // bounded intent ledger exactly as they were, so metadata maintenance
+        // stays reachable for the owner. Integration-lane startups can never be
+        // refused by this rule, so they skip the read entirely. Neither the store
+        // mutex nor the preparation mutex is held across this view check.
+        if (a.setup.lane !== 'integration') {
+          await this.assertStartupBindable(a, fingerprint, preparing, signal);
+        }
         let shared = this.registrations.get(key);
         if (!shared) {
           // The heartbeat count is sampled where the record is written, so a

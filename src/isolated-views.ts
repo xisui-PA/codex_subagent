@@ -8,7 +8,8 @@ import { createHash } from 'node:crypto';
 import { ContentStore, isFileMode } from './snapshot-content';
 import { LayeredTree } from './layered-tree';
 import type { SnapshotEntry, SnapshotManifest } from './snapshot-content';
-import type { SnapshotBacking, CapturedProject, PendingCapture, StoredSnapshot, OverlayRecord, OverlayRevision, SealedSubmission, ViewPin, ViewReceipt, IsolatedViewBinding } from './isolated-view-types';
+import type { SnapshotBacking, CapturedProject, PendingCapture, StoredSnapshot, OverlayRecord, OverlayRevision, SealedSubmission, ViewPin, ViewReceipt, IsolatedViewBinding, IntegrationArtifactRef, IntegrationComposition, IntegrationConflictHop, IntegrationScope, IntegrationSnapshotProvenance, IntegrationSourceAncestry, StartupBindIdentity } from './isolated-view-types';
+import { mergeIntegrationTrees } from './integration-merge';
 import { IsolatedIndex, validateIndex, parseStoredSnapshot, parseOverlayRecord, parseSealedSubmission, parseViewPin } from './isolated-index';
 import type { ViewIndexData } from './isolated-index';
 import type { IsolatedViewPort, IsolatedViewState, IsolatedViewIdentity } from './isolated-view-port';
@@ -30,10 +31,35 @@ const isIso = (value: string): boolean => ISO_RE.test(value) && Number.isFinite(
 const isPlain = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && [null, Object.prototype].includes(Object.getPrototypeOf(value));
 
+/** Internal integration pins: a reserved name prefix, per attempt and resource. */
+const INTEGRATION_PIN_PREFIX = 'integration:';
+/** One integration batch: the service itself bounds a begin to this many sources. */
+const MAX_INTEGRATION_REFS = 16;
+/**
+ * Deepest stored derived-lineage one composition may carry. A chain longer than
+ * this is corrupt (or hostile), never walked further.
+ */
+const MAX_INTEGRATION_ANCESTRY = 64;
+
+const sha256Bytes = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex');
+
+const sameIntegrationRef = (a: IntegrationArtifactRef, b: IntegrationArtifactRef): boolean =>
+  a.id === b.id && a.version === b.version && a.uri === b.uri;
+
 const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
 const MAX_MANIFEST_FILES = 10_000;
 const MAX_MANIFEST_FILE_BYTES = 32 * 1024 * 1024;
 const MAX_MANIFEST_TOTAL_BYTES = 512 * 1024 * 1024;
+/**
+ * The ONE combined pre-write bound for a composition's DISTINCT payload bytes:
+ * every synthesized merge result plus every native Git blob the final seed still
+ * references, each counted at most once per hash for the whole attempt. It is the
+ * same 512 MiB the manifest tree may reference, so anything the derived seed can
+ * name fits, while the rest of the 600 MiB `begin` reservation stays metadata
+ * room for the 32 MiB manifest and the durable attempt/index records. Bytes are
+ * charged BEFORE they are written, so a refused composition never crosses it.
+ */
+const MAX_COMPOSITION_PAYLOAD_BYTES = MAX_MANIFEST_TOTAL_BYTES;
 
 function invalid(message: string): never {
   throw new WorkerError('isolation_invalid', message);
@@ -522,10 +548,68 @@ export class IsolatedViews implements IsolatedViewPort {
 
   // -- bind ------------------------------------------------------------------
 
+  /**
+   * The ONE lane rule of a bind: a snapshot that carries its own unresolved merge
+   * conflict groups may only be bound by the governed integration-lane startup of
+   * exactly that team and snapshot. Everything else (an ordinary capture, a
+   * conflict-free derived seed, or any legacy record without conflict groups) is
+   * unaffected, and the identity is the host-supplied Session startup, never a
+   * caller field.
+   */
+  private assertStartupLaneForConflicts(snapshot: StoredSnapshot, startup: StartupBindIdentity | undefined): void {
+    const provenance = snapshot.provenance;
+    if (provenance === undefined || provenance.kind !== 'integration-seed' || provenance.conflicts.length === 0) {
+      return;
+    }
+    if (startup === undefined) {
+      conflict('This snapshot is a derived integration seed with unresolved merge conflict groups; only its governed integration-lane startup may bind it.');
+    }
+    if (startup.lane !== 'work' && startup.lane !== 'validation' && startup.lane !== 'integration') {
+      invalid('The internal startup lane must be work, validation or integration.');
+    }
+    if (startup.lane !== 'integration' || startup.teamId !== snapshot.teamId || startup.snapshotId !== snapshot.id) {
+      conflict('This snapshot is a derived integration seed with unresolved merge conflict groups; only its governed integration-lane startup may bind it.');
+    }
+  }
+
+  /**
+   * Narrow startup PREFLIGHT of that same rule, answered BEFORE a governed
+   * startup creates its worker and assigns a ready board task, so an invalid work
+   * or validation bind can never strand an assignment. It reads the durable index
+   * only and publishes nothing; an unknown snapshot, or a snapshot of ANOTHER
+   * owner, is a no-op because the bind itself owns the owner/team scope check.
+   */
+  async assertStartupBindable(
+    ownerId: string, teamId: string, snapshotId: string, lane: StartupBindIdentity['lane'], authorize?: () => void
+  ): Promise<void> {
+    return this.mutex.run(async () => {
+      this.authorize(authorize);
+      requireString(ownerId, 'ownerId', 1, 200);
+      requireTeam(teamId, 'teamId');
+      requireHex64(snapshotId, 'snapshotId');
+      if (lane !== 'work' && lane !== 'validation' && lane !== 'integration') {
+        invalid('The internal startup lane must be work, validation or integration.');
+      }
+      const snapshot = this.assertReady().snapshots[snapshotId];
+      if (snapshot === undefined || snapshot.teamId !== teamId || snapshot.ownerId !== ownerId) {
+        return;
+      }
+      this.assertStartupLaneForConflicts(snapshot, { teamId, snapshotId, lane });
+    });
+  }
+
+  /**
+   * Binds one worker instance to one snapshot. `startup` is the HOST-supplied
+   * governed startup identity of this exact bind (real Session startup record,
+   * never caller input); it is the only thing that may authorize a snapshot whose
+   * OWN merge conflict groups are still unresolved. Every ordinary bind and every
+   * exact ACK replay keeps its original semantics.
+   */
   async bind(
     input: BindInput,
     persistMarker: (binding: IsolatedViewBinding) => Promise<void>,
-    authorize?: () => void
+    authorize?: () => void,
+    startup?: StartupBindIdentity
   ): Promise<OverlayRecord> {
     return this.mutex.run(async () => {
       this.authorize(authorize);
@@ -586,6 +670,13 @@ export class IsolatedViews implements IsolatedViewPort {
       if (snapshot.teamId !== teamId || snapshot.ownerId !== ownerId) {
         conflict(`Snapshot ${snapshotId} belongs to a different owner or team.`);
       }
+      // A derived seed whose OWN merge conflict groups are still unresolved is
+      // not ordinary work: its bytes contain an unreviewed composition, so ONLY
+      // its governed integration-lane startup may bind it. The identity is the
+      // host-supplied real Session startup, compared exactly on team and snapshot,
+      // so a request field can never widen this and an old work-lane seal cannot
+      // launder the conflict. Exact ACK replays returned above are unchanged.
+      this.assertStartupLaneForConflicts(snapshot, startup);
       const overlay = data.overlays[overlayId];
       if (overlay) {
         if (overlay.released) {
@@ -964,6 +1055,11 @@ export class IsolatedViews implements IsolatedViewPort {
       guard();
       this.checkScope(input.ownerId, input.teamId);
       requireString(input.name, 'name', 1, 128);
+      // Legacy public names keep their original reservation: only `binding:`
+      // and `snapshot:` prefixes are internal. An `integration:` public name is
+      // still allowed (and replays exactly as before); it can never reach an
+      // internal integration pin, whose id is derived from the attempt and
+      // which also carries protected integration metadata.
       if (/^(binding|snapshot):/.test(input.name)) {
         invalid('This pin name is reserved for internal retention.');
       }
@@ -1041,6 +1137,14 @@ export class IsolatedViews implements IsolatedViewPort {
           : input.kind === 'pending' ? data.pendingCaptures[input.id]?.snapshot : undefined;
       if (!resource || resource.ownerId !== input.ownerId || resource.teamId !== input.teamId) {
         throw new WorkerError('not_found', 'This resource does not exist in the requested scope.');
+      }
+      // Internal integration pins and derived seeds are released only by their
+      // own durable attempt decision, never by a public retention call.
+      if (input.kind === 'pin' && data.pins[input.id].integration !== undefined) {
+        conflict('An internal integration pin is released only by its own durable attempt decision.');
+      }
+      if (input.kind === 'snapshot' && data.snapshots[input.id].provenance?.kind === 'integration-seed') {
+        conflict('A derived integration seed snapshot is released only by its own durable attempt decision.');
       }
       const references = typeof retained === 'function' ? retained() : retained;
       if (input.kind === 'submission' && (references.has(data.submissions[input.id].uri) || (preserveConsumers && Object.values(data.pins).some(pin => pin.resource.kind === 'submission' && pin.resource.id === input.id)))) {
@@ -1202,6 +1306,29 @@ export class IsolatedViews implements IsolatedViewPort {
         if (pin.resource.kind === 'snapshot') {
           rooted.add(pin.resource.id);
         }
+      }
+      // Durable ancestry edges are part of retention: a rooted derivation (a
+      // live seed pin, an unreleased submission or overlay) also roots every
+      // derived snapshot it was composed from, and the oldest ordinary capture
+      // its lineage rests on. Only edges STORED ON REACHABLE snapshots are
+      // followed, so an unrelated attempt's retired chain still falls to normal
+      // cleanup.
+      const ancestryQueue = [...rooted];
+      while (ancestryQueue.length > 0) {
+        const snapshot = data.snapshots[ancestryQueue.pop() as string];
+        // Only an edge stored on a SAME-SCOPE reachable derivation is followed,
+        // and only to a same-scope parent record. A legacy link that names a
+        // missing or foreign snapshot is skipped, never resolved from live
+        // files, so unrelated cleanup stays possible.
+        const parent = snapshot === undefined || snapshot.ownerId !== input.ownerId || snapshot.teamId !== input.teamId
+          ? undefined : snapshot.provenance?.baseSnapshotId;
+        const record = parent === undefined ? undefined : data.snapshots[parent];
+        if (parent === undefined || record === undefined || record.ownerId !== input.ownerId || record.teamId !== input.teamId
+          || rooted.has(parent)) {
+          continue;
+        }
+        rooted.add(parent);
+        ancestryQueue.push(parent);
       }
       for (const snapshot of Object.values(data.snapshots).filter(snapshot => scoped(snapshot) && !rooted.has(snapshot.id))) {
         this.validateBacking(snapshot.backing, snapshot.id);
@@ -1398,6 +1525,769 @@ export class IsolatedViews implements IsolatedViewPort {
       }, guard);
       const released = [...targets.keys()].filter(id => committed.submissions[id]?.released);
       return { released, preserved };
+    });
+  }
+
+  // -- private integration artifacts -----------------------------------------
+  //
+  // Integration composes a PRIVATE seed snapshot from exact sealed artifacts.
+  // Everything below is durable-first: internal pins are published in ONE index
+  // update before any consumer can observe them, the seed is committed together
+  // with its own provenance and pin, and every replay is answered from those
+  // durable records instead of a receipt that epoch GC could move.
+
+  /** Strict identity of one durable integration attempt. */
+  private integrationScope(scope: unknown): IntegrationScope {
+    if (!isPlain(scope)) {
+      invalid('The integration scope must be an object.');
+    }
+    const expected = new Set(['ownerId', 'teamId', 'attemptId']);
+    if (Object.keys(scope).some(key => !expected.has(key))) {
+      invalid('The integration scope has unknown fields.');
+    }
+    return {
+      ownerId: requireString(scope.ownerId, 'ownerId', 1, 200),
+      teamId: requireTeam(scope.teamId, 'teamId'),
+      attemptId: requireHex64(scope.attemptId, 'attemptId')
+    };
+  }
+
+  /**
+   * Exact ordered refs. An EXACT repeat names the same artifact and is folded
+   * (the merge could not accept a duplicate id); one id with another version or
+   * URI is ambiguous and refused.
+   */
+  private integrationRefs(refs: unknown): IntegrationArtifactRef[] {
+    if (!Array.isArray(refs) || refs.length === 0 || refs.length > MAX_INTEGRATION_REFS) {
+      invalid(`An integration batch must name 1..${MAX_INTEGRATION_REFS} exact artifact refs.`);
+    }
+    const wanted: IntegrationArtifactRef[] = [];
+    const seen = new Map<string, IntegrationArtifactRef>();
+    for (const raw of refs) {
+      if (!isPlain(raw)) {
+        invalid('Each integration artifact ref must be an object.');
+      }
+      const expected = new Set(['id', 'version', 'uri']);
+      if (Object.keys(raw).some(key => !expected.has(key))) {
+        invalid('An integration artifact ref has unknown fields.');
+      }
+      const version = raw.version;
+      if (typeof version !== 'number' || !Number.isSafeInteger(version) || version < 1) {
+        invalid('ref.version must be a positive safe integer.');
+      }
+      const ref: IntegrationArtifactRef = {
+        id: requireHex64(raw.id, 'ref.id'),
+        version,
+        uri: requireString(raw.uri, 'ref.uri', 1, 2048)
+      };
+      const prior = seen.get(ref.id);
+      if (prior !== undefined) {
+        if (!sameIntegrationRef(prior, ref)) {
+          conflict(`Artifact ${ref.id} was requested with different versions or URIs.`);
+        }
+        continue;
+      }
+      seen.set(ref.id, ref);
+      wanted.push(ref);
+    }
+    return wanted;
+  }
+
+  /** Deterministic internal pin: one exact resource per attempt and role. */
+  private integrationPin(scope: IntegrationScope, role: 'source' | 'seed', resource: ViewPin['resource']): ViewPin {
+    const id = sha256(['integration-pin', this.namespace, scope.ownerId, scope.teamId, scope.attemptId, role, resource.kind, resource.id]);
+    return {
+      id,
+      ownerId: scope.ownerId,
+      teamId: scope.teamId,
+      name: `${INTEGRATION_PIN_PREFIX}${id.slice(0, 40)}`,
+      resource: { kind: resource.kind, id: resource.id },
+      integration: { attemptId: scope.attemptId, role }
+    };
+  }
+
+  /** The derived seed identity of this attempt, base and exact source set. */
+  private integrationSeedId(scope: IntegrationScope, baseSnapshotId: string, refs: readonly IntegrationArtifactRef[]): string {
+    return sha256(['integration-seed', this.namespace, scope.ownerId, scope.teamId, scope.attemptId, baseSnapshotId,
+      ...refs.map(ref => `${ref.id}/${ref.version}/${ref.uri}`)]);
+  }
+
+  private retainingPin(data: ViewIndexData, kind: ViewPin['resource']['kind'], id: string): boolean {
+    return Object.values(data.pins).some(pin => pin.resource.kind === kind && pin.resource.id === id);
+  }
+
+  /**
+   * Proves one EXACT explicit seal in this scope: URI, version, worker and head
+   * metadata must all name this submission, a governed runner auto-seal is
+   * refused, and an unreferenced released record is unavailable.
+   */
+  private exactIntegrationSubmission(data: ViewIndexData, scope: IntegrationScope, ref: IntegrationArtifactRef): SealedSubmission {
+    const submission = data.submissions[ref.id];
+    if (!submission || submission.ownerId !== scope.ownerId || submission.teamId !== scope.teamId) {
+      throw new WorkerError('not_found', `No sealed submission ${ref.id} exists in this scope.`);
+    }
+    if (submission.version !== ref.version || submission.uri !== ref.uri
+      || submission.uri !== this.submissionUri(submission.id, submission.version)) {
+      conflict('The artifact ref does not name this exact sealed submission version and URI.');
+    }
+    if (submission.version !== submission.revision + 1 || (submission.head === null) !== (submission.revision === 0)) {
+      throw new WorkerError('isolation_corrupt', 'The sealed submission metadata is inconsistent.');
+    }
+    if (submission.runnerInput === true) {
+      conflict('A governed runner auto-seal is not an explicit integration artifact.');
+    }
+    if (submission.released && !this.retainingPin(data, 'submission', submission.id)) {
+      throw new WorkerError('isolation_released', 'This sealed artifact was released and has no retaining reference.');
+    }
+    return submission;
+  }
+
+  /** Re-reads a durable derived seed and proves its stored bytes still match. */
+  private async replaySeed(seed: StoredSnapshot): Promise<SnapshotManifest> {
+    this.validateBacking(seed.backing, seed.id);
+    if (seed.backing.kind !== 'cas') {
+      throw new WorkerError('isolation_corrupt', 'A derived integration seed must be committed to this store\'s CAS.');
+    }
+    if (!seed.provenance || seed.provenance.kind !== 'integration-seed') {
+      throw new WorkerError('isolation_corrupt', 'A derived integration seed lost its provenance.');
+    }
+    const { manifest } = await this.readManifest(seed.manifestHash);
+    if (sha256(JSON.stringify(manifest)) !== seed.manifestHash) {
+      throw new WorkerError('isolation_corrupt', 'The derived integration seed manifest failed verification.');
+    }
+    return manifest;
+  }
+
+  /** Copies one native provenance so a caller can never alias the index. */
+  private copyIntegrationProvenance(provenance: IntegrationSnapshotProvenance): IntegrationSnapshotProvenance {
+    return {
+      kind: 'integration-seed',
+      attemptId: provenance.attemptId,
+      baseSnapshotId: provenance.baseSnapshotId,
+      refs: provenance.refs.map(ref => ({ id: ref.id, version: ref.version, uri: ref.uri })),
+      conflicts: provenance.conflicts.map(group => ({ paths: [...group.paths], inputIds: [...group.inputIds], reason: group.reason }))
+    };
+  }
+
+  /**
+   * Walks the STORED lineage of one base snapshot down to its oldest ordinary
+   * capture. Every step is an exact snapshot record of this owner and team read
+   * from the index: a missing, foreign, inconsistent or cyclic parent is a
+   * fail-closed hole, never resolved from a live workspace path and never
+   * guessed. The oldest ordinary record (no integration provenance) is returned
+   * as the root and is not listed among the ancestors.
+   */
+  private integrationLineage(
+    data: ViewIndexData, scope: IntegrationScope, baseSnapshotId: string
+  ): { oldest: StoredSnapshot; ancestors: { snapshotId: string; provenance: IntegrationSnapshotProvenance }[] } {
+    const ancestors: { snapshotId: string; provenance: IntegrationSnapshotProvenance }[] = [];
+    const visited = new Set<string>();
+    let currentId = baseSnapshotId;
+    for (;;) {
+      if (visited.has(currentId)) {
+        throw new WorkerError('isolation_corrupt', 'The stored integration lineage contains a cycle.');
+      }
+      visited.add(currentId);
+      const snapshot = data.snapshots[currentId];
+      if (snapshot === undefined) {
+        throw new WorkerError('isolation_corrupt', `The stored integration lineage is missing snapshot ${currentId}; ancestry is never resolved from live files.`);
+      }
+      if (snapshot.ownerId !== scope.ownerId || snapshot.teamId !== scope.teamId) {
+        throw new WorkerError('isolation_corrupt', `The stored integration lineage reaches foreign snapshot ${currentId}.`);
+      }
+      this.validateBacking(snapshot.backing, snapshot.id);
+      const provenance = snapshot.provenance;
+      if (provenance === undefined) {
+        return { oldest: snapshot, ancestors };
+      }
+      if (provenance.kind !== 'integration-seed' || provenance.baseSnapshotId === snapshot.id) {
+        throw new WorkerError('isolation_corrupt', `Snapshot ${snapshot.id} has inconsistent integration ancestry.`);
+      }
+      // A legacy link whose parent record is gone is reported as a MISSING
+      // snapshot (the honest diagnosis) rather than explored further.
+      if (data.snapshots[provenance.baseSnapshotId] === undefined) {
+        throw new WorkerError('isolation_corrupt', `The stored integration lineage is missing snapshot ${provenance.baseSnapshotId}; ancestry is never resolved from live files.`);
+      }
+      // A derived record is durable IDENTITY, not a hint: it must be CAS-backed
+      // and its id must be exactly what this store's seed formula yields for its
+      // OWN attempt, base and exact refs. Any other link is noncanonical and
+      // fails closed (it would name a seed this store never composed).
+      if (snapshot.backing.kind !== 'cas'
+        || this.integrationSeedId({ ownerId: scope.ownerId, teamId: scope.teamId, attemptId: provenance.attemptId },
+          provenance.baseSnapshotId, provenance.refs) !== snapshot.id) {
+        throw new WorkerError('isolation_corrupt', `Snapshot ${snapshot.id} is not this store's canonical derived seed record for its own attempt, base and refs.`);
+      }
+      if (ancestors.length >= MAX_INTEGRATION_ANCESTRY) {
+        throw new WorkerError('isolation_capacity', `The stored integration lineage exceeds ${MAX_INTEGRATION_ANCESTRY} derived snapshots.`);
+      }
+      ancestors.push({ snapshotId: snapshot.id, provenance: this.copyIntegrationProvenance(provenance) });
+      currentId = provenance.baseSnapshotId;
+    }
+  }
+
+  /**
+   * The CONFLICTED hops of one stored lineage, leaf-most first, each with the
+   * exact refs that hop carried. `carried` is the begin's own selection, i.e. the
+   * refs the immediate base is being consumed by here; a deeper hop was consumed
+   * by its child seed's own stored provenance refs, so the same ledger proof
+   * applies at every depth. A hop is only listed - and therefore only proved -
+   * when its OWN conflict groups are unresolved; a conflict-free hop keeps the
+   * ordinary clean ancestry.
+   */
+  private conflictHops(
+    ancestors: readonly { snapshotId: string; provenance: IntegrationSnapshotProvenance }[],
+    carried: readonly IntegrationArtifactRef[]
+  ): IntegrationConflictHop[] {
+    const hops: IntegrationConflictHop[] = [];
+    for (let index = 0; index < ancestors.length; index += 1) {
+      const ancestor = ancestors[index];
+      if (ancestor.provenance.conflicts.length === 0) {
+        continue;
+      }
+      const refs = index === 0 ? carried : ancestors[index - 1].provenance.refs;
+      hops.push({
+        snapshotId: ancestor.snapshotId,
+        provenance: this.copyIntegrationProvenance(ancestor.provenance),
+        refs: refs.map(ref => ({ id: ref.id, version: ref.version, uri: ref.uri }))
+      });
+    }
+    return hops;
+  }
+
+  /**
+   * Exact stored ancestry of this attempt's sealed sources, read under the same
+   * view mutex as every other retention decision. Each ref must be the EXACT
+   * seal of this owner and team, all of them must name ONE immediate base, and
+   * that base's durable lineage is walked to its oldest ordinary capture. The
+   * returned provenance records are exact native copies, so no caller can alias
+   * or mutate store state.
+   */
+  async integrationSourceAncestry(scope: IntegrationScope, refs: readonly IntegrationArtifactRef[], authorize?: () => void): Promise<IntegrationSourceAncestry> {
+    return this.mutex.run(async () => {
+      const guard = (): void => this.authorize(authorize);
+      guard();
+      const exact = this.integrationScope(scope);
+      const wanted = this.integrationRefs(refs);
+      const data = this.assertReady();
+      let sourceSnapshotId: string | undefined;
+      for (const ref of wanted) {
+        guard();
+        const submission = this.exactIntegrationSubmission(data, exact, ref);
+        if (sourceSnapshotId !== undefined && sourceSnapshotId !== submission.snapshotId) {
+          conflict('These artifacts were sealed over different base snapshots and share no stored ancestry.');
+        }
+        sourceSnapshotId = submission.snapshotId;
+      }
+      const base = sourceSnapshotId as string;
+      const lineage = this.integrationLineage(data, exact, base);
+      // The oldest ordinary capture is the baseline this lineage really rests
+      // on, so it must still resolve from immutable storage before an ancestry
+      // answer can be given for it. When the immediate base is itself a derived
+      // seed, its own stored bytes must resolve too: a caller is never handed a
+      // chain whose first link is already gone.
+      await this.ensureRetention(lineage.oldest.id, lineage.oldest.backing, guard);
+      await this.readManifest(lineage.oldest.manifestHash);
+      guard();
+      if (lineage.oldest.id !== base) {
+        const immediate = data.snapshots[base];
+        await this.ensureRetention(immediate.id, immediate.backing, guard);
+        await this.readManifest(immediate.manifestHash);
+        guard();
+      }
+      return { sourceSnapshotId: base, ancestors: lineage.ancestors };
+    });
+  }
+
+  /**
+   * Retains this attempt's exact artifacts in ONE atomic pin publication, after
+   * proving every ref and that its exact sealed revision is actually available.
+   */
+  async retainIntegrationArtifacts(
+    scope: IntegrationScope, refs: readonly IntegrationArtifactRef[], authorize?: () => void,
+    verify?: (submissions: readonly SealedSubmission[]) => void | Promise<void>
+  ): Promise<SealedSubmission[]> {
+    return this.mutex.run(async () => {
+      const guard = (): void => this.authorize(authorize);
+      guard();
+      const exact = this.integrationScope(scope);
+      const wanted = this.integrationRefs(refs);
+      const data = this.assertReady();
+      const proven: SealedSubmission[] = [];
+      for (const ref of wanted) {
+        guard();
+        const submission = this.exactIntegrationSubmission(data, exact, ref);
+        // Actual availability: the snapshot, its retention, the manifest and
+        // the EXACT sealed revision chain all resolve from immutable storage.
+        await this.loadState(data, submission, guard);
+        guard();
+        proven.push(structuredClone(submission));
+      }
+      // The caller's verifier runs AFTER every exact immutable seal is proven
+      // and BEFORE any index pin changes, under this same view lock: a refusal
+      // (wrong base, wrong lane) publishes no pin and leaves no partial set,
+      // while an accepted set is published in the ONE update below.
+      if (verify !== undefined) {
+        if (typeof verify !== 'function') {
+          invalid('The artifact verifier must be a function.');
+        }
+        await verify(proven.map(submission => structuredClone(submission)));
+        guard();
+      }
+      const pins = proven.map(submission => this.integrationPin(exact, 'source', { kind: 'submission', id: submission.id }));
+      const publish = (draft: ViewIndexData): void => {
+        for (const pin of pins) {
+          const current = draft.pins[pin.id];
+          if (current !== undefined && (current.name !== pin.name || current.resource.kind !== pin.resource.kind
+            || current.resource.id !== pin.resource.id || current.integration?.attemptId !== exact.attemptId
+            || current.integration?.role !== 'source')) {
+            throw new WorkerError('isolation_conflict', 'An internal integration pin is claimed by a different attempt.');
+          }
+          draft.pins[pin.id] = pin;
+        }
+      };
+      this.preflightIndex(publish);
+      await this.index.update(publish, guard);
+      return proven;
+    });
+  }
+
+  /**
+   * Publishes this attempt's private derived seed under the same view/index lock
+   * as the pins it reads. Inputs come from durable pins only, must share ONE
+   * exact base snapshot, and are merged from their actual LayeredTree entries
+   * and raw validated immutable bytes; the seed is a coherent CAS snapshot the
+   * attempt keeps pinned, never a publication. Payload writes are bounded ONCE
+   * (MAX_COMPOSITION_PAYLOAD_BYTES of distinct bytes) across the synthesized
+   * merge results and the native Git blobs the final seed still references, so
+   * the whole composition fits its reservation instead of growing per phase.
+   *
+   * A stored lineage that contains a seed with UNRESOLVED conflict groups may
+   * only be composed (or replayed) when `verifyAncestry` - the ledger's own
+   * resolution proof - accepts every such hop. The verifier is awaited under this
+   * same mutex BEFORE any composed write and BEFORE a durable seed is replayed,
+   * and an ancestry that needs it but has no verifier fails closed.
+   */
+  async composeIntegration(
+    scope: IntegrationScope,
+    refs: readonly IntegrationArtifactRef[],
+    authorize?: () => void,
+    verifyAncestry?: (chain: readonly IntegrationConflictHop[]) => void | Promise<void>
+  ): Promise<IntegrationComposition> {
+    return this.mutex.run(() => this.withStorageWrite(async () => {
+      const guard = (): void => this.authorize(authorize);
+      guard();
+      const exact = this.integrationScope(scope);
+      const wanted = this.integrationRefs(refs);
+      const data = this.assertReady();
+      const inputs: { id: string; submission: SealedSubmission; snapshot: StoredSnapshot; state: IsolatedViewState }[] = [];
+      let baseSnapshotId: string | undefined;
+      for (const ref of wanted) {
+        guard();
+        const submission = this.exactIntegrationSubmission(data, exact, ref);
+        const pin = this.integrationPin(exact, 'source', { kind: 'submission', id: submission.id });
+        const pinned = data.pins[pin.id];
+        if (pinned === undefined || pinned.resource.kind !== 'submission' || pinned.resource.id !== submission.id
+          || pinned.integration?.attemptId !== exact.attemptId) {
+          conflict('Retain these exact artifacts for this attempt before composing them.');
+        }
+        if (baseSnapshotId !== undefined && baseSnapshotId !== submission.snapshotId) {
+          conflict('These artifacts were sealed over different base snapshots and cannot be composed.');
+        }
+        baseSnapshotId = submission.snapshotId;
+        const snapshot = data.snapshots[submission.snapshotId];
+        if (!snapshot || snapshot.ownerId !== exact.ownerId || snapshot.teamId !== exact.teamId) {
+          throw new WorkerError('isolation_corrupt', 'The integration base snapshot is missing from this scope.');
+        }
+        const state = await this.loadState(data, submission, guard);
+        guard();
+        inputs.push({ id: submission.id, submission, snapshot, state });
+      }
+      const base = baseSnapshotId as string;
+      const baseSnapshot = inputs[0].snapshot;
+      const seedId = this.integrationSeedId(exact, base, wanted);
+      // The stored lineage is read FIRST, before a durable seed is replayed or a
+      // single composed byte is written, because a CONFLICTED hop is a decision
+      // this service is not allowed to make on its own: the ledger must prove that
+      // the hop was consumed by its exact accepted resolution.
+      const lineage = baseSnapshot.provenance === undefined ? undefined : this.integrationLineage(data, exact, base);
+      const hops = lineage === undefined ? [] : this.conflictHops(lineage.ancestors, wanted);
+      if (hops.length > 0) {
+        if (verifyAncestry === undefined) {
+          conflict('This composition would consume a derived seed with unresolved merge conflict groups and no resolution verifier proved that ancestry; nothing was composed.');
+        }
+        // `conflictHops` already returns isolated copies of the stored
+        // provenance and refs, so the verifier is handed exactly those.
+        await verifyAncestry(hops);
+        guard();
+      }
+      const existing = Object.values(data.snapshots).filter(snapshot => snapshot.ownerId === exact.ownerId
+        && snapshot.teamId === exact.teamId && snapshot.provenance?.kind === 'integration-seed'
+        && snapshot.provenance.attemptId === exact.attemptId);
+      if (existing.length > 0) {
+        // Safe replay or refusal from the seed's own durable provenance: no
+        // receipt is consulted, so an epoch rollover cannot lose this decision.
+        const seed = existing.length === 1 ? existing[0] : undefined;
+        const provenance = seed?.provenance;
+        if (!seed || !provenance || seed.id !== seedId || provenance.baseSnapshotId !== base
+          || provenance.refs.length !== wanted.length || provenance.refs.some((ref, index) => !sameIntegrationRef(ref, wanted[index]))) {
+          conflict('This attempt already composed a different exact source set.');
+        }
+        await this.replaySeed(seed);
+        guard();
+        return {
+          snapshot: structuredClone(seed), baseSnapshotId: base,
+          conflicts: provenance.conflicts.map(group => ({ paths: [...group.paths], inputIds: [...group.inputIds], reason: group.reason }))
+        };
+      }
+      // A FRESH composition over a base that is itself a derived seed must prove
+      // that stored lineage FIRST: a known legacy hole (or a foreign/corrupted
+      // link) would otherwise yield a brand-new attempt that only strands itself
+      // in `applying` when publication walks the same chain. Only the oldest
+      // ordinary capture manifest is read from immutable storage -- never the
+      // intermediate trees, which composition does not need. The replay path
+      // above keeps its prove-only behavior for an in-flight attempt. A conflicted
+      // hop was already offered to the ledger's verifier above.
+      if (lineage !== undefined) {
+        await this.ensureRetention(lineage.oldest.id, lineage.oldest.backing, guard);
+        await this.readManifest(lineage.oldest.manifestHash);
+        guard();
+      }
+      this.validateBacking(baseSnapshot.backing, baseSnapshot.id);
+      await this.ensureRetention(baseSnapshot.id, baseSnapshot.backing, guard);
+      const baseManifest = (await this.readManifest(baseSnapshot.manifestHash)).manifest;
+      const baseEntries = new LayeredTree(this.index.root, baseManifest.entries).entries;
+      // Every UNIQUE visible file hash of every pinned input (plus the base) is
+      // verified from immutable storage exactly ONCE, one file at a time, and
+      // only its verified LENGTH is remembered. Hash AND size must agree with
+      // the recorded entry, and the body is dropped again immediately, so
+      // composition never holds more than a single file in memory no matter how
+      // many inputs or bytes the attempt names. No live workspace path is used.
+      // Verification writes NOTHING: a native Git blob is copied into this
+      // store's CAS only after the merge, and only when the FINAL seed still
+      // references it, so bytes the merge replaced or deleted are never
+      // materialized.
+      const sources = new Map<string, { read: (hash: string) => Promise<Buffer>; size: number; copy: boolean }>();
+      const readers = new Map<string, (hash: string) => Promise<Buffer>>();
+      const readerFor = (snapshot: StoredSnapshot): ((hash: string) => Promise<Buffer>) => {
+        const known = readers.get(snapshot.id);
+        if (known !== undefined) {
+          return known;
+        }
+        const created = this.readContent
+          ? (hash: string) => this.readContent!(snapshot.backing, this.content, hash, guard)
+          : createProjectContentReader(snapshot.backing, this.content, guard);
+        readers.set(snapshot.id, created);
+        return created;
+      };
+      const note = (snapshot: StoredSnapshot, hash: string, size: number): void => {
+        // A hash recorded by a Git backing is NATIVE: it is readable only from
+        // that repository until it is copied here. Whether it is copied at all
+        // is decided AFTER the merge from the final seed, so a native blob the
+        // merge replaced or deleted is never materialized. Any other hash is
+        // already content-addressed in this store and is never copied again.
+        const copy = snapshot.backing.kind === 'git' && Object.hasOwn(snapshot.backing.blobs, hash);
+        const known = sources.get(hash);
+        if (known === undefined) {
+          sources.set(hash, { read: readerFor(snapshot), size, copy });
+          return;
+        }
+        if (known.size !== size) {
+          throw new WorkerError('isolation_corrupt', `The immutable bytes for ${hash} are recorded with two different sizes.`);
+        }
+        known.copy = known.copy || copy;
+      };
+      for (const entry of Object.values(baseEntries)) {
+        if (entry.type === 'file') {
+          note(baseSnapshot, entry.hash, entry.size);
+        }
+      }
+      for (const input of inputs) {
+        for (const entry of Object.values(input.state.tree.entries)) {
+          if (entry.type === 'file') {
+            note(input.snapshot, entry.hash, entry.size);
+          }
+        }
+      }
+      // Sequential and deduplicated by hash: every named hash is proved present,
+      // immutable and hash/size exact BEFORE the merge, one failure aborts with
+      // its own error, and each body is released before the next hash is read.
+      // No payload is written by this pass.
+      const verified = new Map<string, number>();
+      for (const [hash, source] of sources) {
+        guard();
+        const content = await source.read(hash);
+        guard();
+        if (content.length !== source.size || sha256Bytes(content) !== hash) {
+          throw new WorkerError('snapshot_content_missing', `The immutable bytes for ${hash} do not match their recorded hash and size.`);
+        }
+        verified.set(hash, source.size);
+      }
+      // ONE ledger for every payload byte this attempt writes. A hash is charged
+      // at most once, whatever produced it, so repeated bytes (the same merge
+      // result twice, or a native blob two inputs share) can never exhaust the
+      // bound twice; charging always happens BEFORE the write.
+      const charged = new Map<string, number>();
+      const synthesized = new Set<string>();
+      let chargedBytes = 0;
+      const charge = (hash: string, size: number): void => {
+        const known = charged.get(hash);
+        if (known !== undefined) {
+          if (known !== size) {
+            throw new WorkerError('isolation_corrupt', `The composition payload for ${hash} is recorded with two different sizes.`);
+          }
+          return;
+        }
+        const next = chargedBytes + size;
+        if (next > MAX_COMPOSITION_PAYLOAD_BYTES) {
+          throw new WorkerError('snapshot_capacity',
+            `This composition would write ${next} distinct payload bytes; the limit is ${MAX_COMPOSITION_PAYLOAD_BYTES}.`);
+        }
+        charged.set(hash, size);
+        chargedBytes = next;
+      };
+      const readBase = async (key: string): Promise<{ bytes: Buffer }> => {
+        guard();
+        const entry = Object.prototype.hasOwnProperty.call(baseEntries, key) ? baseEntries[key] : undefined;
+        if (entry === undefined || entry.type !== 'file') {
+          throw new WorkerError('not_found', 'The shared base snapshot has no file at this path.');
+        }
+        if (verified.get(entry.hash) !== entry.size) {
+          throw new WorkerError('isolation_corrupt', 'The merge asked for base bytes that were not verified.');
+        }
+        // Reread the verified bytes from immutable storage instead of retaining
+        // them: only the paths several inputs changed are ever asked for.
+        const content = await readerFor(baseSnapshot)(entry.hash);
+        guard();
+        if (content.length !== entry.size || sha256Bytes(content) !== entry.hash) {
+          throw new WorkerError('snapshot_content_missing', `The immutable bytes for ${entry.hash} do not match their recorded hash and size.`);
+        }
+        return { bytes: content };
+      };
+      guard();
+      const merged = await mergeIntegrationTrees(this.index.root, baseEntries, readBase,
+        inputs.map(input => ({ id: input.id, entries: input.state.tree.entries, read: input.state.read })),
+        async (putBytes: Buffer) => {
+          guard();
+          // A synthesized merge result is charged by its own hash BEFORE it is
+          // written, so the bound is never crossed and identical results cost
+          // once.
+          const hash = sha256Bytes(putBytes);
+          charge(hash, putBytes.length);
+          if (await this.content.put(putBytes, guard) !== hash) {
+            throw new WorkerError('snapshot_content_missing', 'The synthesized merged bytes changed their hash.');
+          }
+          synthesized.add(hash);
+          guard();
+          return hash;
+        });
+      const mergedEntries: Record<string, SnapshotEntry> = Object.create(null);
+      for (const key of Object.getOwnPropertyNames(baseEntries)) {
+        if (!Object.prototype.hasOwnProperty.call(merged.changes, key)) {
+          mergedEntries[key] = baseEntries[key];
+        }
+      }
+      for (const key of Object.keys(merged.changes)) {
+        const change = merged.changes[key];
+        if (change !== null) {
+          mergedEntries[key] = change;
+        }
+      }
+      const entries = new LayeredTree(this.index.root, mergedEntries).entries;
+      let fileCount = 0;
+      let totalBytes = 0;
+      for (const entry of Object.values(entries)) {
+        if (entry.type === 'file') {
+          fileCount += 1;
+          totalBytes += entry.size;
+        }
+      }
+      // Deterministic identity of the composed content, independent of time:
+      // the seed is the SAME bytes on every replay of this exact source set.
+      const fingerprint = sha256(['integration-seed-fingerprint', this.namespace, exact.ownerId, exact.teamId, exact.attemptId, base,
+        JSON.stringify(Object.keys(entries).sort().map(key => [key, entries[key]]))]);
+      const candidate: SnapshotManifest = {
+        schema: 1, root: this.index.root, capturedAt: baseManifest.capturedAt, fingerprint, fileCount, totalBytes,
+        entries: { ...entries }
+      };
+      const { manifest, capturedAt } = this.validateManifest(candidate);
+      const manifestText = JSON.stringify(manifest);
+      if (Buffer.byteLength(manifestText, 'utf8') > MAX_MANIFEST_BYTES) {
+        throw new WorkerError('snapshot_capacity', 'The derived seed manifest exceeds 32 MiB.');
+      }
+      // The FINAL seed decides what is copied. Only native Git blobs it still
+      // references are materialized - a native blob the merge replaced or
+      // deleted never reaches this store - and their whole distinct remaining
+      // total is preflighted TOGETHER with every synthesized write already
+      // attempted, before a single further byte is written.
+      const nativeCopies = new Map<string, { read: (hash: string) => Promise<Buffer>; size: number }>();
+      let remainingBytes = 0;
+      for (const entry of Object.values(entries)) {
+        if (entry.type !== 'file' || synthesized.has(entry.hash) || nativeCopies.has(entry.hash)) {
+          continue;
+        }
+        const source = sources.get(entry.hash);
+        if (source === undefined) {
+          throw new WorkerError('isolation_corrupt',
+            `The derived seed references ${entry.hash}, which this composition never verified.`);
+        }
+        if (verified.get(entry.hash) !== entry.size || source.size !== entry.size) {
+          throw new WorkerError('isolation_corrupt', 'The derived seed records a file size that was not verified.');
+        }
+        if (!source.copy) {
+          // Already content-addressed in this store: never copied again.
+          continue;
+        }
+        if (!charged.has(entry.hash)) {
+          remainingBytes += source.size;
+        }
+        nativeCopies.set(entry.hash, source);
+      }
+      if (chargedBytes + remainingBytes > MAX_COMPOSITION_PAYLOAD_BYTES) {
+        throw new WorkerError('snapshot_capacity',
+          `This composition would write ${chargedBytes + remainingBytes} distinct payload bytes; the limit is ${MAX_COMPOSITION_PAYLOAD_BYTES}.`);
+      }
+      for (const [hash, source] of nativeCopies) {
+        charge(hash, source.size);
+        guard();
+        // Fail-closed: the final native bytes are read AGAIN from their actual
+        // immutable backing and must still match the recorded hash and size
+        // before they are copied into this store's CAS.
+        const content = await source.read(hash);
+        guard();
+        if (content.length !== source.size || sha256Bytes(content) !== hash) {
+          throw new WorkerError('snapshot_content_missing', `The immutable bytes for ${hash} do not match their recorded hash and size.`);
+        }
+        if (await this.content.put(content, guard) !== hash) {
+          throw new WorkerError('snapshot_content_missing', 'The copied immutable bytes changed their hash.');
+        }
+        guard();
+      }
+      const manifestHash = sha256(manifestText);
+      if (await this.content.put(Buffer.from(manifestText, 'utf8'), guard) !== manifestHash) {
+        throw new WorkerError('snapshot_content_missing', 'The stored seed manifest hash changed.');
+      }
+      guard();
+      const conflicts = merged.conflicts.map(group => ({ paths: [...group.paths], inputIds: [...group.inputIds], reason: group.reason }));
+      const seed: StoredSnapshot = {
+        id: seedId, teamId: exact.teamId, ownerId: exact.ownerId, manifestHash, backing: { kind: 'cas' }, createdAt: capturedAt,
+        provenance: {
+          kind: 'integration-seed', attemptId: exact.attemptId, baseSnapshotId: base,
+          refs: wanted.map(ref => ({ id: ref.id, version: ref.version, uri: ref.uri })), conflicts
+        }
+      };
+      const seedPin = this.integrationPin(exact, 'seed', { kind: 'snapshot', id: seed.id });
+      const publish = (draft: ViewIndexData): void => {
+        if (draft.snapshots[seed.id] !== undefined) {
+          throw new WorkerError('isolation_conflict', 'The derived seed snapshot was published while composing.');
+        }
+        const claimed = Object.values(draft.pins).find(pin => pin.integration?.attemptId === exact.attemptId
+          && pin.integration.role === 'seed' && pin.resource.id !== seed.id);
+        if (claimed !== undefined) {
+          throw new WorkerError('isolation_conflict', 'This attempt already has a different derived seed snapshot.');
+        }
+        draft.snapshots[seed.id] = seed;
+        draft.pins[seedPin.id] = seedPin;
+      };
+      this.preflightIndex(publish);
+      const committed = await this.index.update(publish, guard);
+      return { snapshot: structuredClone(committed.snapshots[seed.id]), baseSnapshotId: base, conflicts };
+    }));
+  }
+
+  /**
+   * Drops exactly this attempt's internal pins - nothing else. A producer or
+   * candidate sealed submission is NEVER marked released here, and no private
+   * view is touched, so an otherwise live explicit artifact stays readable
+   * after this attempt is released and collected. The derived seed simply
+   * becomes an ordinary unreferenced snapshot, which the existing
+   * reference-aware cleanup collects only once nothing (an unreleased
+   * submission or overlay) still roots it. Idempotent, and the ONLY path that
+   * may release an integration pin: a public retention call refuses them.
+   */
+  async releaseIntegrationArtifacts(scope: IntegrationScope, authorize?: () => void): Promise<void> {
+    return this.mutex.run(async () => {
+      const guard = (): void => this.authorize(authorize);
+      guard();
+      const exact = this.integrationScope(scope);
+      const data = this.assertReady();
+      const own = Object.values(data.pins)
+        .filter(pin => pin.ownerId === exact.ownerId && pin.teamId === exact.teamId
+          && pin.integration?.attemptId === exact.attemptId)
+        .map(pin => pin.id);
+      if (own.length === 0) {
+        return;
+      }
+      const apply = (draft: ViewIndexData): void => {
+        for (const id of own) {
+          const pin = draft.pins[id];
+          if (pin !== undefined && pin.integration?.attemptId === exact.attemptId) {
+            delete draft.pins[id];
+          }
+        }
+      };
+      this.preflightIndex(apply);
+      await this.index.update(apply, guard);
+    });
+  }
+
+  /**
+   * Offers the CAPTURED original base manifest and this attempt's sealed
+   * candidate view under the view lock. Every identity is proved from durable
+   * records: this attempt's exact internal pin, its derived seed and the
+   * original base the seed was composed over.
+   */
+  async withIntegrationCandidate<T>(
+    scope: IntegrationScope, baseSnapshotId: string, ref: IntegrationArtifactRef,
+    action: (base: SnapshotManifest, candidate: IsolatedViewState, submission: SealedSubmission) => T | Promise<T>,
+    authorize?: () => void
+  ): Promise<T> {
+    return this.mutex.run(async () => {
+      const guard = (): void => this.authorize(authorize);
+      guard();
+      if (typeof action !== 'function') {
+        invalid('withIntegrationCandidate requires an action function.');
+      }
+      const exact = this.integrationScope(scope);
+      const wanted = this.integrationRefs([ref])[0];
+      const base = requireHex64(baseSnapshotId, 'baseSnapshotId');
+      const data = this.assertReady();
+      const submission = this.exactIntegrationSubmission(data, exact, wanted);
+      const pin = this.integrationPin(exact, 'source', { kind: 'submission', id: submission.id });
+      const pinned = data.pins[pin.id];
+      if (pinned === undefined || pinned.resource.kind !== 'submission' || pinned.resource.id !== submission.id
+        || pinned.integration?.attemptId !== exact.attemptId) {
+        conflict('This candidate is not an exact artifact retained by this integration attempt.');
+      }
+      const seed = data.snapshots[submission.snapshotId];
+      const provenance = seed?.provenance;
+      // The candidate must be SEALED OVER this attempt's derived seed, and that
+      // seed must name the original base the caller accepted. The candidate is
+      // a new submission over the seed, so it is proved by the pin and snapshot
+      // identity below, not by being one of the seed's source refs.
+      if (!seed || !provenance || provenance.kind !== 'integration-seed' || provenance.attemptId !== exact.attemptId
+        || provenance.baseSnapshotId !== base) {
+        conflict('This candidate is not sealed over this attempt\'s derived seed for the accepted base.');
+      }
+      await this.replaySeed(seed);
+      guard();
+      // The candidate's exact immediate parent (this attempt's derived seed),
+      // its attempt and the accepted base are proved above. Publication must
+      // diff and check EDITOR ORIGIN against the oldest ordinary capture of
+      // that stored lineage - the real workspace baseline - because an
+      // intermediate derived seed is a private composition the workspace never
+      // holds and it carries no editor provenance of its own. The chain is
+      // stored data only: a missing, foreign or cyclic parent fails closed
+      // instead of falling back to live files.
+      const lineage = this.integrationLineage(data, exact, seed.id);
+      const baseline = lineage.oldest;
+      this.validateBacking(baseline.backing, baseline.id);
+      await this.ensureRetention(baseline.id, baseline.backing, guard);
+      const baseManifest = (await this.readManifest(baseline.manifestHash)).manifest;
+      const candidate = await this.loadState(data, submission, guard);
+      guard();
+      const result = await action(baseManifest, candidate, structuredClone(submission));
+      guard();
+      return result;
     });
   }
 
@@ -1785,7 +2675,7 @@ export class IsolatedViews implements IsolatedViewPort {
     if (!isPlain(raw)) {
       invalid('The capture manifest must be an object.');
     }
-    const expected = new Set(['schema', 'root', 'capturedAt', 'fingerprint', 'fileCount', 'totalBytes', 'entries']);
+    const expected = new Set(['schema', 'root', 'capturedAt', 'fingerprint', 'fileCount', 'totalBytes', 'entries', 'editorPaths']);
     if (Object.keys(raw).some(key => !expected.has(key))) {
       invalid('The capture manifest has unknown fields.');
     }
@@ -1864,6 +2754,26 @@ export class IsolatedViews implements IsolatedViewPort {
       }
       if (fileEntrySize !== undefined && fileEntrySize > MAX_MANIFEST_FILE_BYTES) {
         throw new WorkerError('snapshot_capacity', `Manifest file ${JSON.stringify(key)} exceeds 32 MiB.`);
+      }
+    }
+    // Optional editor provenance: an explicit `[]` means every captured path
+    // came from raw disk, while an ABSENT field stays the legacy "unknown". When
+    // present it must be sorted, unique and name EXACT captured file keys.
+    const editorPaths = (manifest as Record<string, unknown>).editorPaths;
+    if (editorPaths !== undefined) {
+      if (!Array.isArray(editorPaths) || editorPaths.length > MAX_MANIFEST_FILES
+        || editorPaths.some(value => typeof value !== 'string' || value.length === 0 || value.length > 4096)) {
+        invalid('The capture manifest editorPaths must be an array of relative POSIX paths.');
+      }
+      for (let index = 0; index < editorPaths.length; index += 1) {
+        const key = editorPaths[index] as string;
+        if (index > 0 && !((editorPaths[index - 1] as string) < key)) {
+          invalid('The capture manifest editorPaths must be sorted and unique.');
+        }
+        const entry = Object.prototype.hasOwnProperty.call(entries, key) ? entries[key] : undefined;
+        if (!isPlain(entry) || entry.type !== 'file') {
+          invalid(`The manifest editor path ${JSON.stringify(key)} is not an exact captured file.`);
+        }
       }
     }
     if (files > MAX_MANIFEST_FILES) {

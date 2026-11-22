@@ -445,6 +445,12 @@
           "scope": "machine",
           "description": "Opt in to shared immutable snapshots and private file overlays for explicitly bound team workers. Requires taskBoard.enabled in User Settings. Bind a stopped owned team member before resuming it; initial unbound turns retain legacy behavior. Shell execution for these workers needs the separate isolatedViews.runners.enabled opt-in; without it, bound run_command fails with isolated_shell_unavailable and never falls back to legacy shell. Disabling this setting preserves private content and permanently marked sessions fail closed. No automatic dispatch or integration."
         },
+        "codexSubagent.isolatedViews.integration.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "description": "Opt in to coordinator-managed integration attempts. Requires resources.enabled, taskBoard.enabled and isolatedViews.enabled in User Settings. Validation uses the separately enabled isolated runner. Acceptance and application require explicit coordinator decisions."
+        },
         "codexSubagent.isolatedViews.runners.enabled": {
           "type": "boolean",
           "default": false,

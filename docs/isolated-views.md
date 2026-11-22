@@ -6,7 +6,9 @@ overlay revisions, sealed submissions, retention pins, cleanup, and the MCP
 tool surface. The task-board records remain separate from this file view. This
 stage implements no peer messaging, automatic dispatch or automatic
 acceptance; a sealed submission is an immutable artifact, not proof of
-validation or integration. Bound workers also get an opt-in bounded private
+validation or integration. Opt-in [coordinator integration](integration.md)
+consumes sealed submissions only through explicit decisions. Bound workers
+also get an opt-in bounded private
 shell; unbound legacy workers keep their existing shell behavior unchanged.
 See [runner workspaces](runner-workspaces.md).
 
@@ -235,7 +237,8 @@ unchanged.
   artifacts they consume; pinning is the mechanism for that. A stored runner
   command result is evidence, not such a pin.
 - Integration must recheck current working-tree and dirty-editor base
-  hashes and path protections before applying a sealed change.
+  hashes and path protections before applying a sealed change, as described in
+  [coordinator integration](integration.md).
 - The synthetic Git retention tree is **not** the project's tree or a
   project commit.
 - Stored entries retain a file mode (optional `644`/`755`, absent defaults to
@@ -246,7 +249,9 @@ unchanged.
 - Runner execution for bound workers is implemented and opt-in; its slot pool,
   materialized view, immutable command results, containment and approval prompt
   are described in [runner workspaces](runner-workspaces.md). Integration, peer
-  messaging, automatic dispatch and auto-acceptance still do not exist.
+  messaging, automatic dispatch and auto-acceptance remain absent, and
+  integration runs only as explicit [coordinator integration](integration.md)
+  decisions.
 
 ## Validation
 

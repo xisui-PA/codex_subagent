@@ -234,7 +234,10 @@ Counts and previews are bounded, and other identities are never shown.
 
 ## What a result does not mean
 
-- No automatic dispatch, integration or acceptance, and no peer messaging.
+- No automatic dispatch or acceptance and no peer messaging. Integration runs
+  only as explicit opt-in coordinator decisions that use scoped runner results
+  as validation evidence, described in
+  [coordinator integration](integration.md).
 - No automatic task-board validation of a command result.
 - A stored command result is evidence of what ran, not an approval shortcut: it
   is not an artifact pin and not a verdict.
@@ -242,7 +245,8 @@ Counts and previews are bounded, and other identities are never shown.
   command has tested until one runs, so nothing may claim the "latest" revision
   was validated automatically. Later consumers must pin the retained artifact
   and compare the exact input revision; evidence acceptance and integration stay
-  distinct decisions.
+  distinct decisions. Publication stays an explicit
+  [coordinator integration](integration.md) decision.
 
 ## Validation
 
@@ -288,4 +292,5 @@ Governed results carry an exact retained input submission in the optional
 and explicit evidence pins before deleting named final results or released lease
 history. Receipt epochs reclaim metadata without resetting immutable identities
 or replaying expired requests. These operations do not validate imports or
-implement integration.
+publish work. Integration remains a separate explicit coordinator workflow,
+described in [coordinator integration](integration.md).

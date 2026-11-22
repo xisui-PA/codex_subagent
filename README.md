@@ -26,7 +26,7 @@ Copy this connection test into Codex chat (the setup/register notification offer
 List the available `codex_subagent` MCP tools, then call `subagent_health` through MCP. Do not substitute a shell command.
 ```
 
-A successful test lists all 32 tools — 13 worker controls, the 8 task-board tools described in [Task board](#task-board-opt-in), and the 11 isolated-view tools (8 view/profile tools plus the 3 runner tools described in [Isolated runner shell](#isolated-runner-shell-opt-in)) — and returns `ready: true` from `subagent_health`, with the expected workspace root and enabled model. The board and isolated tools stay discoverable even when their opt-in settings are off; the host refuses their calls at that point. This confirms that Codex can call the worker host; it does not perform model inference. If the test still fails after a window reload, run **Codex Subagent: Check MCP Connection**, then inspect **Codex Subagent: Show Diagnostics** and **Codex Subagent: Show Log** for the failure details.
+A successful test lists the worker controls and every opt-in tool group — 13 worker controls, the 8 task-board tools described in [Task board](#task-board-opt-in), the 8 isolated-view tools described in [isolated file views](docs/isolated-views.md), the 3 runner tools described in [Isolated runner shell](#isolated-runner-shell-opt-in), and the coordinator `subagent_integration` tool described in [coordinator integration](docs/integration.md) — and returns `ready: true` from `subagent_health`, with the expected workspace root and enabled model. The board and isolated tools stay discoverable even when their opt-in settings are off; the host refuses their calls at that point. This confirms that Codex can call the worker host; it does not perform model inference. If the test still fails after a window reload, run **Codex Subagent: Check MCP Connection**, then inspect **Codex Subagent: Show Diagnostics** and **Codex Subagent: Show Log** for the failure details.
 
 Reloading the window interrupts active workers. After reloading, inspect them in **Codex Workers** and use **Resume** explicitly to continue unfinished work.
 
@@ -109,6 +109,7 @@ Provider request options now live inside each `codexSubagent.models` entry as ne
 | `notifyOnCompletion` | `true` | Completion/failure notifications |
 | `taskBoard.enabled` | `false` | Opt in to the persistent task board: enables board calls and the **Task Board** view. The 8 board tools stay discoverable when off, but the host refuses every call. Records only — no worker dispatch, file edits or automatic acceptance. Machine scope |
 | `isolatedViews.enabled` | `false` | Opt in to shared immutable snapshots and private worker overlays. A worker already bound to a view never falls back to live files while the flag is off (`feature_disabled`). Machine scope |
+| `isolatedViews.integration.enabled` | `false` | Opt in to coordinator integration attempts. Requires `resources.enabled`, `taskBoard.enabled` and `isolatedViews.enabled`. Validation uses the separately enabled isolated runner, and accept and apply stay explicit decisions. Machine scope |
 | `isolatedViews.runners.enabled` | `false` | Enables bounded private shell execution for bound isolated workers. Read live from User Settings. While it is off, isolated `run_command` returns `isolated_shell_unavailable`, no runner storage or execution is created, and legacy workspace shell routing is unchanged |
 | `isolatedViews.runners.capacity` | `2` | Durable runner slots per canonical root, integer 1–8. Resource configuration: applied when the host and its pool reopen |
 | `isolatedViews.runners.maxQueue` | `32` | Bounded FIFO queue of waiting runner requests per canonical root, integer 0–256; overflow is an explicit capacity error |
@@ -144,7 +145,7 @@ Native Codex parent-stop events and native agent UI integration are not exposed 
 | `subagent_parent` | Renew leases or stop a parent group |
 | `subagent_delete` | Permanently delete a stopped worker |
 
-Status supports `outputOffset`/`outputLimit`, `turnId`/`attempt`, and `afterMessage`/`messageLimit`. History offsets stay continuous across rollovers. Supply context explicitly: workers do not inherit hidden parent conversation, native tools, skills, or approvals. Those are the 13 worker controls; [Task board](#task-board-opt-in) adds 8 board tools and [Isolated runner shell](#isolated-runner-shell-opt-in) adds the 3 runner tools alongside the 8 view tools.
+Status supports `outputOffset`/`outputLimit`, `turnId`/`attempt`, and `afterMessage`/`messageLimit`. History offsets stay continuous across rollovers. Supply context explicitly: workers do not inherit hidden parent conversation, native tools, skills, or approvals. Those are the 13 worker controls; [Task board](#task-board-opt-in) adds 8 board tools, [Isolated team file views](#isolated-team-file-views-opt-in) adds the 8 isolated-view tools, and [Isolated runner shell](#isolated-runner-shell-opt-in) adds 3 runner tools plus the coordinator `subagent_integration` tool described in [coordinator integration](docs/integration.md).
 
 To target a registered worktree from a Codex conversation rooted in the main checkout, pass its absolute `workspaceRoot`. Keep the returned root on subsequent controls, and group wait IDs by root. The server verifies that roots are open workspace folders or registered worktrees; arbitrary sibling folders are rejected. This also handles worktrees nested inside the main checkout.
 
@@ -162,7 +163,7 @@ Board tools are record-only:
 
 - Creating or assigning a task never starts a worker, edits files or runs inference. Assignment is metadata.
 - A worker that is a team member can read board records and update only its own task's `progress`, `blockers`, candidate artifact refs and lifecycle state (`in_progress`, `submitted`, `failed`). It cannot set contracts, validations, assignments or acceptance. Board updates grant no filesystem access; per-model write and shell policy still gates every file tool.
-- Acceptance is always an explicit coordinator decision. Nothing is accepted automatically, and `accepted` never means integrated: **no integration is implemented**, so accepted work still needs a separate deliberate change.
+- Acceptance is always an explicit coordinator decision. Nothing is accepted automatically, and `accepted` never means integrated: opt-in [coordinator integration](docs/integration.md) publishes only through separate explicit accept and apply decisions.
 
 Lifecycle is `ready → in_progress → submitted → validating → accepted`, plus `failed` and `cancelled`. `submitted` and `validating` await coordinator acceptance; the coordinator advances a task with an explicit update carrying the current expected revision.
 
@@ -184,7 +185,7 @@ Capacity is explicit rather than silently evicting: at most 64 teams and 512 tas
 
 Enable both `codexSubagent.taskBoard.enabled` and `codexSubagent.isolatedViews.enabled` in **User Settings** to use immutable shared snapshots with private worker overlays. Capture once, explicitly bind a stopped owned team member, then resume it. Unbound turns retain legacy behavior; bound workers never fall back to live files when their view is unavailable. Bound workers also get bounded private shell once `isolatedViews.runners.enabled` is on; without it `run_command` returns `isolated_shell_unavailable` and the legacy workspace shell is never substituted. See [Isolated runner shell](#isolated-runner-shell-opt-in) and [isolated file views](docs/isolated-views.md).
 
-Workers can seal immutable submissions for review. Later edits leave earlier submissions unchanged; explicit retention pins and cleanup manage their lifetime. Board acceptance still does not imply integration, and board references do not pin stored content automatically. See [isolated file views](docs/isolated-views.md) for tools, capture rules, supported layouts, limits, recovery and consumer obligations, and [isolated runner workspaces](docs/runner-workspaces.md) for the runner shell, its storage and its containment limits.
+Workers can seal immutable submissions for review. Later edits leave earlier submissions unchanged; explicit retention pins and cleanup manage their lifetime. Board acceptance still does not imply integration: the opt-in [coordinator integration](docs/integration.md) workflow handles composition, validation and publication explicitly, and board references do not pin stored content automatically. See [isolated file views](docs/isolated-views.md) for tools, capture rules, supported layouts, limits, recovery and consumer obligations, and [isolated runner workspaces](docs/runner-workspaces.md) for the runner shell, its storage and its containment limits.
 
 ## Isolated runner shell (opt-in)
 
@@ -217,7 +218,7 @@ Step 4 adds `subagent_isolated_spawn`: create a stopped worker, atomically estab
 
 Separate aggregate model, runnable, runner and storage budgets cover governed work across roots, worktrees, stores and extension hosts for this OS user. Fair queues yield resources during dependency/message/runner waits and reserve validation/integration headroom. Existing owning-store model ceilings, runner pool reopen settings and legacy spawn behavior remain explicit.
 
-Owner-scoped receipt epochs, compressed archives, exact evidence pins and reference-aware collection reclaim metadata without turning expired requests into fresh operations. See [resource governance and lifecycle](docs/resource-governance.md) for configuration, tools, retention limits, recovery and the contracts for steps 5-7.
+Owner-scoped receipt epochs, compressed archives, exact evidence pins and reference-aware collection reclaim metadata without turning expired requests into fresh operations. See [resource governance and lifecycle](docs/resource-governance.md) for configuration, tools, retention limits and recovery. Step-5 [coordinator integration](docs/integration.md) composes exact sealed sources, validates one candidate and publishes only an accepted result.
 
 ## Preservation and workspaces
 

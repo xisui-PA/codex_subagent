@@ -181,6 +181,13 @@ export interface SnapshotManifest {
    * documented legacy default DEFAULT_FILE_MODE (0o644, not executable).
    */
   entries: Record<string, SnapshotEntry>;
+  /**
+   * Sorted canonical root-relative POSIX paths of the editor overrides
+   * included in this capture (empty array when none). OPTIONAL for backward
+   * compatibility: manifests persisted before this field existed omit it,
+   * which means the override set is unknown (legacy).
+   */
+  editorPaths?: string[];
 }
 
 /**
@@ -1028,6 +1035,9 @@ async function buildManifest(root: string, store: ContentStore, scan: ScanResult
     }
     entries[key] = { type: 'file', hash, size: bytes.length, mode };
   }
+  // Real captures always record the accepted editor overrides explicitly,
+  // including the empty array: omission is reserved for legacy manifests.
+  const editorPaths = [...scan.documents.keys()].sort();
   const manifest: SnapshotManifest = {
     schema: 1,
     root,
@@ -1035,7 +1045,8 @@ async function buildManifest(root: string, store: ContentStore, scan: ScanResult
     fingerprint,
     fileCount: scan.files.size,
     totalBytes: scan.totalBytes,
-    entries
+    entries,
+    editorPaths
   };
   for (const entry of Object.values(manifest.entries)) {
     Object.freeze(entry);

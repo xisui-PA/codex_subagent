@@ -67,12 +67,12 @@ Implemented in the host runtime and the extension: the setting is read live thro
 - Feature gate: `codexSubagent.taskBoard.enabled` is User-level and read live; the extension checks `inspect().globalValue` so a repository value can never enable it, and the editor view/context key follow the same callback. Discovery still lists the 8 board tools; while off, the host refuses every call with `feature_disabled` and workers receive no private board tools. Flipping it refreshes only the board view and context: no broker restart, no model or permission reconfiguration, no worker interruption.
 - Validation and acceptance: verdicts are append-only, keyed by artifact id and exact candidate version and retained in insertion order; a distinct re-recorded verdict appends another entry, so a later `failed` supersedes an earlier `passed`, while a byte-identical verdict is deduplicated even under a new `requestId`. Acceptance requires the task to be `validating`, clean readiness, and the **last appended** verdict for the **latest** version of every candidate to be `passed`: a pass for an older version never satisfies a newer one. Only the coordinator records verdicts; a worker cannot.
 - Immutability: references are keyed by `id` and `version`. Recording the same pair again never rewrites its `uri` or `label`, and a different URI for that pair is rejected. Verdicts stay append-only: an existing verdict and its `resultRef` are never rewritten, distinct repeated verdicts for one artifact version are kept in insertion order, and byte-identical repeats are deduplicated. Task-scoped candidate, contract, and report `id`+`version` identities (their exact `uri` and `label`) are checked against the current records and against every retained task receipt on open and on commit; contract revocation and task rework clear the active agreements or verdicts without freeing the underlying identity. Any future receipt compaction must preserve that identity history, and a contradictory durable history causes the board to refuse to open without rewriting stored records.
-- No automation: no auto-dispatch, no automatic acceptance, no integration. `accepted` is distinct from `integrated`; integration is not implemented. Explicit coordinator acceptance remains a normal board update.
+- No automation: no auto-dispatch and no automatic acceptance. `accepted` is distinct from `integrated`, and integration runs only as an explicit coordinator attempt. Explicit coordinator acceptance remains a normal board update.
 - Response bounds: `subagent_team_list` and `subagent_task_list` both page at the adapter (`offset` default 0, `limit` default 20, max 20, answers `{teams|tasks, nextOffset}`) and stop at a 3,000,000-character serialized page budget, returning fewer items with `nextOffset` advancing by exactly what was returned; one item that cannot fit fails with `response_too_large`. Team listing needs paging because 100-entry histories are its largest field, not because of the 64-team count. `listTeams` stays a raw synchronous array for worker membership filtering; paging is adapter-only. Status snapshots are bounded summaries with clipped `…Preview` fields, first-few detail lists plus `<list>Count` totals, exact ids/edges, a `truncated` flag, and no reference URIs or transition entries. Caps are sized for doubly encoded JSON (a control character costs seven envelope characters), so even 512 maximum-size tasks stay far inside the bridge limit. Only status snapshots are summaries: the MCP `subagent_team_get`/`subagent_task_get` tools and the paged list results carry full records, and `codexSubagent.openBoardRecord` is the editor path that shows one.
 - View and full records: the **Task Board** view renders bounded summaries only. `codexSubagent.openBoardRecord` reads the board summaries, takes the team's trusted `coordinatorOwnerId` from the record (never from UI input), and re-reads the team and task through `subagent_team_get`/`subagent_task_get`. The full JSON, including transition entries and reference URIs, opens read-only through the `codex-task-board-record` content-provider scheme, so nothing implies an editable or savable document.
 - Shutdown: root shutdown awaits `board.close()` before the `SessionStore` owner lock is released.
 
-Validation `resultRef` entries remain manual metadata: they record an id, version and URI without automatically fetching or verifying content. Opt-in [isolated file views](isolated-views.md) now provide shared immutable snapshots, private overlays, sealed submissions and explicit retention. Governed view cleanup now treats current board references and retained evidence pins as retention roots; consumers must still pin exact inputs before use. Opt-in isolated runner execution for bound workers is implemented too (see below); integration, automatic dispatch and peer messaging remain unimplemented. Subsequent consumers must pin exact artifacts and preserve the task/worker state separation.
+Validation `resultRef` entries remain manual metadata: they record an id, version and URI without automatically fetching or verifying content. Opt-in [isolated file views](isolated-views.md) now provide shared immutable snapshots, private overlays, sealed submissions and explicit retention. Governed view cleanup now treats current board references and retained evidence pins as retention roots; consumers must still pin exact inputs before use. Opt-in isolated runner execution for bound workers is implemented too (see below). Opt-in step-5 coordinator integration is implemented as explicit decisions, while automatic dispatch, automatic acceptance and peer messaging remain unimplemented. Subsequent consumers must pin exact artifacts and preserve the task/worker state separation.
 
 ## Isolated runner workspaces
 
@@ -86,7 +86,24 @@ Isolated runner execution is a separate, opt-in service layered on the existing 
 - **Caches.** Only `npm`/`pip` download caches are reused. Installed dependencies, build output and temporary directories are fresh per slot, so a run never inherits another run's tree, and nothing installs without approval; combine steps inside one approved command (for example `npm ci && npm test`).
 - **Containment.** Windows uses a Job Object with a suspended assign, no breakaway and an active-zero drain proof; POSIX uses an owned process group plus an inherited marker discovered through readable `/proc` or `ps`. Incomplete or failed scans quarantine instead of guessing, no path kills by bare PID, and runtime identity is validated before recovery. Deliberately scrubbed environment values and changed OS identity are outside this contract: containment is not an OS sandbox.
 - **MCP surface.** `subagent_runner_status` pages leases, queue entries or result summaries for the caller's owner and team with a bounded summary block; `subagent_runner_result` returns one full immutable result plus derived current-revision and staleness fields that are null when the current index is unavailable, never rewriting the evidence; `subagent_runner_cleanup` reconciles the scope with no new command and carries a `destructiveHint` tool annotation so clients can warn before calling it.
-- **Coordinator control.** Governed step-4 startup now executes explicit create-bind-start decisions; no task planner, automatic integration/acceptance or peer messaging exists. A stored command result is evidence only: it is not an artifact pin and not a validation verdict, and a command that ran on one input revision never validates a later one.
+- **Coordinator control.** Governed step-4 startup now executes explicit create-bind-start decisions; no task planner, automatic acceptance or peer messaging exists, and integration requires the explicit step-5 decisions. A stored command result is evidence only: it is not an artifact pin and not a validation verdict, and a command that ran on one input revision never validates a later one.
+
+## Coordinator integration (step 5)
+
+`subagent_integration` runs one explicit coordinator decision per call: begin,
+status, candidate, validate, accept, apply or release. Beginning pins 1–16 exact
+sealed sources over one common base snapshot, records immutable requirements,
+contract versions, observed evidence and merge conflicts, then composes a
+CAS-backed private seed whose derived snapshot id differs from the original
+base. A governed service-lane worker validates the clean seed unchanged at
+overlay revision 0, or proposes an integration-lane candidate over the derived
+seed. Validation matches each agreed command to one exact succeeded, drained,
+import-free runner result for the candidate's input revision. Acceptance names
+every resolved conflict path, and a separate apply publishes the accepted
+candidate through a per-file durable journal with raw bytes and live base
+checks. The journal is per file, an interrupted publication is proof-only, and
+no Git commit or network publish occurs. See
+[coordinator integration](integration.md).
 
 ## Resource governance and create-bind-start
 
@@ -103,5 +120,7 @@ remain supported.
 Owner receipt epochs, compressed archives, compact reference identity history,
 evidence pins and explicit collection bound metadata alongside content GC.
 Missing namespace documents fail closed and expired requests cannot become
-fresh mutations. Validation, integration and peer messaging remain subsequent
-stages with exact input revision, retention and explicit wakeup obligations.
+fresh mutations. Validation and integration are explicit coordinator stages
+with exact input revision and retention obligations, described in
+[coordinator integration](integration.md). Peer messaging remains a subsequent
+stage with explicit wakeup obligations.

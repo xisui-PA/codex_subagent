@@ -40,15 +40,12 @@ const assigneeText = (task: BoardTaskSummary): string =>
   task.assigneeWorkerId ? `worker ${task.assigneeWorkerId}` : 'unassigned';
 
 /**
- * Visible state text. Submitted/validating stay pending coordinator acceptance,
- * and accepted is never shown as integrated: integration is not implemented.
+ * Visible state text. Submitted/validating stay pending coordinator acceptance;
+ * accepted shows only the board acceptance state, never an integration outcome.
  */
 function stateText(state: BoardTaskSummary['state']): string {
   if (state === 'submitted' || state === 'validating') {
     return `${state} - awaiting coordinator acceptance`;
-  }
-  if (state === 'accepted') {
-    return 'accepted - not integrated (integration not implemented)';
   }
   return state;
 }

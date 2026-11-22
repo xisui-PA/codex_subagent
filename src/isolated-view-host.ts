@@ -5,14 +5,19 @@ import { IsolatedViews, WorkerViewPresence } from './isolated-views';
 import type { SnapshotInspection } from './isolated-views';
 import { IsolatedWorkspaceTools, executeViewRead } from './isolated-workspace-tools';
 import { isolatedViewSchemas, IsolatedViewToolName, isSlowViewTool, viewResponse } from './isolated-view-tools';
-import type { IsolatedViewBinding } from './isolated-view-types';
-import type { IsolatedViewIdentity, IsolatedViewPort } from './isolated-view-port';
-import type { OpenDocument } from './snapshot-content';
+import type { IntegrationArtifactRef, IntegrationScope, IsolatedViewBinding, SealedSubmission } from './isolated-view-types';
+import type { IsolatedViewIdentity, IsolatedViewPort, IsolatedViewState } from './isolated-view-port';
+import { fileModeOf } from './snapshot-content';
+import type { OpenDocument, SnapshotEntry, SnapshotManifest } from './snapshot-content';
+import { IntegrationAttempts } from './integration-attempts';
+import type { EvidenceCheck, IntegrationAction } from './integration-attempts';
+import { publishIntegration, type IntegrationPublicationOptions } from './integration-publication';
+import type { PublicationChange, PublicationEntry } from './integration-publication';
 import type { TaskBoard } from './task-board';
 import { captureProject } from './project-snapshot';
 import { RunnerExecution } from './runner-execution';
 import type { RunnerCommandResult } from './runner-results';
-import type { RunnerPoolCleanupResult, RunnerPoolStatus } from './runner-pool';
+import { RUNNER_POOL_MAX_CAPACITY, type RunnerPoolCleanupResult, type RunnerPoolStatus } from './runner-pool';
 import { EvidenceRetention } from './evidence-retention';
 import { digest, SessionStore } from './storage';
 import { Session, Settings, WorkerError, WorkspaceTools } from './types';
@@ -88,6 +93,126 @@ interface RunnerLeaseRow {
 
 type RunnerStatusArgs = { ownerId: string; teamId: string; kind: 'leases' | 'queue' | 'results'; offset: number; limit: number };
 
+/** Plan publication from the CAPTURED original base and the private candidate. */
+interface PublicationPlan {
+  changes: PublicationChange[];
+  conflicts: { path: string; reason: string }[];
+}
+
+/** Component names publication may never write, exactly as the adapter's rules. */
+const PUBLICATION_PROTECTED: ReadonlySet<string> = new Set(['.git', '.codex', '.vscode']);
+const INTEGRATION_RESULT_PREFIX = 'urn:codex-runner-result:';
+
+const ownEntry = (entries: Readonly<Record<string, SnapshotEntry>>, key: string): SnapshotEntry | undefined =>
+  (Object.prototype.hasOwnProperty.call(entries, key) ? entries[key] : undefined);
+
+/** Raw effective identity of one entry: file bytes/mode, or its exact kind. */
+function sameRawEntry(before: SnapshotEntry | undefined, after: SnapshotEntry | undefined): boolean {
+  if (before === undefined || after === undefined) {
+    return before === after;
+  }
+  if (before.type === 'file' && after.type === 'file') {
+    return before.hash === after.hash && before.size === after.size && fileModeOf(before) === fileModeOf(after);
+  }
+  if (before.type === 'file' || after.type === 'file') {
+    return false;
+  }
+  return before.type === after.type && (before.type === 'directory' || (after.type !== 'directory' && before.detail === after.detail));
+}
+
+const publicationEntry = (entry: SnapshotEntry | undefined): PublicationEntry =>
+  (entry === undefined || entry.type !== 'file' ? null : { type: 'file', hash: entry.hash, size: entry.size, mode: fileModeOf(entry) });
+
+/**
+ * The captured base records which paths it took from an EDITOR BUFFER. An absent
+ * field is UNKNOWN provenance (manifests written before the field, or a derived
+ * seed): raw-disk changes cannot then be proven, so they are refused instead of
+ * overwriting bytes the user never saved. `[]` means every captured path is raw
+ * disk.
+ */
+function capturedEditorPaths(manifest: SnapshotManifest): ReadonlySet<string> | undefined {
+  const value = (manifest as unknown as { editorPaths?: unknown }).editorPaths;
+  if (!Array.isArray(value) || value.some(entry => typeof entry !== 'string')) {
+    return undefined;
+  }
+  return new Set(value);
+}
+
+/**
+ * Compare the CAPTURED original base with the private candidate, as RAW
+ * effective file entries. Only a regular file can be created, replaced or
+ * deleted: directories, unsupported/excluded entries, protected configuration
+ * directories, case-only aliases and editor-derived provenance are explicit
+ * conflicts, so an ambiguous integration is never published.
+ */
+export function publicationPlan(base: SnapshotManifest, candidate: IsolatedViewState): PublicationPlan {
+  const baseEntries = base.entries;
+  const candidateEntries = candidate.tree.entries;
+  const editorPaths = capturedEditorPaths(base);
+  const keys = [...new Set([...Object.getOwnPropertyNames(baseEntries), ...Object.getOwnPropertyNames(candidateEntries)])].sort();
+  const conflicts: { path: string; reason: string }[] = [];
+  const pending: PublicationChange[] = [];
+  const changed: string[] = [];
+  for (const key of keys) {
+    const before = ownEntry(baseEntries, key);
+    const after = ownEntry(candidateEntries, key);
+    if (sameRawEntry(before, after)) {
+      continue;
+    }
+    changed.push(key);
+    if ((before !== undefined && before.type !== 'file') || (after !== undefined && after.type !== 'file')) {
+      const kinds = [before?.type ?? 'absent', after?.type ?? 'absent'].join(' -> ');
+      conflicts.push({ path: key, reason: `unsupported change: only regular files can be published (${kinds}).` });
+      continue;
+    }
+    if (key.split('/').some(segment => PUBLICATION_PROTECTED.has(segment.toLowerCase()))) {
+      conflicts.push({ path: key, reason: 'protected path: configuration directories are never published.' });
+      continue;
+    }
+    if (editorPaths === undefined) {
+      conflicts.push({ path: key, reason: 'unknown provenance: the captured base records no editor-override set, so raw-disk bytes cannot be proven for this change.' });
+      continue;
+    }
+    if (editorPaths.has(key)) {
+      conflicts.push({ path: key, reason: 'editor override: this change was captured from an unsaved buffer, not from raw disk.' });
+      continue;
+    }
+    pending.push({ path: key, before: publicationEntry(before), after: publicationEntry(after) });
+  }
+  // A case-only alias pair in the FINAL namespace cannot be published portably.
+  // It is checked against the resolved namespace, so adding `a.txt` beside an
+  // unchanged captured `A.txt` conflicts instead of silently shadowing it.
+  const finalKeys = new Set<string>(Object.getOwnPropertyNames(baseEntries));
+  for (const key of Object.getOwnPropertyNames(candidateEntries)) {
+    finalKeys.add(key);
+  }
+  const changedSet = new Set(changed);
+  const folded = new Map<string, string[]>();
+  for (const key of finalKeys) {
+    const lower = key.toLowerCase();
+    folded.set(lower, [...(folded.get(lower) ?? []), key]);
+  }
+  for (const group of folded.values()) {
+    if (group.length < 2) {
+      continue;
+    }
+    for (const key of group) {
+      if (changedSet.has(key)) {
+        conflicts.push({ path: key, reason: `case-only alias: ${group.join(', ')} differ only by case and cannot be published portably.` });
+      }
+    }
+  }
+  const aliased = new Set(conflicts.map(conflict => conflict.path));
+  return {
+    changes: pending.filter(change => !aliased.has(change.path)),
+    conflicts
+  };
+}
+
+/** Bounded, printable internal pin name; the attempt key namespace keeps it exact. */
+const integrationPinName = (index: number, ref: IntegrationArtifactRef): string =>
+  `integration/${index}/${ref.id}/${ref.version}`;
+
 /** Lazy lifecycle handle, always drained before its SessionStore owner unlocks. */
 export class IsolatedViewHost {
   readonly evidence: EvidenceRetention;
@@ -95,6 +220,8 @@ export class IsolatedViewHost {
   private opening?: Promise<IsolatedViews>;
   private runners?: RunnerExecution;
   private openingRunners?: Promise<RunnerExecution>;
+  private integration?: IntegrationAttempts;
+  private openingIntegration?: Promise<IntegrationAttempts>;
   private closing = false;
   private drained?: Promise<void>;
   constructor(
@@ -117,6 +244,15 @@ export class IsolatedViewHost {
       allowShell?: () => boolean;
       /** Existing five-argument approval callback; the adapter adds runner context. */
       approveCommand?: (command: string, cwd: string, signal: AbortSignal, workspaceRoot: string, context?: CommandApprovalContext) => Promise<boolean>;
+      /** Live integration opt-in; absent keeps every coordinator integration action off. */
+      integrationEnabled?: () => boolean;
+      /**
+       * Every open file-backed and associated untitled buffer in the owning
+       * window. Publication refuses to write while a touched path may be open in
+       * an editor, so an ABSENT enumeration fails apply closed instead of
+       * silently editing a buffer the user cannot see.
+       */
+      publicationDocuments?: () => OpenDocument[];
     }
   ) {
     this.evidence = new EvidenceRetention(store.directory);
@@ -208,6 +344,16 @@ export class IsolatedViewHost {
     // so the caller keeps the SessionStore owner lock instead of unlocking under
     // work that may still be running.
     const pending = (async () => {
+      // Order matters, and it starts with integration: its service writes the
+      // durable attempt ledger through this store and answers from the runner and
+      // view stores, so invoke()'s own mutex and close() must drain BEFORE either
+      // of them is closed and before the caller unlocks the store owner. A
+      // rejection propagates so that lock is retained instead of being released
+      // under work that may still run.
+      const sessions = this.openingIntegration
+        ? await this.openingIntegration.then(service => service, () => undefined)
+        : this.integration;
+      await sessions?.close();
       const runners = this.openingRunners
         ? await this.openingRunners.then(manager => manager, () => undefined)
         : this.runners;
@@ -644,7 +790,7 @@ export class IsolatedViewHost {
     };
   }
 
-  async invoke(name: IsolatedViewToolName, input: unknown, engine: WorkerEngine, signal?: AbortSignal): Promise<ToolResult> {
+  async invoke(name: IsolatedViewToolName, input: unknown, engine: WorkerEngine, signal?: AbortSignal, recoveryError?: WorkerError): Promise<ToolResult> {
     this.commitGuard();
     const args = isolatedViewSchemas[name].parse(input);
     await this.board.open();
@@ -674,6 +820,16 @@ export class IsolatedViewHost {
       this.board.assertTeam(a.ownerId, a.teamId);
       return viewResponse(await this.runnerCleanup(a));
     }
+    if (name === 'subagent_integration') {
+      // Coordinator integration is answered by its own durable service, never by
+      // a saved/offline store and never by a public pin name. The service mutex
+      // already serializes actions and its close() drains them, and the invoke
+      // guard (operation abort + live host/flag/team checks) is carried into
+      // EVERY port side effect.
+      const a = isolatedViewSchemas.subagent_integration.parse(input) as IntegrationAction;
+      this.board.assertTeam(a.ownerId, a.teamId);
+      return viewResponse(await this.integrate(a, guard, recoveryError));
+    }
     const views = await this.open();
     if (name === 'subagent_snapshot_create') {
       const a = isolatedViewSchemas.subagent_snapshot_create.parse(input);
@@ -697,6 +853,17 @@ export class IsolatedViewHost {
           this.board.assertTeam(a.ownerId, a.teamId, a.id);
         };
         bindingGuard();
+        // The internal startup lane comes from the REAL Session's durable startup
+        // record of this exact worker, never from the request, and it is only
+        // passed while that startup names exactly this team and snapshot. A
+        // conflicted derived seed is therefore bindable only by its governed
+        // integration-lane startup; every ordinary bind is unaffected.
+        const startup = this.store.get(a.id).startup;
+        const startupIdentity = startup === undefined ? undefined : {
+          lane: startup.lane,
+          teamId: startup.teamId,
+          snapshotId: startup.snapshotId
+        };
         return views.bind({ ownerId: a.ownerId, teamId: a.teamId, snapshotId: a.snapshotId, workerId: a.id, workerCreatedAt: session.createdAt, requestId: a.requestId }, async marker => {
           await this.store.change(a.id, draft => {
             if (draft.isolatedView && !sameBinding(draft.isolatedView, marker)) {
@@ -708,7 +875,7 @@ export class IsolatedViewHost {
             draft.schema = draft.startup ? 3 : 2;
             draft.isolatedView = { ...marker };
           }, bindingGuard);
-        }, bindingGuard);
+        }, bindingGuard, startupIdentity);
       }, { kind: 'isolation', activity: 'Binding private view' });
       return viewResponse(result);
     }
@@ -867,6 +1034,27 @@ export class IsolatedViewHost {
     const reclaimed = await views.reclaimInputs(scope, () => manager.results.inputReferences(retained), this.commitGuard);
     return { ...outcome, reclaimed, removed: outcome.removed.map(result => ({ id: result.id, uri: result.uri, inputArtifact: result.attempt.inputArtifact })) };
   }
+  /**
+   * Narrow governed-startup PREFLIGHT of the ONE bind-time lane rule, answered
+   * BEFORE a fresh worker is created and before the ready board task is assigned.
+   * It publishes nothing and creates nothing, so a work- or validation-lane
+   * startup aimed at a derived seed with unresolved conflict groups is refused
+   * without stranding an assignment; the bind itself re-proves the same rule under
+   * the view mutex from the real Session startup.
+   */
+  async preflightStartupBind(
+    ownerId: string, teamId: string, snapshotId: string, lane: 'work' | 'validation' | 'integration', signal?: AbortSignal
+  ): Promise<void> {
+    this.commitGuard();
+    signal?.throwIfAborted();
+    const views = await this.open();
+    signal?.throwIfAborted();
+    await views.assertStartupBindable(ownerId, teamId, snapshotId, lane, () => {
+      signal?.throwIfAborted();
+      this.commitGuard();
+    });
+  }
+
   async assertWorkerUsable(session: Session, signal?: AbortSignal): Promise<void> {
     this.commitGuard();
     await this.board.open();
@@ -877,6 +1065,338 @@ export class IsolatedViewHost {
     guard();
     const identity = { ownerId: session.ownerId!, workerId: session.id, workerCreatedAt: session.createdAt };
     await (await this.open()).status(session.isolatedView!, identity, guard);
+  }
+
+  // -- coordinator integration -------------------------------------------------
+
+  /** Live opt-in; absent keeps every integration action off. Read per decision. */
+  private integrationEnabled(): boolean {
+    return this.options.integrationEnabled?.() === true;
+  }
+
+  private get integrationDirectory(): string {
+    return path.join(this.store.directory, 'integration');
+  }
+
+  /** Evidence metadata goes through the store write fence, never a nested lock. */
+  private withStorage<T>(action: () => Promise<T>): Promise<T> {
+    return this.options.withStorageWrite ? this.options.withStorageWrite(action) : action();
+  }
+
+  /**
+   * Live authorization for one integration action. `guard` is the invoke-level
+   * check (operation abort + host/feature/team), so a revoked or aborted call is
+   * refused at EVERY port side effect, not only when it entered. `apply`
+   * additionally requires write access AND an owning-window document enumeration
+   * BEFORE the durable applying intent exists: a publication that cannot be
+   * guarded must never become an unresolved in-flight attempt that only release
+   * could clear.
+   */
+  private integrationAuthorize(args: IntegrationAction, guard?: () => void): () => void {
+    return () => {
+      guard?.();
+      this.commitGuard();
+      if (!this.integrationEnabled()) {
+        throw new WorkerError('feature_disabled', 'Integration requires User Settings codexSubagent.taskBoard.enabled, codexSubagent.isolatedViews.enabled, codexSubagent.resources.enabled and codexSubagent.isolatedViews.integration.enabled.');
+      }
+      this.board.assertTeam(args.ownerId, args.teamId);
+      if (args.action === 'apply') {
+        if (!this.options.canWrite()) {
+          throw new WorkerError('permission_denied', 'Publishing an accepted candidate requires live workspace write access; nothing was written.');
+        }
+        if (this.options.publicationDocuments === undefined) {
+          throw new WorkerError('feature_disabled', 'Publishing requires the owning window document enumeration so open editors are never overwritten; nothing was written.');
+        }
+      }
+    };
+  }
+
+  /**
+   * One integration action. IntegrationAttempts.invoke already serializes every
+   * action under its own mutex and close() drains them, so the host adds no
+   * second queue. Every port re-runs this exact live guard at its own effect.
+   * `recoveryError` is the broker's OPTIONAL internal admission denial for one
+   * apply whose action never entered; it is threaded unchanged so the ledger can
+   * prove an exact current receipt and otherwise throw that original denial back.
+   * It is never derived from caller input.
+   */
+  private async integrate(args: IntegrationAction, guard?: () => void, recoveryError?: WorkerError): Promise<unknown> {
+    const authorize = this.integrationAuthorize(args, guard);
+    authorize();
+    const attempts = await this.openIntegration(authorize);
+    authorize();
+    return attempts.invoke(args, authorize, recoveryError);
+  }
+
+  /**
+   * Single-flight construction of this root's integration service. Its ports are
+   * bound to the LIVE call (through the per-call authorize) rather than captured
+   * when the service was built, so a revocation is seen at every side effect.
+   */
+  private async openIntegration(authorize: () => void): Promise<IntegrationAttempts> {
+    if (this.integration) {
+      return this.integration;
+    }
+    if (!this.openingIntegration) {
+      this.openingIntegration = (async () => {
+        this.commitGuard();
+        if (!this.integrationEnabled()) {
+          throw new WorkerError('feature_disabled', 'Integration requires codexSubagent.taskBoard.enabled, codexSubagent.isolatedViews.enabled, codexSubagent.resources.enabled and codexSubagent.isolatedViews.integration.enabled in User Settings.');
+        }
+        // Deliberately lazy: the durable ledger is answered WITHOUT opening
+        // private view storage, so status and release stay reachable when the
+        // index is missing, and each action that really needs a view capability
+        // opens it at its own boundary before any effect.
+        authorize();
+        const service = new IntegrationAttempts(this.integrationDirectory, {
+          board: () => this.board.open(),
+          session: (id: string) => {
+            try {
+              return this.store.get(id);
+            } catch (error) {
+              if (error instanceof WorkerError && error.code === 'not_found') {
+                return undefined;
+              }
+              throw error;
+            }
+          },
+          // await this.open() on EVERY call: a fresh host, or a view store that
+          // was closed and reopened, must open it here instead of reading an
+          // absent cached handle.
+          retainArtifacts: async (scope: IntegrationScope, refs: readonly IntegrationArtifactRef[], check: () => void,
+            verify?: (submissions: readonly SealedSubmission[]) => void | Promise<void>) =>
+            (await this.open()).retainIntegrationArtifacts(scope, refs, check, verify),
+          // Durable ancestry of this attempt's exact sealed sources: the ONE
+          // immediate base they were composed over plus every derived snapshot
+          // its stored lineage rests on, read under the view mutex.
+          sourceAncestry: async (scope: IntegrationScope, refs: readonly IntegrationArtifactRef[], check: () => void) =>
+            (await this.open()).integrationSourceAncestry(scope, refs, check),
+          compose: async (scope, refs, check, verify) => (await this.open()).composeIntegration(scope, refs, check, verify),
+          pinEvidence: (scope, items, check) => this.pinIntegrationEvidence(scope, items, check),
+          releasePins: (scope, check) => this.releaseIntegrationPins(scope, check),
+          publish: (scope, baseSnapshotId, ref, check, options) => this.publishIntegrationCandidate(scope, baseSnapshotId, ref, check, options),
+          withStorageWrite: action => this.withStorage(action)
+        },
+        // The trusted root this host was constructed for. The ledger puts it in
+        // its bounded-summary `details` template so that following that object
+        // from a client whose CWD is another open folder still routes to THIS
+        // canonical root instead of answering attempt_missing.
+        this.root);
+        this.integration = service;
+        return service;
+      })().catch((error: unknown) => {
+        this.openingIntegration = undefined;
+        throw error;
+      });
+    }
+    return this.openingIntegration;
+  }
+
+  /**
+   * Pin this attempt's evidence in ONE durable adoption, after proving every
+   * exact resource inside the evidence mutex the runner GC already uses. A
+   * partial, failed or replayed set therefore never looks protected. The set is
+   * bounded by the ledger's own 1024-pin cap, not by the request shape.
+   */
+  private async pinIntegrationEvidence(scope: IntegrationScope, items: readonly EvidenceCheck[], authorize: () => void): Promise<void> {
+    authorize();
+    await this.evidence.pinIntegration(scope.attemptId, async guard => {
+      const requested: { ownerId: string; teamId: string; name: string; uri: string }[] = [];
+      for (let index = 0; index < items.length; index += 1) {
+        guard();
+        authorize();
+        const item = items[index];
+        if (typeof item.ref?.uri !== 'string' || typeof item.ref?.id !== 'string' || !Number.isInteger(item.ref?.version)) {
+          throw new WorkerError('retention_invalid', 'Every integration evidence item requires an exact id, version and URI.');
+        }
+        await this.verifyIntegrationEvidence(scope, item, authorize);
+        requested.push({ ownerId: scope.ownerId, teamId: scope.teamId, name: integrationPinName(index, item.ref), uri: item.ref.uri });
+      }
+      return requested;
+    }, authorize, action => this.withStorage(action));
+    authorize();
+  }
+
+  /**
+   * Prove one exact evidence item. Only a DURABLE runner result is evidence: a
+   * board verdict, a sealed submission URI or any other URI is refused, because
+   * none of them proves that one immutable command ran, drained, left its input
+   * revision untouched and was produced by the exact worker instance that sealed
+   * the artifact.
+   */
+  private async verifyIntegrationEvidence(scope: IntegrationScope, item: EvidenceCheck, authorize: () => void): Promise<void> {
+    const submission = item.submission;
+    if (submission === null || typeof submission !== 'object') {
+      throw new WorkerError('retention_invalid', 'Evidence must be bound to an exact sealed submission.');
+    }
+    if (submission.ownerId !== scope.ownerId || submission.teamId !== scope.teamId) {
+      throw new WorkerError('retention_missing', 'Evidence is bound to a submission of another coordinator or team.');
+    }
+    const ref = item.ref;
+    if (!ref.uri.startsWith(INTEGRATION_RESULT_PREFIX)) {
+      throw new WorkerError('retention_missing', 'Validation evidence must be an existing durable runner result; a board verdict, sealed submission URI or bare URI is not evidence.');
+    }
+    const manager = await this.runnerStore();
+    if (!manager) {
+      throw new WorkerError('retention_missing', 'No runner result store exists for this workspace, so this result evidence is unavailable.');
+    }
+    const id = ref.uri.slice(INTEGRATION_RESULT_PREFIX.length).split(':').at(-1)!;
+    // A ref whose id differs is refused even when the URI happens to match.
+    if (ref.id !== id) {
+      throw new WorkerError('retention_missing', 'The result evidence id differs from the exact durable result named by its URI.');
+    }
+    const result = manager.results.get(id, { ownerId: scope.ownerId, teamId: scope.teamId });
+    if (result.id !== ref.id || result.uri !== ref.uri || result.version !== ref.version) {
+      throw new WorkerError('retention_missing', 'The result evidence URI, id or version differs from the exact durable result.');
+    }
+    if (result.outcome !== 'succeeded' || result.exitCode !== 0 || result.signal !== null || !result.drained) {
+      throw new WorkerError('evidence_invalid', `Result ${result.id} is ${result.outcome} (exit ${String(result.exitCode)}, signal ${String(result.signal)}, drained ${result.drained}); only a clean, drained success is validation evidence.`);
+    }
+    if (result.import !== 'unchanged') {
+      throw new WorkerError('evidence_invalid', `Result ${result.id} reported import '${result.import}' instead of 'unchanged'; a command that changed or may have changed its input is not validation evidence.`);
+    }
+    const input = result.attempt.inputVersion;
+    const after = result.afterVersion;
+    if (!after || after.snapshotId !== input.snapshotId || after.overlayId !== input.overlayId || after.revision !== input.revision) {
+      throw new WorkerError('evidence_invalid', `Result ${result.id} does not prove its input revision was left unchanged.`);
+    }
+    if (input.snapshotId !== submission.snapshotId || input.overlayId !== submission.overlayId || input.revision !== submission.revision) {
+      throw new WorkerError('evidence_invalid', `Result ${result.id} ran against a different snapshot, overlay or revision than the sealed input.`);
+    }
+    const owner = result.attempt.owner;
+    if (owner.ownerId !== scope.ownerId || owner.teamId !== scope.teamId) {
+      throw new WorkerError('retention_missing', `Result ${result.id} belongs to another coordinator or team.`);
+    }
+    if (owner.workerId !== submission.workerId || owner.workerCreatedAt !== submission.workerCreatedAt) {
+      throw new WorkerError('evidence_invalid', `Result ${result.id} was produced by a different worker instance than the sealed input.`);
+    }
+    if (item.command !== undefined) {
+      if (result.attempt.command !== item.command) {
+        throw new WorkerError('evidence_invalid', `Result ${result.id} recorded a different command than this immutable validation step.`);
+      }
+      // An explicit validation must come from the attempt's own EXACT source
+      // directory: `<pool>/slots/<slot>/<leaseId>/source`. The immutable result
+      // already records that execution directory and the configured pool
+      // directory is its anchor, so the exact canonical shape is proved here
+      // WITHOUT the lease record: a finished lease is released and its tombstone
+      // is collected by normal retention, independently of this retained result.
+      // A temp or output directory of the same lease fails the shape, and a
+      // non-canonical slot spelling (for example '01') is refused too.
+      let expected: string | undefined;
+      try {
+        const root = path.resolve(manager.pool.directory);
+        const actual = path.resolve(result.attempt.executionDirectory);
+        const parts = path.relative(root, actual).split(path.sep);
+        const slot = parts.length === 4 && parts[0] === 'slots' && parts[3] === 'source' ? Number(parts[1]) : NaN;
+        if (Number.isSafeInteger(slot) && slot >= 0 && slot < RUNNER_POOL_MAX_CAPACITY
+          && String(slot) === parts[1] && parts[2] === result.attempt.leaseId) {
+          expected = path.join(root, 'slots', String(slot), result.attempt.leaseId, 'source');
+        }
+        if (expected !== actual) {
+          expected = undefined;
+        }
+      } catch {
+        expected = undefined;
+      }
+      if (expected === undefined) {
+        throw new WorkerError('evidence_invalid', `Result ${result.id} was not produced from its lease's exact source directory.`);
+      }
+    }
+    authorize();
+  }
+
+  /** Release exactly this attempt's protected pins and its private view inputs. */
+  private async releaseIntegrationPins(scope: IntegrationScope, authorize: () => void): Promise<void> {
+    authorize();
+    await this.evidence.releaseIntegration(scope.attemptId, authorize, action => this.withStorage(action));
+    authorize();
+    await (await this.open()).releaseIntegrationArtifacts(scope, authorize);
+  }
+
+  /**
+   * Creates this attempt's durable publication journal path, which MUST live
+   * outside the workspace and inside a plain directory this store owns. Every
+   * component is created with `mkdir` and then lstat'ed: a pre-existing file,
+   * link or junction in place of the directory is refused instead of followed.
+   */
+  private async publicationJournal(attemptId: string, authorize: () => void): Promise<string> {
+    const base = this.integrationDirectory;
+    const directory = path.join(base, 'publications');
+    for (const target of [base, directory]) {
+      authorize();
+      await fs.mkdir(target, { recursive: true, mode: 0o700 });
+      authorize();
+      const stat = await fs.lstat(target);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new WorkerError('integration_conflict', `The integration publication directory ${target} is not a plain owned directory; nothing was published.`);
+      }
+    }
+    return path.join(directory, `${attemptId}.json`);
+  }
+
+  /**
+   * Publication of ONE accepted candidate. Provenance is checked against the
+   * CAPTURED original base, the candidate is read through its private reader, and
+   * the durable journal is keyed by the immutable attempt identity the service
+   * proves. Unknown provenance and every other ambiguous change therefore return
+   * a conflict BEFORE any durable write, so the attempt stays releasable.
+   *
+   * `options` is the ledger's publication contract for THIS attempt, forwarded
+   * unchanged: a recovery apply requires the existing journal and may only
+   * reconcile it through the proof-only path, never create a new one.
+   */
+  private async publishIntegrationCandidate(
+    scope: IntegrationScope, baseSnapshotId: string, ref: IntegrationArtifactRef, authorize: () => void,
+    options: IntegrationPublicationOptions
+  ): Promise<{ state: 'applied' | 'conflict' | 'interrupted'; applied: string[]; conflicts: { path: string; reason: string }[] }> {
+    authorize();
+    const documents = this.options.publicationDocuments;
+    if (documents === undefined) {
+      throw new WorkerError('feature_disabled', 'Publishing requires the owning window document enumeration; nothing was written.');
+    }
+    if (!this.options.canWrite()) {
+      throw new WorkerError('permission_denied', 'Publishing requires live workspace write access; nothing was written.');
+    }
+    const rootStat = await fs.lstat(this.root).catch(() => undefined);
+    if (!rootStat || !rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      throw new WorkerError('workspace_changed', 'The workspace root is no longer the same plain directory; nothing was published.');
+    }
+    const journalPath = await this.publicationJournal(scope.attemptId, authorize);
+    return (await this.open()).withIntegrationCandidate(scope, baseSnapshotId, ref, async (base, candidate, submission) => {
+      authorize();
+      if (submission.id !== ref.id || submission.version !== ref.version || submission.uri !== ref.uri) {
+        throw new WorkerError('integration_conflict', 'The private candidate is not the exact accepted sealed artifact.');
+      }
+      const plan = publicationPlan(base, candidate);
+      if (plan.conflicts.length > 0) {
+        // Inherently unsupported provenance or entry kinds: no journal, no write.
+        return { state: 'conflict' as const, applied: [], conflicts: plan.conflicts };
+      }
+      authorize();
+      return publishIntegration({
+        root: this.root,
+        journalPath,
+        identity: digest(['integration-publication', scope.attemptId, submission.id, submission.version, submission.uri, baseSnapshotId]),
+        changes: plan.changes,
+        read: async key => (await candidate.read(key)).bytes,
+        // An absent or malformed enumeration is a hard refusal: an editor buffer
+        // that cannot be enumerated must never be treated as "no open editors".
+        openDocuments: () => {
+          const value = documents();
+          if (!Array.isArray(value)) {
+            throw new WorkerError('invalid_publication', 'The owning window document enumeration returned an invalid value; publication is refused.');
+          }
+          return value;
+        },
+        authorize,
+        // The ledger decides the publication contract, and it is forwarded
+        // UNCHANGED: the required journal, the latch checkpoint, proof-only
+        // recovery, and the additive journal-revision floor with the per-file
+        // intent checkpoint that maintains it. A recovery apply therefore still
+        // finds its existing journal and may only reconcile it.
+        ...options
+      });
+    }, authorize);
   }
 
   private async presence(id: string): Promise<WorkerViewPresence> {

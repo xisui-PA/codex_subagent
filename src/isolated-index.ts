@@ -42,13 +42,33 @@ const gitBacking = z.strictObject({
   tree: z.string().regex(/^[a-f0-9]{40,64}$/),
   blobs: z.record(z.string().regex(/^[a-f0-9]{64}$/), z.string().regex(/^[a-f0-9]{40,64}$/))
 });
+const integrationArtifactRefSchema = z.strictObject({
+  id: id64,
+  version: z.number().int().positive(),
+  uri: z.string().min(1).max(2048)
+});
+const integrationConflictSchema = z.strictObject({
+  paths: z.array(z.string().min(1).max(4096)).min(1).max(4096),
+  inputIds: z.array(z.string().min(1).max(2048)).max(256),
+  reason: z.string().min(1).max(500)
+});
+/** Additive provenance of a PRIVATE derived integration seed; never a capture. */
+const integrationProvenanceSchema = z.strictObject({
+  kind: z.literal('integration-seed'),
+  attemptId: id64,
+  baseSnapshotId: id64,
+  refs: z.array(integrationArtifactRefSchema).min(1).max(16),
+  conflicts: z.array(integrationConflictSchema).max(256)
+});
 const snapshotSchema = z.strictObject({
   id: id64,
   teamId,
   ownerId,
   manifestHash: id64,
   backing: z.discriminatedUnion('kind', [z.strictObject({ kind: z.literal('cas') }), gitBacking]),
-  createdAt: isoDate
+  createdAt: isoDate,
+  /** Absent on every ordinary capture and every legacy record. */
+  provenance: integrationProvenanceSchema.optional()
 }).refine(s => {
   const b = s.backing;
   if (b.kind !== 'git') {
@@ -75,6 +95,8 @@ const submissionSchema = z.strictObject({
 const pinSchema = z.strictObject({
   id: id64, ownerId, teamId, name: z.string().min(1).max(128),
   resource: z.strictObject({ kind: z.enum(['snapshot', 'submission']), id: id64 }),
+  /** Additive private integration identity; absent on every ordinary pin. */
+  integration: z.strictObject({ attemptId: id64, role: z.enum(['source', 'seed']) }).optional(),
   binding: z.strictObject({ overlayId: id64, workerId: teamId, workerCreatedAt: isoDate, receiptKey: id64, fingerprint: id64 }).optional()
 });
 // result must keep the raw JSON value exactly (including an own __proto__ key);
@@ -321,6 +343,11 @@ export function validateIndex(raw: unknown, root: string, limits: IndexLimits = 
     }
     if (pin.binding && (pin.resource.kind !== 'snapshot' || pin.name !== `binding:${pin.binding.overlayId}`)) {
       corrupt(`Pin ${key} has a malformed binding intent.`);
+    }
+    // A private integration pin must stay inside its reserved name namespace,
+    // so it can never masquerade as (or collide with) a public pin.
+    if (pin.integration && (pin.binding !== undefined || !pin.name.startsWith('integration:'))) {
+      corrupt(`Pin ${key} has a malformed integration identity.`);
     }
     const target = pin.resource.kind === 'snapshot' ? data.snapshots[pin.resource.id] : data.submissions[pin.resource.id];
     if (!target) {

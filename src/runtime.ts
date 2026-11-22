@@ -20,7 +20,7 @@ import { failure, Provider, Session, SessionHeader, Settings, WorkerError, Works
 import { FileToolOptions, FileTools } from './workspace-tools';
 import { IsolatedViewHost } from './isolated-view-host';
 import type { RunnerHostConfig } from './isolated-view-host';
-import { isIsolatedViewTool, isOfflineViewTool } from './isolated-view-tools';
+import { integrationReservation, isIntegrationTool, isIsolatedViewTool, isOfflineViewTool } from './isolated-view-tools';
 import type { OpenDocument } from './snapshot-content';
 import { contains, prepareWorkspaces, registeredWorktrees, rememberWorkspaceRoots, rootMetadata, worktreeRoot, workspaceCatalog, workspaceDirectory } from './workspaces';
 
@@ -31,6 +31,7 @@ export interface RuntimeOptions {
   /** Opt-in task board gate; absent or false keeps every board surface off. Read on every call. */
   taskBoardEnabled?: () => boolean;
   isolatedViewsEnabled?: () => boolean;
+  integrationEnabled?: () => boolean;
   /**
    * Live physical-runner configuration for isolated workers. Absent keeps runner
    * execution off exactly as before: no runner storage is created and bound
@@ -45,6 +46,8 @@ export interface RuntimeOptions {
   resourceDirectory?: string;
   /** Fresh owning-window dirty document enumeration, queried at each capture boundary. */
   openDocuments?: () => OpenDocument[];
+  /** All file-backed and associated untitled buffers in the owning window, including clean ones. */
+  publicationDocuments?: () => OpenDocument[];
 }
 interface Local { root: string; roots: string[]; store: SessionStore; engine: WorkerEngine; files: FileTools; host: BridgeHost; board: BoardHost; isolation: IsolatedViewHost; lifecycle: WorkerLifecycle }
 const identifier = z.string().regex(/^[a-f0-9]{32}$/);
@@ -372,6 +375,15 @@ export class WorkerBroker {
     return this.boardEnabled() && this.options.isolatedViewsEnabled?.() === true;
   }
 
+  /**
+   * Integration is an ADDITIONAL live opt-in over the same parent flags, read on
+   * every request and never cached: it cannot enable the board, private views or resources
+   * by itself, and the adapter re-reads it at every publication boundary.
+   */
+  private integrationEnabled(): boolean {
+    return this.viewsEnabled() && this.resourcesEnabled() && this.options.integrationEnabled?.() === true;
+  }
+
   private isolationHost(root: string, store: SessionStore, board: BoardHost): IsolatedViewHost {
     return new IsolatedViewHost(root, store, board, { enabled: () => this.viewsEnabled(), guard: () => {
       if (this.closed) {
@@ -383,6 +395,11 @@ export class WorkerBroker {
     // shell switch and the approval surface are forwarded, not copied, so a
     // live revocation is seen by every runner decision point.
     runners: this.options.runners,
+    // Integration is a separate, live User-scope opt-in over the same parent
+    // flags; publication documents are forwarded, never copied, so an absent
+    // enumeration keeps apply failing closed.
+    integrationEnabled: () => this.integrationEnabled(),
+    publicationDocuments: this.options.publicationDocuments,
     governanceEnabled: () => this.resourcesEnabled(),
     withStorageWrite: action => store.withStorageWrite(action),
     allowShell: this.options.files.allowShell,
@@ -728,6 +745,10 @@ export class WorkerBroker {
     if (isIsolatedViewTool(name) && !this.viewsEnabled()) {
       return this.boardFailure('feature_disabled', 'Private views require User Settings codexSubagent.taskBoard.enabled and codexSubagent.isolatedViews.enabled.');
     }
+    if (isIntegrationTool(name) && !this.integrationEnabled()) {
+      // A separate opt-in: private views alone never allow composed publication.
+      return this.boardFailure('feature_disabled', 'Integration requires User Settings codexSubagent.taskBoard.enabled, codexSubagent.isolatedViews.enabled, codexSubagent.resources.enabled and codexSubagent.isolatedViews.integration.enabled.');
+    }
     if (args && typeof args === 'object' && 'workspaceRoot' in args) {
       cwd = z.string().min(1).max(8000).parse(args.workspaceRoot);
       const { workspaceRoot: _scope, ...rest } = args as Record<string, unknown>; void _scope; args = rest;
@@ -771,6 +792,42 @@ export class WorkerBroker {
         if (session.ownerId) {
           releaseControl = route.local.lifecycle.beginControl(session.ownerId);
         }
+      }
+      if (isIntegrationTool(name)) {
+        // ONE strict coordinator action union, routed through the integration
+        // resource lane: begin composes a derived snapshot (600 MiB), every other
+        // metadata decision reserves 32 MiB, and status/release never queue for a
+        // permit so an exhausted budget can still be inspected and released.
+        const reservation = integrationReservation(args);
+        const local = route.local;
+        // Only apply has a durable receipt an exhausted admission can still
+        // need to reach; every other action keeps its exact refusal.
+        const apply = args !== null && typeof args === 'object' && (args as { action?: unknown }).action === 'apply';
+        // The action callback is the ONLY place the ledger is entered, so this
+        // flag proves whether the original attempt was ever started.
+        let entered = false;
+        const invokeIntegration = (recoveryError?: WorkerError): Promise<ToolResult> => {
+          entered = true;
+          return local.isolation.invoke(name, args, engine, signal, recoveryError);
+        };
+        let result: ToolResult;
+        try {
+          result = await this.storageOperation(local, reservation.bytes, () => invokeIntegration(), signal, reservation.reclaim, 'integration');
+        } catch (error) {
+          // An exact current apply can be refused BEFORE the ledger because its
+          // own journal consumed the headroom this reservation needs. Only that
+          // admission denial, for apply, before the action entered, is retried:
+          // through the reclaim storage path (which still refreshes the accounted
+          // store) with the original denial as internal recovery context. The
+          // ledger proves the exact current receipt and throws this same denial
+          // back for every new or stale request.
+          if (!apply || entered || !(error instanceof WorkerError) || error.code !== 'storage_exhausted') {
+            throw error;
+          }
+          result = await this.storageOperation(local, reservation.bytes, () => invokeIntegration(error), signal, true, 'integration');
+        }
+        this.options.onChange();
+        return result;
       }
       if (isGovernedTool(name)) {
         // Dispatching a governed tool is NOT participation: this request can still

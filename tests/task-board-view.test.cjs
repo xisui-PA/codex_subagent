@@ -179,7 +179,7 @@ test('task rows show state, revision and assignee, with ids that survive revisio
   assert.equal(other.item.iconPath.id, 'circle-outline');
 });
 
-test('submitted/validating await coordinator acceptance and accepted is never shown as integrated', async () => {
+test('submitted/validating await coordinator acceptance and accepted shows only the board state', async () => {
   const submitted = await taskRow({ state: 'submitted' });
   assert.match(submitted.item.description, /submitted/);
   assert.match(submitted.item.description, /awaiting coordinator acceptance/);
@@ -191,11 +191,10 @@ test('submitted/validating await coordinator acceptance and accepted is never sh
   assert.equal(validating.item.iconPath.id, 'beaker');
 
   const accepted = await taskRow({ state: 'accepted' });
-  assert.match(accepted.item.description, /accepted/);
-  assert.match(accepted.item.description, /not integrated/);
-  assert.match(accepted.item.description, /integration not implemented/);
-  assert.doesNotMatch(accepted.item.description, /^accepted$/);
-  assert.match(accepted.item.tooltip, /not integrated/);
+  assert.equal(accepted.item.description, 'accepted - rev 0 - unassigned', 'only the board acceptance state is shown');
+  assert.doesNotMatch(accepted.item.description, /integrat/, 'the description adds no integration outcome');
+  assert.match(accepted.item.tooltip, /state accepted/);
+  assert.doesNotMatch(accepted.item.tooltip, /integrat/, 'the tooltip adds no integration outcome');
   assert.equal(accepted.item.iconPath.id, 'pass');
 
   assert.equal((await taskRow({ state: 'failed' })).item.iconPath.id, 'error');
