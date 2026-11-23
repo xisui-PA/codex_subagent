@@ -133,9 +133,10 @@
 // rename/link is atomic and never crosses a filesystem boundary. The generated
 // basename is pinned into that entry's durable `intent` record, the entry is then
 // created EXCLUSIVELY, and its actual file identity is recorded durably BEFORE
-// the first candidate byte is written. `stage` is an additive v2 field: a legacy
-// v2 record without it is read and replayed exactly as before, and debris it
-// cannot describe is never touched.
+// the first candidate byte is written. The persisted row always carries that
+// record: `stage` is null when the phase has none, and a record's `identity` is
+// null until the exclusive create records the exact entry. Debris the record
+// cannot describe - no record, or no recorded identity - is never touched.
 //
 // The staged payload is proved before anything can publish it: it must still be
 // the recorded inode, a plain single-link regular file, and its bytes must be the
@@ -199,8 +200,8 @@
 // parent+leaf location; document text is never read), and an interrupted run is
 // cleaned ONLY through its own durable `stage` record, for one exact name and
 // one exact identity: a staging entry whose payload was only partially written,
-// a legacy v2 record without stage data, or a rollback that cost the recorded
-// identity is left in place as unproved debris instead of being guessed at - and
+// a row whose stage is null or whose recorded identity is still null is left in
+// place as unproved debris instead of being guessed at - and
 // that debris keeps its row from staging again (a retryable conflict naming the
 // staging path) until the owner has moved it or the path is provably absent.
 // Journal-level refusals (foreign, corrupt or unsafe journal) report the
@@ -222,8 +223,11 @@ import {
 import { atomicWrite, digest } from './storage';
 import { WorkerError } from './types';
 
-/** One side of a change: an approved regular file, or its absence. */
-export type PublicationEntry = { type: 'file'; hash: string; size: number; mode?: FileMode } | null;
+/**
+ * One side of a change: an approved regular file with its planned POSIX mode
+ * class, or its absence.
+ */
+export type PublicationEntry = { type: 'file'; hash: string; size: number; mode: FileMode } | null;
 
 /** One approved path transition; `path` is canonical, root-relative and POSIX. */
 export interface PublicationChange {
@@ -395,8 +399,10 @@ type JournalState = 'pending' | 'intent' | 'applied' | 'interrupted';
  * Durable staging record of one entry: the exact basename this module pinned for
  * its payload and, once the entry was created exclusively, the exact file
  * identity to prove it with. `identity` is absent while the entry has only been
- * pinned - before the create, or when a rollback restored a revision written
- * before the identity record - and a staging entry can then never be proven.
+ * pinned - before the create - and a staging entry can then never be proven. The
+ * persisted row still carries both fields of this one current shape: `stage` is
+ * null when the phase has no staging record at all, and a record's `identity` is
+ * null until the exclusive create has recorded the exact entry.
  */
 interface JournalStage {
   name: string;
@@ -534,8 +540,12 @@ function lstatOrNull(target: string): Promise<BigIntStats | undefined> {
   });
 }
 
-/** The mode a publication entry means; an omitted mode is the legacy default. */
-const entryMode = (entry: PublicationEntry): FileMode => entry?.mode ?? DEFAULT_FILE_MODE;
+/**
+ * The planned mode class of one side of a change. A file entry always carries its
+ * own mode; only an ABSENT side - the base of a creation - has no approved class
+ * of its own, and the publication default applies to it.
+ */
+const entryMode = (entry: PublicationEntry): FileMode => (entry === null ? DEFAULT_FILE_MODE : entry.mode);
 
 function sameEntry(left: PublicationEntry, right: PublicationEntry): boolean {
   return left !== null && right !== null && left.hash === right.hash && left.size === right.size
@@ -626,7 +636,11 @@ function validatePath(value: unknown): string[] {
   return segments;
 }
 
-/** Strict validation of one journal/base/result entry. */
+/**
+ * Strict validation of one journal/base/result entry. A file entry always carries
+ * its planned mode class, so a record that omits it is refused instead of being
+ * read with an implied default.
+ */
 function normalizeEntry(value: unknown, label: string): PublicationEntry {
   if (value === null) {
     return null;
@@ -647,12 +661,10 @@ function normalizeEntry(value: unknown, label: string): PublicationEntry {
   if (entry.size > MAX_FILE_BYTES) {
     throw new WorkerError('publication_capacity', `The ${label} entry exceeds the ${MAX_FILE_BYTES}-byte per-file bound.`);
   }
-  if (entry.mode !== undefined && !isFileMode(entry.mode)) {
+  if (!isFileMode(entry.mode)) {
     invalid(`The ${label} entry mode must be 0o644 or 0o755.`);
   }
-  return entry.mode === undefined
-    ? { type: 'file', hash: entry.hash, size: entry.size }
-    : { type: 'file', hash: entry.hash, size: entry.size, mode: entry.mode };
+  return { type: 'file', hash: entry.hash, size: entry.size, mode: entry.mode };
 }
 
 /** Strict validation of one persisted dev/ino pair of exact decimal strings. */
@@ -680,11 +692,13 @@ function normalizeIdentity(value: unknown, label: string): FileIdentity {
 }
 
 /**
- * Strict validation of one persisted staging record. `stage` is additive: its
- * absence is a legacy v2 entry, which is read and replayed exactly as before and
- * whose staging debris - whatever it may be - is never touched. A present record
- * must name a bare staging sibling of this entry's own directory and may carry
- * only an exact dev/ino identity; it is never derived from anything else.
+ * Strict validation of one persisted staging record. The one CURRENT journal
+ * shape encodes a row without a staging record as `stage: null`, so a present
+ * record must name a bare staging sibling of this entry's own directory and must
+ * carry its own `identity` field: null while the intent is only pinned - before
+ * the exclusive create proves the exact entry - or an exact dev/ino pair. A
+ * record that omits either field is refused, never reinterpreted, and an
+ * identity is never derived from anything else.
  */
 function normalizeStage(value: unknown, leaf: string, hasResult: boolean): JournalStage | string {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -705,8 +719,11 @@ function normalizeStage(value: unknown, leaf: string, hasResult: boolean): Journ
   if (!hasResult) {
     return 'a publication journal stage record describes a change with no result to stage.';
   }
-  if (stage.identity === undefined) {
+  if (stage.identity === null) {
     return { name: stage.name };
+  }
+  if (stage.identity === undefined) {
+    return 'a publication journal stage record omits its identity.';
   }
   try {
     return { name: stage.name, identity: normalizeIdentity(stage.identity, 'journal stage') };
@@ -1033,7 +1050,13 @@ async function inspectFile(
       if (Math.floor(mode / 0o1000) % 8 !== 0) {
         return { ok: false, reason: 'unsafe mode: the destination carries special permission bits.' };
       }
-      if (fileModeFromPermissions(mode) !== (expected.mode ?? DEFAULT_FILE_MODE)) {
+      // The approved base entry always carries its mode; only a staging
+      // inspection disables this comparison (rules.mode), so a missing mode here
+      // is an internal shape error and never a live default.
+      if (expected.mode === undefined) {
+        throw new WorkerError('internal_error', 'The approved publication entry has no file mode.');
+      }
+      if (fileModeFromPermissions(mode) !== expected.mode) {
         return { ok: false, reason: 'stale mode: the destination permissions no longer match the approved base.' };
       }
     }
@@ -1318,18 +1341,23 @@ function trustDocument(trust: JournalTrust): { root: { dev: string; ino: string 
 }
 
 /**
- * The persisted shape of one entry. `stage` is an additive field: it is written
- * only when the entry carries one, so a legacy v2 entry is byte-identical to what
- * it always was, and its exact dev/ino identity is encoded as decimal strings
- * exactly like every other identity in the file.
+ * The persisted shape of one entry. Every row of the ONE current journal shape
+ * carries its `stage` field explicitly: null when the runtime phase has no
+ * staging record at all (a row before its intent, a deletion, a cleared record),
+ * otherwise the record with its own `identity` field - null while only the name
+ * is pinned, or the exact dev/ino pair encoded as decimal strings exactly like
+ * every other identity in the file.
  */
 function entryDocument(entry: JournalEntry): Record<string, unknown> {
   const stage = entry.stage;
   const base = { path: entry.path, state: entry.state, before: entry.before, after: entry.after };
   if (!stage) {
-    return base;
+    return { ...base, stage: null };
   }
-  return { ...base, stage: stage.identity ? { name: stage.name, identity: identityDocument(stage.identity) } : { name: stage.name } };
+  return {
+    ...base,
+    stage: { name: stage.name, identity: stage.identity ? identityDocument(stage.identity) : null }
+  };
 }
 
 /**
@@ -1849,10 +1877,10 @@ function stagingPathOf(context: Context, entry: JournalEntry): string | undefine
  * the approved bytes, the type/link state and the editor/path preconditions. Its bytes are bound to the recorded
  * inode across the open, the bounded read and the final path entry, so a
  * same-size clone or a later edit is refused. Everything else - a partial
- * payload, a legacy v2 row without stage data, a row whose identity record was
- * lost to a rollback, an untrusted parent, an open editor - is left exactly as it
- * is, and nothing is discovered by globbing or scanning: only the pinned
- * basename is ever examined. The two-link window is only accepted for a creation
+ * payload, a row whose stage is null or whose stage identity is still null, an
+ * untrusted parent, an open editor - is left exactly as it is, and nothing is
+ * discovered by globbing or scanning: only the pinned basename is ever examined.
+ * The two-link window is only accepted for a creation
  * whose exact final target is that second link.
  */
 async function cleanupStage(context: Context, chain: readonly Ancestor[] | string, entry: JournalEntry): Promise<boolean> {
@@ -2063,8 +2091,11 @@ function parseJournal(text: string, context: Context): Journal | string {
     if (before === null && after === null) {
       return `the publication journal entry for ${JSON.stringify(key)} has no change.`;
     }
+    if (entry.stage === undefined) {
+      return `the publication journal entry for ${JSON.stringify(key)} omits its stage field; a current journal encodes the absence of a staging record as null.`;
+    }
     let stage: JournalStage | undefined;
-    if (entry.stage !== undefined) {
+    if (entry.stage !== null) {
       const parsedStage = normalizeStage(entry.stage, segments[segments.length - 1], after !== null);
       if (typeof parsedStage === 'string') {
         return `the publication journal entry for ${JSON.stringify(key)} has an invalid stage: ${parsedStage}`;
@@ -2219,7 +2250,7 @@ async function runPublication(
     //     to the published inode, which the destination proof below would
     //     otherwise refuse as hard-linked. Only a staging entry whose identity,
     //     bytes, link state, ancestors and editor preconditions are provable is
-    //     removed; every unproved, partial or legacy record is left alone.
+    //     removed; every unproved or partial record is left alone.
     const reconciled = await reconcileStage(context, entry, chain);
     if (terminal) {
       continue;

@@ -10,11 +10,13 @@ const callSchema = z.object({ type: z.literal('call'), id: z.string(), name: z.s
 const partSchema = z.discriminatedUnion('type', [callSchema, z.object({ type: z.literal('text'), text: z.string() }), z.object({ type: z.literal('result'), id: z.string(), text: z.string() })]);
 const stateSchema = z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']);
 const failureSchema = z.object({ code: z.string(), message: z.string(), retryable: z.boolean() });
+/** Current session modes are explicit, required and never defaulted. */
+const sessionModes = ['standalone', 'isolated', 'governed'] as const;
 const sessionSchema = z.object({
-  schema: z.union([z.literal(1), z.literal(2), z.literal(3)]), id: z.string().regex(/^[a-f0-9]{32}$/), title: z.string(), instructions: z.string(),
+  schema: z.literal(3), mode: z.enum(sessionModes), id: z.string().regex(/^[a-f0-9]{32}$/), title: z.string(), instructions: z.string(),
   model: z.object({ id: z.string(), name: z.string(), vendor: z.string(), family: z.string(), version: z.string(), maxInputTokens: z.number().positive() }),
   permission: z.enum(['read-only', 'workspace-write']), state: stateSchema,
-  messages: z.array(z.object({ role: z.enum(['user', 'assistant']), parts: z.array(partSchema) })),
+  messages: z.array(z.object({ role: z.enum(['user', 'assistant']), parts: z.array(partSchema), peerNotices: z.array(z.object({ id: z.string().min(1).max(256), teamId: z.string().min(1).max(256) })).max(64).optional() })),
   turns: z.array(z.object({ id: z.string(), input: z.string(), state: stateSchema, started: z.boolean(), attempts: z.number().int().nonnegative(), output: z.string(), archived: z.boolean().optional(), error: failureSchema.optional(), attemptsLog: z.array(z.object({ attempt: z.number().int(), output: z.string(), error: failureSchema.optional(), endedAt: z.string() })).optional(), tools: z.array(z.object({ call: callSchema, state: z.enum(['started', 'completed', 'uncertain']), result: z.string().optional() })), createdAt: z.string(), updatedAt: z.string() })).min(1),
   operations: z.record(z.string().regex(/^[a-f0-9]{64}$/), z.object({ fingerprint: z.string(), turnId: z.string() })),
   summary: z.object({ text: z.string(), through: z.number().int().nonnegative() }).optional(), revision: z.number().int().nonnegative(), createdAt: z.string(), updatedAt: z.string()
@@ -25,11 +27,13 @@ const sessionSchema = z.object({
   startup: startupSchema.optional(), scheduleWait: scheduleWaitSchema.optional(), scheduleWaitRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(), waitingReason: z.enum(waitingReasons).optional(),
   changes: z.array(z.object({ id: z.string().uuid(), path: z.string(), target: z.string().optional(), kind: z.enum(['write', 'delete', 'rename']), state: z.enum(['pending', 'applied', 'reverted']), createdAt: z.string() })).optional()
 }).refine(session => {
-  if (session.schema === 1) {
+  // The explicit mode - never the fields that happen to be present - decides
+  // which invariant must hold, so no record is inferred or silently upgraded.
+  if (session.mode === 'standalone') {
     return session.isolatedView === undefined && session.startup === undefined;
   }
   const scope = !!session.ownerId && session.ownerId.length <= 200 && !!session.workspaceRoot && path.isAbsolute(session.workspaceRoot);
-  if (session.schema === 2) {
+  if (session.mode === 'isolated') {
     return scope && session.isolatedView !== undefined && session.startup === undefined;
   }
   if (!scope || !session.startup) {
@@ -39,7 +43,7 @@ const sessionSchema = z.object({
     return false;
   }
   return ['created', 'assigned', 'cancelled'].includes(session.startup.phase) || session.isolatedView !== undefined;
-}, 'Schema 1 is legacy; schema 2 requires its permanent view; schema 3 requires governed setup, owner/root and a matching view before readiness.');
+}, 'Session format 3 requires an explicit mode: standalone forbids a private binding and startup, isolated requires its permanent view plus a bounded owner and absolute root, and governed requires governed setup with owner/root and a matching view before readiness. Older formats are unsupported.');
 /**
  * Bounded intent for one accepted governed request whose worker checkpoint does
  * not exist yet. It is the only durable record of that request's identity, its

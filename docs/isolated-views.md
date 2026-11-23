@@ -4,10 +4,11 @@ This document describes the implemented stage of the opt-in disk-efficient
 team-worker feature: shared immutable project snapshots, private per-worker
 overlay revisions, sealed submissions, retention pins, cleanup, and the MCP
 tool surface. The task-board records remain separate from this file view. This
-stage implements no peer messaging, automatic dispatch or automatic
-acceptance; a sealed submission is an immutable artifact, not proof of
-validation or integration. Opt-in [coordinator integration](integration.md)
-consumes sealed submissions only through explicit decisions. Bound workers
+stage implements no automatic dispatch or automatic acceptance. Opt-in
+[team mail](team-mailbox.md) carries peer messages as durable records. A
+sealed submission is an immutable artifact, not proof of validation or
+integration. Opt-in [coordinator integration](integration.md) consumes
+sealed submissions only through explicit decisions. Bound workers
 also get an opt-in bounded private
 shell; unbound legacy workers keep their existing shell behavior unchanged.
 See [runner workspaces](runner-workspaces.md).
@@ -35,7 +36,12 @@ silently serving the working tree.
 2. **Bind a worker** (`subagent_view_bind`) to a snapshot that belongs to
    the same owner and team. The worker must be an **already stopped, owned
    team member**; binding does not start inference. The binding is
-   permanent for the worker's identity and writes a Session marker.
+   permanent for the worker's identity and writes a Session marker. The
+   worker keeps the one current Session format (schema 3): binding promotes
+   an ordinary `standalone` record to `isolated` in place, a governed
+   create-bind-start worker stays `governed`, and no older format is read,
+   written or migrated. A record whose mode or binding is inconsistent fails
+   closed instead of falling back to live files.
 3. **Resume / send** to that worker. Its file tools now operate on its
    private overlay revision; turns that occurred before binding remain
    legacy and are not rewritten.
@@ -248,10 +254,10 @@ unchanged.
   treat a captured editor override as encoding-preserving.
 - Runner execution for bound workers is implemented and opt-in; its slot pool,
   materialized view, immutable command results, containment and approval prompt
-  are described in [runner workspaces](runner-workspaces.md). Integration, peer
-  messaging, automatic dispatch and auto-acceptance remain absent, and
-  integration runs only as explicit [coordinator integration](integration.md)
-  decisions.
+  are described in [runner workspaces](runner-workspaces.md). Integration,
+  automatic dispatch and auto-acceptance remain absent. Peer messaging is the
+  separate opt-in [team mail](team-mailbox.md) record channel, and integration
+  runs only as explicit [coordinator integration](integration.md) decisions.
 
 ## Validation
 

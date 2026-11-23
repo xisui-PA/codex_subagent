@@ -234,10 +234,10 @@ Counts and previews are bounded, and other identities are never shown.
 
 ## What a result does not mean
 
-- No automatic dispatch or acceptance and no peer messaging. Integration runs
-  only as explicit opt-in coordinator decisions that use scoped runner results
-  as validation evidence, described in
-  [coordinator integration](integration.md).
+- No automatic dispatch or acceptance. Opt-in [team mail](team-mailbox.md)
+  carries structured messages. Integration runs only as explicit coordinator
+  decisions that use scoped runner results as validation evidence, described
+  in [coordinator integration](integration.md).
 - No automatic task-board validation of a command result.
 - A stored command result is evidence of what ran, not an approval shortcut: it
   is not an artifact pin and not a verdict.

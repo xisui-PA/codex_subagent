@@ -502,6 +502,16 @@ journaled with that entry's durable `intent`, and the staged entry's own file
 identity is journaled before its first approved byte is written, so only that
 exact entry can ever be published or removed.
 
+Every persisted journal row carries that record explicitly: `stage` is
+`null` when the row has none - a deletion, a `pending` row before its
+intent, or a record proved absent - and a stage record carries `identity`
+as `null` until the exclusive create has journaled the exact entry, or as
+the exact dev/ino pair afterwards. The one current shape applies to the
+approved file entries too, which always carry their planned POSIX mode
+class: a same-schema row that omits any of these fields is refused as a
+journal conflict before any workspace write or staging cleanup instead of
+being read with an older implied meaning. No journal is migrated.
+
 Recovery reconciles the recorded stage of a `pending` or `applied` row before
 starting new staging. If the stage cannot be safely removed, the result names
 the recorded path as a conflict and the journal retains its identity. A retry
@@ -533,7 +543,7 @@ only while the pinned parents, that exact recorded identity, the approved
 bytes, the link state and the editor inventory still verify. That includes
 the second staging link of a verified creation interrupted between link and
 unlink, whose destination is that same identity holding the approved bytes.
-Missing or older stage ownership, edited or ambiguous bytes and unsupported
+Missing stage ownership, edited or ambiguous bytes and unsupported
 parents are left untouched, and a staging name is never found by scanning.
 
 The journal is per file, so publication is not multi-file atomic and provides
@@ -637,10 +647,10 @@ Current limits: one immediate base snapshot per attempt, sealed sources from
 the same owner and team, conservative conflicts for binary and overlapping
 changes, and proof-only handling of a possibly started effect. Automatic
 acceptance, automatic dispatch, board mutation, Git commits and publishing
-network calls are not part of this workflow. Peer messaging does not exist yet.
-A future messaging contract may reference an exact attempt, artifact or result
-id and set or wake an explicit schedule wait generation, and that schedule
-mutation implies no task, verdict or publication authority.
+network calls are not part of this workflow. Opt-in [team mail](team-mailbox.md)
+carries structured messages that may name an exact attempt, artifact or result
+id as identity only. Neither a message nor a schedule mutation implies any
+task, verdict or publication authority on its own.
 
 Downstream consumers must pin the exact artifact or result they use, recheck
 the exact input revision and keep evidence, acceptance and publication as

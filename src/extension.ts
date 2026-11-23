@@ -111,6 +111,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
       return false;
     }
   };
+  /**
+   * Durable team mail is a second, narrower opt-in: the machine-level
+   * taskBoard.messaging.enabled flag, honored only from User Settings and only
+   * while the board itself is enabled. The runtime re-reads it on every call, so
+   * toggling it needs no host restart and never interrupts a worker.
+   */
+  const messagingEnabled = (): boolean => {
+    try {
+      return boardEnabled() && vscode.workspace.getConfiguration('codexSubagent').inspect<boolean>('taskBoard.messaging.enabled')?.globalValue === true;
+    } catch {
+      return false;
+    }
+  };
   const isolatedViewsEnabled = (): boolean => {
     try {
       return vscode.workspace.getConfiguration('codexSubagent').inspect<boolean>('isolatedViews.enabled')?.globalValue === true;
@@ -282,6 +295,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
       const next = new WorkerBroker({
         storage: context.globalStorageUri.fsPath, registry, roots: realRoots, identity, provider,
         taskBoardEnabled: boardEnabled,
+        messagingEnabled,
         isolatedViewsEnabled,
         integrationEnabled: () => vscode.workspace.getConfiguration('codexSubagent').inspect<boolean>('isolatedViews.integration.enabled')?.globalValue === true,
         runners: runnerHostConfig,

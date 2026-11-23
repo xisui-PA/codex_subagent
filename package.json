@@ -439,6 +439,12 @@
           "scope": "machine",
           "description": "Opt in to the persistent task board. When false, the host refuses every board MCP call with feature_disabled, workers receive no private board tools, and the Task Board view stays hidden; the tools still appear in MCP discovery. The board stores team, task, dependency, candidate and validation records in this workspace folder: it never dispatches workers, edits files or accepts work on its own. Machine scope, so a checkout cannot enable it."
         },
+        "codexSubagent.taskBoard.messaging.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "description": "Opt in to durable team mail over the task board. Requires codexSubagent.taskBoard.enabled and is honored only from User Settings. When false every mailbox MCP call fails with feature_disabled, workers receive no mailbox tools and no mailbox storage is opened; the tools still appear in MCP discovery. Messages are stored for live team members of a team you coordinate and are delivered only to a worker that is already running: nothing is started, resumed, woken or scheduled, no files or board records change, and automatic delivery never acknowledges a message. Machine scope, so a checkout cannot enable it."
+        },
         "codexSubagent.isolatedViews.enabled": {
           "type": "boolean",
           "default": false,

@@ -492,7 +492,7 @@ export class IsolatedViewHost {
       authorize?.();
       const current = this.store.get(original.id);
       if (current.createdAt !== original.createdAt || current.ownerId !== original.ownerId || current.workspaceRoot !== this.root
-        || (current.schema !== 2 && current.schema !== 3) || !current.isolatedView || !original.isolatedView || !sameBinding(current.isolatedView, original.isolatedView)) {
+        || (current.mode !== 'isolated' && current.mode !== 'governed') || !current.isolatedView || !original.isolatedView || !sameBinding(current.isolatedView, original.isolatedView)) {
         throw new WorkerError('isolation_unavailable', 'This worker instance no longer has its original private binding.');
       }
       if (checkModel) {
@@ -515,7 +515,7 @@ export class IsolatedViewHost {
 
   /** The constructor identity is trusted; editable tool arguments cannot replace it. */
   scoped(session: Session): WorkspaceTools {
-    if (!session.isolatedView || (session.schema !== 2 && session.schema !== 3) || !session.ownerId) {
+    if (!session.isolatedView || (session.mode !== 'isolated' && session.mode !== 'governed') || !session.ownerId) {
       throw new WorkerError('isolation_unavailable', 'A private worker requires its permanent binding and owner identity.');
     }
     const identity: IsolatedViewIdentity = { ownerId: session.ownerId, workerId: session.id, workerCreatedAt: session.createdAt };
@@ -872,7 +872,10 @@ export class IsolatedViewHost {
             if (draft.startup && (draft.startup.snapshotId !== marker.snapshotId || draft.startup.teamId !== marker.teamId)) {
               throw new WorkerError('isolation_conflict', 'Governed setup cannot bind a different team or snapshot.');
             }
-            draft.schema = draft.startup ? 3 : 2;
+            // Binding promotes the ONE current record in place: a governed
+            // setup stays governed, an ordinary standalone worker becomes
+            // isolated, and the schema literal never changes.
+            draft.mode = draft.startup ? 'governed' : 'isolated';
             draft.isolatedView = { ...marker };
           }, bindingGuard);
         }, bindingGuard, startupIdentity);

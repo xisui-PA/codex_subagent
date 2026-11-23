@@ -31,10 +31,15 @@ Use the actual current revisions. `lane` is an explicit coordinator decision:
 `work`, `validation` or `integration`. Those labels reserve capacity; they do
 not perform validation or integration and convey no verdict or approval.
 
-Governed sessions use schema **3**. Earlier hosts that understand only schemas
-1/2 reject and preserve them, so stripping an unfamiliar optional field can
-never turn incomplete setup into a live legacy worker. Use the updated host
-to administer governed histories; legacy schemas 1/2 remain supported.
+Sessions use one current format: schema **3** with an explicit, required
+`mode` of `standalone`, `isolated` or `governed`. There is no default and no
+old-version reader: a schema-1 record, a schema-2 record, a schema-3 record
+without a mode or an unknown mode is malformed and is never inferred,
+upgraded or silently mapped. Such files are left byte-for-byte in place (a
+diagnostic copy is kept under `quarantine/`) and their worker IDs stay fenced,
+so an old request ID cannot overwrite them or replay their effects. A host
+that only understands an earlier schema format refuses an unfamiliar record
+rather than treating incomplete setup as a runnable worker.
 
 The persisted setup phases are `created`, `assigned`, `bound`, `ready`,
 `started`, and `cancelled`. Creation persists a non-runnable session. One board
@@ -393,8 +398,10 @@ board / 4096 view keys), so their later expiry and archive collection cannot
 turn a legacy ID into a new operation. This set is never reset or appended.
 Worker histories, task records, snapshot/submission IDs and immutable reference
 identities remain unchanged. Boards with expiry metadata use schema **2**, so
-older non-strict hosts reject them instead of discarding request epochs. Legacy
-schema-1 boards remain readable; earlier strict view-index readers likewise
+older non-strict hosts reject them instead of discarding request epochs. The
+board-only stage reads that schema 2 format exclusively: an older schema-1
+board is refused as malformed and left byte-for-byte untouched, never
+migrated; earlier strict view-index readers likewise
 reject the added retention fields. Administer these stores with the updated host.
 Board receipt compaction preserves historical
 id/version/URI/label identities even after their acknowledgement expires.
@@ -493,10 +500,12 @@ not implement a migration tool.
   and evidence, recheck live base/editor hashes and path protections, and keep
   acceptance separate from integration. The opt-in workflow that implements
   these decisions is [coordinator integration](integration.md).
-- Future message delivery can use `ScheduleWait`/`ScheduleWakeup` and explicit
-  `subagent_schedule` waits/wakes. Waiting stores intent and yields resources;
-  it neither delivers peer messages nor chooses tasks. Coordinator decisions,
-  parent leases, exact identities and drain/quarantine rules remain authoritative.
+- Opt-in [team mail](team-mailbox.md) delivers durable events to a running
+  worker and acknowledges them explicitly. Its wait uses `subagent_mailbox_wait`
+  and the explicit `subagent_schedule` waits/wakes. Waiting stores intent and
+  yields resources, a message alone never wakes a worker or chooses tasks, and
+  coordinator decisions, parent leases, exact identities and drain/quarantine
+  rules remain authoritative.
 
 Each governed worker keeps an opaque, monotonically increasing **wait
 generation** (`scheduleWaitRevision`, absent means `0`) beside its wait in its

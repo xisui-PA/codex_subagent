@@ -2189,7 +2189,7 @@ test('a lost journal after a partial apply is terminal through the durable ledge
   const fsSync = require('node:fs');
   const { publishIntegration } = require(path.join(BUILD, 'integration-publication'));
   const hash = value => crypto.createHash('sha256').update(value).digest('hex');
-  const entryOf = bytes => ({ type: 'file', hash: hash(bytes), size: bytes.length });
+  const entryOf = bytes => ({ type: 'file', hash: hash(bytes), size: bytes.length, mode: 0o644 });
   const exists = target => fs.lstat(target).then(() => true, () => false);
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'step5-latch-workspace-'));
   const store = await fs.mkdtemp(path.join(os.tmpdir(), 'step5-latch-journal-'));
@@ -2529,7 +2529,7 @@ test('a legacy pre-latch editor preflight conflict with no journal retries fresh
   const crypto = require('node:crypto');
   const { publishIntegration } = require(path.join(BUILD, 'integration-publication'));
   const hash = value => crypto.createHash('sha256').update(value).digest('hex');
-  const entryOf = bytes => ({ type: 'file', hash: hash(bytes), size: bytes.length });
+  const entryOf = bytes => ({ type: 'file', hash: hash(bytes), size: bytes.length, mode: 0o644 });
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'step5-prelatch-workspace-'));
   const store = await fs.mkdtemp(path.join(os.tmpdir(), 'step5-prelatch-journal-'));
   const journalPath = path.join(store, 'publication.json');
@@ -2703,7 +2703,7 @@ test('a restored prior journal after a partial apply is stale and preserves the 
   const fsSync = require('node:fs');
   const { publishIntegration } = require(path.join(BUILD, 'integration-publication'));
   const hash = value => crypto.createHash('sha256').update(value).digest('hex');
-  const entryOf = bytes => ({ type: 'file', hash: hash(bytes), size: bytes.length });
+  const entryOf = bytes => ({ type: 'file', hash: hash(bytes), size: bytes.length, mode: 0o644 });
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'step5-restored-workspace-'));
   const store = await fs.mkdtemp(path.join(os.tmpdir(), 'step5-restored-journal-'));
   const journalPath = path.join(store, 'publication.json');

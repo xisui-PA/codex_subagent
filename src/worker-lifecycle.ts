@@ -5,7 +5,7 @@ import type { TaskBoard } from './task-board';
 import { boardStorageReservation } from './task-board-tools';
 import type { IsolatedViewHost } from './isolated-view-host';
 import { ResourceGovernor, storageUsage, type ResourcePermit, type WaitingReason } from './resource-governor';
-import { governedSchemas, waitDecision, waitRevision, type GovernedTool, type ScheduleWait } from './worker-startup';
+import { governedSchemas, sameWait, scheduleWaitSchema, waitDecision, waitRevision, type GovernedTool, type ScheduleWait } from './worker-startup';
 import { digest, Mutex, type SessionStore } from './storage';
 import { EvidenceRetention } from './evidence-retention';
 import { view } from './api';
@@ -13,6 +13,12 @@ import { WorkerError, type Session, type Settings, type Provider, type Message, 
 
 /** Explicit scheduling hook, reusable by future message delivery without a planner. */
 export interface ScheduleWakeup { workerId: string; key: string; reason: 'message' | 'dependency' | 'policy' | 'resource' }
+/**
+ * Host-observed reply state for ONE peer question, possibly synchronous. It is
+ * the only authority a peer wait consults, and `unavailable` fails closed: an
+ * expired or revoked message never enables, starts or resumes anything.
+ */
+export type PeerReplyState = 'waiting' | 'ready' | 'unavailable';
 
 type IsolatedSpawn = ReturnType<typeof governedSchemas.subagent_isolated_spawn.parse>;
 /** `heartbeats` counts explicit parent renewals applied to this preparation. */
@@ -70,7 +76,13 @@ export class WorkerLifecycle implements ExecutionGovernance {
      * shutdown and policy refresh for real participants, never for a dispatch
      * whose operation was still going to be refused.
      */
-    private readonly participate?: () => void) {
+    private readonly participate?: () => void,
+    /**
+     * Reply state of one durable peer question, supplied only by the host that
+     * owns this mailbox. Absent means no peer wait exists on this host, so a
+     * wait tool is never advertised and an explicit call fails closed.
+     */
+    private readonly replyState?: (session: Session, messageId: string, signal: AbortSignal) => PeerReplyState | Promise<PeerReplyState>) {
     this.evidence = isolation.evidence;
   }
 
@@ -672,6 +684,25 @@ export class WorkerLifecycle implements ExecutionGovernance {
     });
     this.engine.onChange();
   }
+  /**
+   * Live model policy for the exact session model, re-read at every provider
+   * request boundary (including immediately after an awaited `prepare`). A model
+   * removed from codexSubagent.models never reaches a provider, and a revoked
+   * allowWrite never gets a request for a workspace-write session. Maintenance
+   * summarization runs no tools, so only membership matters there.
+   */
+  private assertModelPolicy(current: Session, maintenance: boolean): void {
+    // OWN key only: a removed id such as '__proto__' or 'constructor' must never
+    // resolve an inherited value from the settings object.
+    const models = this.settings().models;
+    const policy = models && Object.prototype.hasOwnProperty.call(models, current.model.id) ? models[current.model.id] : undefined;
+    if (!policy) {
+      throw new WorkerError('model_unavailable', 'The selected model was disabled while queued.');
+    }
+    if (!maintenance && current.permission === 'workspace-write' && policy.allowWrite === false) {
+      throw new WorkerError('permission_denied', 'Write permission was revoked while queued.');
+    }
+  }
   /** Synchronous checks are reusable at every pre-effect authorization boundary. */
   private schedulingReason(current: Session): 'dependency' | 'message' | undefined {
     const board = this.schedulingBoard;
@@ -707,6 +738,40 @@ export class WorkerLifecycle implements ExecutionGovernance {
       }
       this.schedulingBoard = await this.board.open();
       const reason = this.schedulingReason(current);
+      const peerKey = this.replyState && current.scheduleWait?.kind === 'mailbox_reply' ? current.scheduleWait.key : undefined;
+      if (reason === 'message' && peerKey && this.isPeerWait(current, peerKey)) {
+        // A live peer wait is observed HERE, with the same bounded 100 ms loop as
+        // every other wait and with no model, runnable, runner or storage permit
+        // held. The generation sampled before the lookup is the ONLY generation
+        // this observation may clear.
+        const observe = this.replyState!;
+        const observed = waitRevision(current);
+        const reply = await observe(current, peerKey, signal);
+        signal.throwIfAborted();
+        this.guard();
+        // Re-read and revalidate after the async reply lookup.
+        const live = this.store.get(current.id);
+        this.assertStartupOwned(live);
+        if (live.startup?.phase !== 'started') {
+          throw new WorkerError('startup_incomplete', 'The worker startup changed while waiting for a peer reply.');
+        }
+        // This observation describes the wait that was live BEFORE the lookup.
+        // If the exact key/generation changed meanwhile - an explicit coordinator
+        // clear or a replacement - BOTH answers are stale: nothing is thrown and
+        // the loop re-reads the live wait, so authorized work is never stopped by
+        // a reply that no longer applies.
+        if (this.isPeerWait(live, peerKey) && waitRevision(live) === observed) {
+          if (reply === 'unavailable') {
+            // Only a generation this call really cleared ends the wait.
+            if (await this.endPeerWait(current.id, peerKey, observed, signal)) {
+              throw new WorkerError('reply_unavailable', `Peer reply ${peerKey} expired or was revoked while waiting. The wait is cleared; no worker is started by a message.`);
+            }
+          } else if (reply === 'ready') {
+            await this.endPeerWait(current.id, peerKey, observed, signal);
+            continue;
+          }
+        }
+      }
       await this.waiting(current.id, reason);
       if (!reason) {
         return;
@@ -714,8 +779,184 @@ export class WorkerLifecycle implements ExecutionGovernance {
       await delay(100, undefined, { signal });
     }
   }
+  /**
+   * Host-bound peer wait for ONE question of the caller's own worker.
+   *
+   * Only the adapter behind `subagent_mailbox_wait` calls it, and only for the
+   * worker whose model tools are executing. It registers the same durable,
+   * opaque schedule wait a coordinator message uses - kind mailbox_reply, keyed
+   * by the observed question ID - at the observed generation, so this worker's
+   * next inference boundary is gated while the wait is live. It never replaces a
+   * different wait (a pre-existing coordinator wait is preserved), never starts
+   * a stopped worker and acquires no permit. It returns as soon as the wait is
+   * durable: the caller holds the governed tool permit, so the reply is observed
+   * later by the existing bounded waitReady loop, which holds nothing.
+   *
+   * The wait becomes eligible ONLY when the host reports that an authorized
+   * reply to this exact question arrived for that same observed generation. A
+   * superseded generation is preserved and never restored; cancellation,
+   * timeout and expiry abandon exactly this wait; an unavailable (expired or
+   * revoked) question fails closed and starts nothing.
+   */
+  async waitForPeer(id: string, teamId: string, messageId: string, signal: AbortSignal): Promise<unknown> {
+    signal.throwIfAborted();
+    this.guard();
+    if (!this.replyState) {
+      throw new WorkerError('feature_disabled', 'Peer waits require the host mailbox adapter; this host has no reply state.');
+    }
+    let key: string;
+    try {
+      key = scheduleWaitSchema.parse({ kind: 'mailbox_reply', key: messageId }).key;
+    } catch {
+      throw new WorkerError('invalid_arguments', 'A peer wait needs a messageId of 1-200 characters.');
+    }
+    const session = this.store.get(id);
+    this.assertStartupOwned(session);
+    if (!session.startup || session.startup.phase !== 'started' || session.mode !== 'governed' || !session.isolatedView) {
+      throw new WorkerError('startup_incomplete', 'Peer waits require a started governed worker bound to this host.');
+    }
+    if (session.startup.snapshotId !== session.isolatedView.snapshotId || session.startup.teamId !== session.isolatedView.teamId) {
+      throw new WorkerError('startup_incomplete', 'The private view bound to this worker does not match its startup record.');
+    }
+    if (teamId !== session.startup.teamId) {
+      throw new WorkerError('forbidden', 'A peer wait may only reference the team of the current worker session.');
+    }
+    // The parent lease is checked before anything is written: a wait never
+    // renews or bypasses it.
+    if (session.parentPolicy === 'cancel-on-expiry' && (session.parentExpiresAt ?? 0) < Date.now()) {
+      throw new WorkerError('parent_expired', 'The parent lease expired; a peer wait cannot renew or bypass it.');
+    }
+    this.authorize(session);
+    const policy = this.settings().models?.[session.model.id];
+    if (!policy) {
+      throw new WorkerError('model_unavailable', 'This model is no longer enabled. Explicitly resume with an enabled exact model.');
+    }
+    if (session.permission === 'workspace-write' && policy.allowWrite === false) {
+      throw new WorkerError('permission_denied', 'The model no longer permits workspace writes.');
+    }
+    const board = await this.board.open();
+    this.schedulingBoard = board;
+    const actor = { kind: 'coordinator', ownerId: session.ownerId! } as const;
+    const team = board.getTeam(actor, session.startup.teamId);
+    const task = board.getTask(actor, session.startup.taskId);
+    if (!team.memberWorkerIds.includes(id) || task.assigneeWorkerId !== id || task.teamId !== team.id) {
+      throw new WorkerError('assignment_conflict', 'Worker assignment or team membership was revoked before this peer wait.');
+    }
+    if (['accepted', 'cancelled', 'failed'].includes(task.state)) {
+      throw new WorkerError('task_stopped', 'Task is terminal or failed; a peer wait cannot resume it.');
+    }
+    const next: ScheduleWait = { kind: 'mailbox_reply', key };
+    // The observed generation is sampled BEFORE the async reply lookup, so an
+    // older observation can never clear a wait that moved on meanwhile.
+    const observedRevision = waitRevision(this.store.get(id));
+    const state = await this.replyState(this.store.get(id), key, signal);
+    signal.throwIfAborted();
+    // Re-read and revalidate after the async lookup and before any write.
+    const current = this.store.get(id);
+    this.assertStartupOwned(current);
+    if (current.startup?.phase !== 'started') {
+      throw new WorkerError('startup_incomplete', 'The worker startup changed while this peer wait was validated.');
+    }
+    if (state === 'unavailable') {
+      // Fail closed. Nothing is registered; a wait this question left behind is
+      // cleared at ITS observed generation and no automatic restart follows.
+      await this.endPeerWait(id, key, observedRevision, signal);
+      throw new WorkerError('reply_unavailable', `Peer reply ${key} is expired or revoked for this worker; no wait was registered and no message can start a worker.`);
+    }
+    if (state === 'ready') {
+      // The reply is already authorized: never register a wait for it.
+      await this.endPeerWait(id, key, observedRevision, signal);
+      return { teamId, messageId: key, state: 'ready', waitRevision: waitRevision(this.store.get(id)) };
+    }
+    // The revision sampled before the lookup is the only generation this call
+    // may publish at; a coordinator set/wake in between wins.
+    const revision = await this.registerPeerWait(id, next, key, observedRevision, signal);
+    // The wait is durable and this call returns NOW: it ran inside the governed
+    // tool permit, so it must not block there. The actual observation happens at
+    // the pre-provider `waitReady` boundary of the NEXT inference, where no
+    // model, runnable, runner or storage permit is held. Nothing polls here.
+    this.engine.reschedule();
+    return { teamId, messageId: key, state: 'waiting', waitRevision: revision };
+  }
+  /**
+   * Register the peer wait at the observed generation. A different existing wait
+   * is never replaced, and a concurrent coordinator set/wake is caught by the
+   * same compare-and-set every schedule mutation uses.
+   */
+  private async registerPeerWait(id: string, next: ScheduleWait, key: string, observed: number, signal: AbortSignal): Promise<number> {
+    const current = this.store.get(id);
+    if (sameWait(current.scheduleWait, next)) {
+      return waitRevision(current);
+    }
+    if (current.scheduleWait || waitRevision(current) !== observed) {
+      // A pre-existing (coordinator) wait, or any generation this call never
+      // observed, is preserved exactly as it is.
+      throw new WorkerError('wait_conflict', `The schedule wait of worker ${id} changed while this peer wait validated (question ${key}); the observed wait is preserved. Read the worker again before retrying.`, true);
+    }
+    try {
+      await this.store.change(id, s => {
+        s.scheduleWait = next;
+        s.scheduleWaitRevision = waitRevision(s) + 1;
+        s.waitingReason = 'message';
+      }, () => {
+        signal.throwIfAborted();
+        this.assertWaitChange(id, observed, next);
+      });
+    } catch (error) {
+      if (error instanceof WaitReplay) {
+        return waitRevision(this.store.get(id));
+      }
+      if (error instanceof WorkerError && error.code === 'revision_conflict') {
+        throw new WorkerError('wait_conflict', `The schedule wait of worker ${id} changed while this peer wait registered (question ${key}); the observed wait is preserved. Read the worker again before retrying.`, true);
+      }
+      throw error;
+    }
+    this.engine.onChange();
+    return waitRevision(this.store.get(id));
+  }
+  /**
+   * Clear exactly this peer wait generation. Anything newer - a coordinator
+   * wait, a wake or another peer question - is left in place, and a worker that
+   * already left the observed generation is never rewritten.
+   */
+  /** True only for a mailbox_reply wait on this exact key; a coordinator wait never matches. */
+  private isPeerWait(session: Session, key: string): boolean {
+    return session.scheduleWait?.kind === 'mailbox_reply' && session.scheduleWait.key === key;
+  }
+  private async endPeerWait(id: string, key: string, expected: number, signal?: AbortSignal): Promise<boolean> {
+    const current = this.store.get(id);
+    if (!this.isPeerWait(current, key) || waitRevision(current) !== expected) {
+      // Superseded or never registered: a newer generation (including an
+      // explicit coordinator wait) is preserved exactly as it is.
+      return false;
+    }
+    try {
+      await this.store.change(id, s => {
+        if (sameWait(s.scheduleWait, { kind: 'mailbox_reply', key })) {
+          s.scheduleWait = undefined;
+        }
+        s.scheduleWaitRevision = waitRevision(s) + 1;
+        s.waitingReason = undefined;
+      }, () => {
+        signal?.throwIfAborted();
+        const live = this.store.get(id);
+        if (!this.isPeerWait(live, key) || waitRevision(live) !== expected) {
+          throw new WorkerError('revision_conflict', `Worker ${id} left the observed peer wait generation ${expected}; the newer wait is preserved.`, true);
+        }
+        this.assertWaitChange(id, expected, undefined);
+      });
+    } catch (error) {
+      if (error instanceof WaitReplay || error instanceof WorkerError && error.code === 'revision_conflict') {
+        return false;
+      }
+      throw error;
+    }
+    this.engine.onChange();
+    return true;
+  }
   /** No resources held during dependency/message waits, runner waits or approval. */
-  async *stream(session: Session, messages: Message[], tools: Tool[], signal: AbortSignal, maintenance = false): AsyncIterable<Part> {
+  async *stream(session: Session, messages: Message[], tools: Tool[], signal: AbortSignal, maintenance = false,
+    prepare?: () => Promise<Message[]>): AsyncIterable<Part> {
     const key = `model:${this.resources.host}:${randomUUID()}`;
     let resolve!: () => void;
     const promise = new Promise<void>(done => {
@@ -776,13 +1017,7 @@ export class WorkerLifecycle implements ExecutionGovernance {
         }
         const board = maintenance ? undefined : await this.board.open();
         this.authorize(session); signal.throwIfAborted();
-        const policy = this.settings().models?.[session.model.id];
-        if (!policy) {
-          throw new WorkerError('model_unavailable', 'The selected model was disabled while queued.');
-        }
-        if (!maintenance && session.permission === 'workspace-write' && policy.allowWrite === false) {
-          throw new WorkerError('permission_denied', 'Write permission was revoked while queued.');
-        }
+        this.assertModelPolicy(this.store.get(session.id), maintenance);
         this.guard(); signal.throwIfAborted();
         const task = board?.getTask({ kind: 'coordinator', ownerId: session.ownerId! }, session.startup!.taskId);
         const team = board?.getTeam({ kind: 'coordinator', ownerId: session.ownerId! }, session.startup!.teamId);
@@ -792,7 +1027,31 @@ export class WorkerLifecycle implements ExecutionGovernance {
         if (!maintenance && (this.store.get(session.id).scheduleWait || !task?.readiness.ready)) {
           throw new WorkerError('schedule_changed', 'Readiness changed during admission. Resume explicitly after resolving the wait.', true);
         }
-        iterator = this.provider.stream(session.model, messages, tools, signal)[Symbol.asyncIterator]();
+        // The last admission boundary: authorization, membership, readiness and
+        // resource admission have all passed, so a prompt rebuilt HERE (a peer
+        // batch that arrived while this request queued, exact context counting)
+        // is what the provider really receives.
+        const prepared = prepare ? await prepare() : messages;
+        signal.throwIfAborted();
+        if (prepare) {
+          // The preparation awaited provider token counts, so the live model
+          // policy, authorization, assignment, task lifecycle and readiness are
+          // re-proved at this last boundary before the provider request is made.
+          this.authorize(session);
+          signal.throwIfAborted();
+          const live = this.store.get(session.id);
+          // In particular a model removed (or an allowWrite revoked) while the
+          // peer block was counted must fail here: a custom provider never
+          // receives a prepared prompt for a model that is no longer configured
+          // or no longer permits this session's permission. Maintenance
+          // summarization keeps its membership-only rule.
+          this.assertModelPolicy(live, maintenance);
+          signal.throwIfAborted();
+          if (!maintenance && (live.scheduleWait || this.schedulingReason(live))) {
+            throw new WorkerError('schedule_changed', 'Readiness changed while preparing the provider prompt. Resume explicitly after resolving the wait.', true);
+          }
+        }
+        iterator = this.provider.stream(session.model, prepared, tools, signal)[Symbol.asyncIterator]();
         admitted();
         for (;;) {
         // Deliberately await the real effect. An outer engine abort may detach

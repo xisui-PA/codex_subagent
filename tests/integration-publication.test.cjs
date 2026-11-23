@@ -21,8 +21,13 @@
 // path is proved absent. An existing record is never replaced by a fresh staging
 // name, so no old `.codex-stage` payload is orphaned or erased from the journal;
 // while it cannot be proved removable the row reports a retryable conflict naming
-// that staging path. Real temp directories only; the module
-// is loaded from .test-build unless STEP5_TEST_BUILD is set.
+// that staging path. The seeded journal is the ONE current shape - every row
+// carries an explicit `stage` (null when it has none) and every stage record its
+// own `identity` (null while only the name is pinned) - and a same-schema row
+// that strips one of those fields from the raw JSON is refused as a journal
+// conflict before any destination write or staging cleanup. Real temp
+// directories only; the module is loaded from .test-build unless
+// STEP5_TEST_BUILD is set.
 
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
@@ -38,11 +43,13 @@ const { publishIntegration } = require(path.join(buildDir, 'integration-publicat
 
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const digest = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const entryOf = (bytes, mode) => ({
+// One approved side in the current entry shape: its planned mode class is always
+// present, and the construction convenience defaults to the publication default.
+const entryOf = (bytes, mode = 0o644) => ({
   type: 'file',
   hash: hash(bytes),
   size: bytes.length,
-  ...(mode === undefined ? {} : { mode })
+  mode
 });
 const byPath = (left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
 const ordered = changes => [...changes].sort(byPath);
@@ -120,8 +127,11 @@ async function diskTrust(root, keys) {
 }
 
 /**
- * Seeds the documented durable journal shape to reproduce a crash window. An
- * entry may carry the additive `stage` record of an interrupted staging effect.
+ * Seeds the documented durable journal shape to reproduce a crash window. Every
+ * row carries the current explicit `stage` field - null when the phase has no
+ * staging record - and every stage record carries its own `identity`, null while
+ * only the name is pinned. A case that needs an OLDER shape removes the field
+ * from the raw JSON after seeding, so this fixture can never hide a refusal.
  */
 async function seedJournal(fx, entries, options = {}) {
   const root = await fs.realpath(fx.root);
@@ -135,7 +145,8 @@ async function seedJournal(fx, entries, options = {}) {
     revision: options.revision === undefined ? 1 : options.revision,
     trust,
     entries: ordered(entries).map(({ path: key, state, before, after, stage }) => ({
-      path: key, state, before, after, ...(stage === undefined ? {} : { stage })
+      path: key, state, before, after,
+      stage: stage === undefined ? null : { ...stage, identity: stage.identity === undefined ? null : stage.identity }
     }))
   };
   await fs.writeFile(fx.journalPath, JSON.stringify(journal));
@@ -949,7 +960,7 @@ test('oversized destinations are refused before they are read', async t => {
   const fx = await fixture(t);
   const target = await write(fx.root, 'large.bin', Buffer.from('x'));
   await fs.truncate(target, 40 * 1024 * 1024);
-  const expected = { type: 'file', hash: 'a'.repeat(64), size: 5 };
+  const expected = { type: 'file', hash: 'a'.repeat(64), size: 5, mode: 0o644 };
   const open = fsPromisesOpen();
   let openedTarget = 0;
   setPromisesOpen(async (file, ...args) => {
@@ -1429,7 +1440,8 @@ test('a plan beyond the declared byte budget is refused before any approved byte
   // Nine DECLARED 32 MB results: 288 MB, above the 256 MB publication bound. The
   // sizes live in the approved entries only, so nothing large is allocated.
   const changes = Array.from({ length: 9 }, (_, index) => ({
-    path: `budget-${index}.bin`, before: null, after: { type: 'file', hash: 'a'.repeat(64), size: 32 * 1024 * 1024 }
+    path: `budget-${index}.bin`, before: null,
+    after: { type: 'file', hash: 'a'.repeat(64), size: 32 * 1024 * 1024, mode: 0o644 }
   }));
   let reads = 0;
   const result = await publishIntegration({
@@ -1456,7 +1468,8 @@ test('a resumed publication over the byte budget reports the paths it already ap
   const changes = [
     { path: 'kept.txt', before: entryOf(base), after: entryOf(next) },
     ...Array.from({ length: 9 }, (_, index) => ({
-      path: `resume-${index}.bin`, before: null, after: { type: 'file', hash: 'b'.repeat(64), size: 32 * 1024 * 1024 }
+      path: `resume-${index}.bin`, before: null,
+      after: { type: 'file', hash: 'b'.repeat(64), size: 32 * 1024 * 1024, mode: 0o644 }
     }))
   ];
   await seedJournal(fx, [
@@ -2184,7 +2197,9 @@ const STAGE = /^\\.codex-stage-[0-9a-f]{16}\\.tmp$/;
 const { publishIntegration } = require(path.join(process.env.STEP5_TEST_BUILD, 'integration-publication'));
 const spec = JSON.parse(process.env.STEP5_CRASH_SPEC);
 const target = path.join(spec.root, spec.rel);
-const entry = bytes => ({ type: 'file', hash: crypto.createHash('sha256').update(bytes).digest('hex'), size: bytes.length });
+const entry = bytes => ({
+  type: 'file', hash: crypto.createHash('sha256').update(bytes).digest('hex'), size: bytes.length, mode: 0o644
+});
 (async () => {
   const base = await fsp.readFile(target);
   const next = Buffer.from(spec.next, 'utf8');
@@ -2340,8 +2355,9 @@ test('recovery removes only a staging entry whose identity, content and link sta
   assert.deepEqual(await fs.readFile(partialPath), next.subarray(0, 4), 'a partial payload is left untouched');
   assert.deepEqual(await fs.readFile(partialTarget), base);
 
-  // (d) A LEGACY v2 intent carries no stage data at all: nothing is inferred and
-  //     nothing is removed, even when a staging-shaped file happens to exist.
+  // (d) An intent row whose stage is the canonical null carries no staging record
+  //     at all: nothing is inferred and nothing is removed, even when a
+  //     staging-shaped file happens to exist.
   const legacy = await fixture(t);
   await write(legacy.root, 'legacy.txt', base);
   const legacyPath = path.join(legacy.root, '.codex-stage-ffffffffffffeeee.tmp');
@@ -2351,7 +2367,7 @@ test('recovery removes only a staging entry whose identity, content and link sta
     contents: { 'legacy.txt': next }
   }));
   assert.equal(legacyResult.state, 'interrupted');
-  assert.deepEqual(await fs.readFile(legacyPath), next, 'legacy debris is never guessed at');
+  assert.deepEqual(await fs.readFile(legacyPath), next, 'unrecorded debris is never guessed at');
   assert.deepEqual((await readJournal(legacy)).entries.map(entry => [entry.path, entry.state]), [['legacy.txt', 'interrupted']]);
 });
 
@@ -2440,6 +2456,65 @@ test('a staging record with an invalid name or identity shape is a journal confl
   assert.equal(deletion.state, 'conflict');
   assert.match(deletion.conflicts[0].reason, /journal conflict: .*stage/);
   assert.deepEqual(await fs.readFile(target), base, 'the refused journal deletes nothing');
+});
+
+test('a same-schema row without its current mode, stage or stage identity is refused before any write', async t => {
+  const fx = await fixture(t);
+  const base = Buffer.from('old shape base\n');
+  const next = Buffer.from('old shape next\n');
+  const target = await write(fx.root, 'shape.txt', base);
+  const stageName = '.codex-stage-5a5a5a5a5a5a5a5a.tmp';
+  const staged = path.join(fx.root, stageName);
+  await fs.writeFile(staged, next);
+  const stagedStat = await fs.lstat(staged, { bigint: true });
+  const identity = { dev: stagedStat.dev.toString(), ino: stagedStat.ino.toString() };
+  const changes = [{ path: 'shape.txt', before: entryOf(base), after: entryOf(next) }];
+  const contents = { 'shape.txt': next };
+  // Each case starts from a VALID current journal and then removes exactly one
+  // current field from the raw JSON, so only that older shape can explain the
+  // refusal: the fixture's own normalization must never mask it.
+  const olderShapes = [
+    {
+      name: 'a file entry without its mode',
+      // The file-entry check runs before the plan digest is compared, so this
+      // specific reason proves the missing current field is what refused it.
+      reason: /journal entry .* is not a valid file entry/,
+      strip: entry => {
+        delete entry.before.mode;
+        delete entry.after.mode;
+      }
+    },
+    {
+      name: 'a row without its stage field',
+      reason: /omits its stage field/,
+      strip: entry => { delete entry.stage; }
+    },
+    {
+      name: 'a stage record without its identity',
+      reason: /stage record omits its identity/,
+      strip: entry => { delete entry.stage.identity; }
+    }
+  ];
+  for (const older of olderShapes) {
+    await seedJournal(fx, [{
+      path: 'shape.txt', state: 'intent', before: entryOf(base), after: entryOf(next),
+      stage: { name: stageName, identity }
+    }]);
+    const raw = await readJournal(fx);
+    older.strip(raw.entries[0]);
+    await fs.writeFile(fx.journalPath, JSON.stringify(raw));
+    const journalBytes = await fs.readFile(fx.journalPath);
+    const refused = await publishIntegration(requestFor(fx, changes, { contents }));
+    assert.equal(refused.state, 'conflict', `${older.name} is refused`);
+    assert.equal(refused.conflicts[0].path, fx.journalPath, `${older.name} refuses the whole journal`);
+    assert.match(refused.conflicts[0].reason, older.reason, `${older.name} names the missing current field`);
+    assert.deepEqual(refused.applied, [], `${older.name} reports nothing applied`);
+    assert.deepEqual(await fs.readFile(fx.journalPath), journalBytes,
+      `${older.name}: the refused journal is never rewritten`);
+    assert.deepEqual(await fs.readFile(target), base, `${older.name}: the destination is untouched`);
+    assert.deepEqual(await fs.readFile(staged), next,
+      `${older.name}: the recorded staging entry is never cleaned up`);
+  }
 });
 
 test('a same-size edit of the staged payload during publication is never published or removed', async t => {
@@ -2532,7 +2607,7 @@ test('a same-size edit of the staged payload during publication is never publish
   assert.deepEqual(await fs.readFile(target), next);
   assert.deepEqual(await stagingEntries(fx.root), [], 'the recorded staging path is gone and no new one remains');
   assert.deepEqual((await readJournal(fx)).entries.map(entry => [entry.path, entry.state, entry.stage]),
-    [['edited-stage.txt', 'applied', undefined]], 'the reconciled record is dropped only after its path is absent');
+    [['edited-stage.txt', 'applied', null]], 'the reconciled record is cleared to null only after its path is absent');
   assert.deepEqual(await fs.readFile(moved), edited, 'the moved file itself is never touched');
 });
 
@@ -2678,7 +2753,7 @@ test('a first editor refusal that also blocks stage cleanup is resolved by a ret
   assert.equal(await exists(oldStage), false, 'the exact old staging entry is removed before new staging');
   assert.deepEqual(await stagingEntries(fx.root), [], 'no staging entry is left behind');
   assert.deepEqual((await readJournal(fx)).entries.map(entry => [entry.path, entry.state, entry.stage]),
-    [['editor-stage.txt', 'applied', undefined]], 'the reconciled record is dropped only after its path is absent');
+    [['editor-stage.txt', 'applied', null]], 'the reconciled record is cleared to null only after its path is absent');
 });
 
 // A resolved intent whose destination proves applied but whose staging cleanup was
@@ -2736,7 +2811,7 @@ test('a resolved applied row keeps its verified stage until a recovery proves it
   assert.equal((await fs.stat(target)).mtimeMs, publishedStat.mtimeMs, 'the applied destination is never replayed');
   const reconciled = await readJournal(fx);
   assert.deepEqual(reconciled.entries.map(entry => [entry.path, entry.state, entry.stage]),
-    [['settled-stage.txt', 'applied', undefined]]);
+    [['settled-stage.txt', 'applied', null]]);
   assert.ok(reconciled.revision > 2, 'the reconciled record is durable');
 
   // The settled state replays without any further effect or revision.
@@ -2813,7 +2888,7 @@ test('an intent proven applied with an uncleared stage is a retryable conflict t
   assert.deepEqual(await fs.readFile(target), next, 'the destination is preserved');
   assert.equal((await fs.stat(target)).mtimeMs, published.mtimeMs, 'the destination is not rewritten');
   assert.deepEqual((await readJournal(fx)).entries.map(entry => [entry.path, entry.state, entry.stage]),
-    [['applied-debris.txt', 'applied', undefined]], 'the record is dropped only after its path is absent');
+    [['applied-debris.txt', 'applied', null]], 'the record is cleared to null only after its path is absent');
 });
 
 // An absence is never accepted through an untrusted parent directory: a pinned

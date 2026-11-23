@@ -131,7 +131,8 @@ export const requestRecordSchema = z.object({
 export type RequestRecord = z.infer<typeof requestRecordSchema>;
 
 export const boardDataSchema = z.object({
-  schema: z.union([z.literal(1), z.literal(2)]),
+  /** The only durable board format this build reads or writes. */
+  schema: z.literal(2),
   workspaceRoot: z.string().min(1).max(limits.workspaceRoot),
   teams: boundedList(teamSchema, limits.teams),
   tasks: boundedList(taskSchema, limits.tasks),

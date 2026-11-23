@@ -182,6 +182,32 @@ recipe and publication recovery. Inspect `status` after an ambiguous call
 before retrying its original request. An `interrupted` publication requires a
 new attempt. Release retention after consumers finish and effects settle.
 
+### Close out task-board work
+
+Final task-board reconciliation is the coordinator's own duty, not automatic
+extension behavior and not part of a worker's completion. Workers may report
+their progress, blockers, candidate refs and `submitted`/`failed` state, but
+cannot accept. Worker completion, board acceptance and integration
+acceptance/`apply` are three separate outcomes.
+
+Before the final completion response, enumerate and re-read all pages of the
+`teams`/`tasks` created or managed for this assignment in the canonical
+`workspaceRoot` and stable `ownerId` scope, reconcile current state using
+`expectedRevision` and a fresh idempotent `requestId` per decision, and verify
+the resulting states. The only successful path is ready -> in_progress ->
+submitted -> validating -> accepted; there is no `completed` state. Acceptance
+requires the candidate, review, readiness/no-blockers and
+latest-passing-verdict conditions stated above, with validations recorded after
+the task is `validating` and before the explicit `accept`. A reporting, review or
+documentation task still needs a concrete versioned report/output reference where
+the board requires candidates: an absent ref is no cover for leaving finished
+work `in_progress`, and evidence or passing verdicts must never be manufactured.
+
+Withdraw tasks by explicit cancellation. Leave genuinely unfinished, failed or
+blocked tasks with accurate state, blockers and next action, and name them in
+the final response instead of claiming full completion or accepting them just
+to clear the board.
+
 ## Line endings and exact-text edits
 
 Before exact-text patches, check the target's working-tree line endings.

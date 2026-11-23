@@ -182,6 +182,7 @@ test('corrupt or foreign-root board data fails closed without modification', asy
   const co = coordinator('co-1');
   const team = await board.createTeam(co, { requestId: 'c1', name: 'Eps', description: '' });
   const pristine = await fs.readFile(file, 'utf8');
+  assert.equal(JSON.parse(pristine).schema, 2, 'a fresh board is written in the current format');
 
   const garbage = '{ not valid json';
   await fs.writeFile(file, garbage, { mode: 0o600 });
@@ -198,6 +199,14 @@ test('corrupt or foreign-root board data fails closed without modification', asy
   broken.teams.push(structuredClone(team)); // duplicate id
   await fs.writeFile(file, JSON.stringify(broken), { mode: 0o600 });
   await assert.rejects(open(), { code: 'board_malformed' });
+
+  // An older schema-1 board is not promoted: it fails closed and keeps its bytes.
+  const older = JSON.parse(pristine);
+  older.schema = 1;
+  const olderText = JSON.stringify(older);
+  await fs.writeFile(file, olderText, { mode: 0o600 });
+  await assert.rejects(open(), { code: 'board_malformed' });
+  assert.equal(await fs.readFile(file, 'utf8'), olderText, 'the older board was left byte-for-byte untouched');
 
   await fs.writeFile(file, pristine, { mode: 0o600 });
   const ok = await open();

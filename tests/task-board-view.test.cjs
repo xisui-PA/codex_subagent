@@ -402,3 +402,123 @@ test('rows use literal text only and add no markup', async () => {
   const literal = await taskRow({ title: markup });
   assert.equal(literal.item.label, markup, 'markup-looking data stays literal and is not transformed');
 });
+
+test('unchanged polls keep the adopted rows and emit nothing extra', async () => {
+  const tree = new TaskBoardTree();
+  let fired = 0;
+  tree.onDidChangeTreeData(() => { fired += 1; });
+
+  tree.refresh();
+  tree.refresh([]);
+  assert.equal(fired, 0, 'the initial empty board is already rendered');
+
+  const snapshot = board({
+    teams: [team(TEAM_A, { name: 'Alpha', revision: 4 })],
+    tasks: [task({ acceptanceCriteria: ['One criterion'] })],
+  });
+  tree.refresh([snapshot]);
+  assert.equal(fired, 1);
+  const [workspace] = await tree.getChildren();
+  const [teamRow] = await tree.getChildren(workspace);
+  const [row] = await tree.getChildren(teamRow);
+
+  const clone = JSON.parse(JSON.stringify(snapshot));
+  tree.refresh([clone]);
+  tree.refresh([snapshot]);
+  assert.equal(fired, 1, 'equal snapshots newly allocated by polling do not notify');
+  const [sameWorkspace] = await tree.getChildren();
+  assert.equal(sameWorkspace, workspace, 'the adopted root keeps its identity');
+  assert.equal((await tree.getChildren(sameWorkspace))[0], teamRow);
+  assert.equal((await tree.getChildren(teamRow))[0], row);
+
+  const noisy = { ...snapshot, ignored: { refreshedAt: AT } };
+  noisy.tasks = snapshot.tasks.map(entry => ({ metadata: { seenAt: AT }, ...entry }));
+  tree.refresh([noisy]);
+  assert.equal(fired, 1, 'unused metadata and property order are not visible changes');
+
+  tree.refresh([]);
+  tree.refresh();
+  assert.equal(fired, 2, 'clearing the board notifies once');
+  assert.equal((await tree.getChildren())[0].id, 'board:none');
+});
+
+test('nested visible changes are detected without mutating the previously adopted tree', async () => {
+  const source = board({
+    teams: [team(TEAM_A)],
+    tasks: [task({ id: TASK_ONE, title: 'First' }), task({ id: TASK_TWO, title: 'Second' })],
+  });
+  const tree = new TaskBoardTree();
+  let fired = 0;
+  tree.onDidChangeTreeData(() => { fired += 1; });
+  tree.refresh([source]);
+
+  const [adoptedWorkspace] = await tree.getChildren();
+  const [adoptedTeam] = await tree.getChildren(adoptedWorkspace);
+  const [adoptedFirst] = await tree.getChildren(adoptedTeam);
+  assert.deepEqual((await tree.getChildren(adoptedFirst)).map(node => node.label), ['No details recorded']);
+
+  source.tasks[0].progressPreview = 'Halfway';
+  tree.refresh([source]);
+  assert.equal(fired, 2, 'ids and revisions stay put but a nested row changed');
+  const [workspace] = await tree.getChildren();
+  assert.notEqual(workspace, adoptedWorkspace);
+  assert.equal((await tree.getChildren(adoptedTeam))[0], adoptedFirst, 'the old rendered node is kept intact');
+  assert.deepEqual((await tree.getChildren(adoptedFirst)).map(node => node.label), ['No details recorded'], 'later summary edits do not alter adopted rows');
+  const [teamRow] = await tree.getChildren(workspace);
+  const [first, second] = await tree.getChildren(teamRow);
+  assert.equal(first.id, adoptedFirst.id, 'the stable row id survives the change');
+  assert.equal(first.description, adoptedFirst.description, 'top-level text is unchanged');
+  assert.deepEqual((await tree.getChildren(first)).map(node => node.label), ['Progress']);
+  assert.equal(second.label, 'Second');
+});
+
+test('ordering, added, removed and error rows all notify', async () => {
+  const source = board({
+    teams: [team(TEAM_A)],
+    tasks: [task({ id: TASK_ONE, title: 'First' }), task({ id: TASK_TWO, title: 'Second' })],
+  });
+  const tree = new TaskBoardTree();
+  let fired = 0;
+  tree.onDidChangeTreeData(() => { fired += 1; });
+  tree.refresh([source]);
+
+  const labels = async () => {
+    const [workspace] = await tree.getChildren();
+    const [teamRow] = await tree.getChildren(workspace);
+    return (await tree.getChildren(teamRow)).map(node => node.label);
+  };
+  const kinds = async () => {
+    const [workspace] = await tree.getChildren();
+    return (await tree.getChildren(workspace)).map(node => node.kind);
+  };
+  assert.deepEqual(await labels(), ['First', 'Second']);
+
+  source.tasks.reverse();
+  tree.refresh([source]);
+  assert.equal(fired, 2, 'a reordered board is a visible change');
+  assert.deepEqual(await labels(), ['Second', 'First']);
+
+  source.tasks.push({ ...source.tasks[1], id: '3'.repeat(32), titlePreview: 'Third' });
+  tree.refresh([source]);
+  assert.equal(fired, 3, 'an added row notifies');
+  assert.deepEqual(await labels(), ['Second', 'First', 'Third']);
+
+  source.tasks.pop();
+  tree.refresh([source]);
+  assert.equal(fired, 4, 'a removed row notifies');
+  assert.deepEqual(await labels(), ['Second', 'First']);
+
+  source.error = 'task-board.json is invalid';
+  tree.refresh([source]);
+  assert.equal(fired, 5, 'a new error notifies');
+  assert.deepEqual(await kinds(), ['error', 'team']);
+
+  source.error = 'task-board.json is unreadable';
+  tree.refresh([source]);
+  assert.equal(fired, 6, 'changed error text notifies');
+
+  source.error = undefined;
+  tree.refresh([source]);
+  assert.equal(fired, 7, 'a cleared error notifies');
+  assert.deepEqual(await kinds(), ['team']);
+});

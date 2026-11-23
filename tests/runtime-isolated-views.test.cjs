@@ -73,7 +73,8 @@ test('private views default off; disabled calls do not open storage or change le
   await fs.writeFile(path.join(f.root, 'a.txt'), 'legacy current');
   await f.call('subagent_send', { ownerId, id: f.worker.id, requestId: 'legacy', message: 'read' });
   const session = await f.complete(f.worker.id);
-  assert.equal(session.schema, 1);
+  assert.equal(session.schema, 3);
+  assert.equal(session.mode, 'standalone');
   assert.equal(session.isolatedView, undefined);
   assert.equal(JSON.parse(session.turns.at(-1).tools[0].result).content, 'legacy current');
 });
@@ -85,7 +86,8 @@ test('real bound worker uses captured unsaved content, edits and seals privately
   assert.ok(f.state.documentCalls >= 4, 'the owning-window enumeration must be queried at every capture boundary');
   const overlay = await f.bind(snapshot.id);
   const bound = await f.broker().session(f.root, f.worker.id);
-  assert.equal(bound.schema, 2);
+  assert.equal(bound.schema, 3);
+  assert.equal(bound.mode, 'isolated');
   assert.equal(bound.isolatedView.overlayId, overlay.overlayId);
   f.state.documents[0].text = 'new unsaved text';
   f.state.documents[0].version = 2;
@@ -137,7 +139,9 @@ test('reload and feature/model revocation fail closed; missing index is never re
   await f.restart();
   await assert.rejects(send('missing-index'), { code: 'isolation_corrupt' });
   await assert.rejects(fs.access(index), { code: 'ENOENT' });
-  assert.equal((await f.broker().session(f.root, f.worker.id)).schema, 2);
+  const restoredSession = await f.broker().session(f.root, f.worker.id);
+  assert.equal(restoredSession.schema, 3);
+  assert.equal(restoredSession.mode, 'isolated');
   assert.equal(await fs.readFile(path.join(f.root, 'a.txt'), 'utf8'), 'base');
   await f.broker().close();
   await fs.writeFile(index, bytes);
@@ -170,7 +174,8 @@ test('membership revoked before Session marker rename blocks binding; exact retr
   }
   assert.ok(removed);
   const session = await f.broker().session(f.root, f.worker.id);
-  assert.equal(session.schema, 1);
+  assert.equal(session.schema, 3);
+  assert.equal(session.mode, 'standalone');
   assert.equal(session.isolatedView, undefined);
   const pins = await f.call('subagent_view_status', { ...f.scope, kind: 'pins' });
   assert.ok(pins.items.some(pin => pin.binding?.workerId === f.worker.id));
@@ -282,7 +287,9 @@ test('shutdown drains a paused private write before releasing the workspace owne
   assert.equal(index.overlays[overlay.overlayId].head, null);
   assert.equal(await fs.readFile(path.join(f.root, 'a.txt'), 'utf8'), 'base');
   await f.restart();
-  assert.equal((await f.broker().session(f.root, f.worker.id)).schema, 2);
+  const drained = await f.broker().session(f.root, f.worker.id);
+  assert.equal(drained.schema, 3);
+  assert.equal(drained.mode, 'isolated');
 });
 
 test('an incomplete restored index cannot sweep content claimed by a permanent Session marker', async t => {
@@ -302,7 +309,9 @@ test('an incomplete restored index cannot sweep content claimed by a permanent S
   const hash = crypto.createHash('sha256').update('base').digest('hex');
   const blob = path.join(f.directory, 'isolated-views', 'content', 'blobs', hash.slice(0, 2), hash.slice(2));
   assert.equal(await fs.readFile(blob, 'utf8'), 'base');
-  assert.equal((await f.broker().session(f.root, f.worker.id)).schema, 2);
+  const retainedSession = await f.broker().session(f.root, f.worker.id);
+  assert.equal(retainedSession.schema, 3);
+  assert.equal(retainedSession.mode, 'isolated');
 });
 
 test('explicit model migration preserves a permanent view while enforcing exact target policies', async t => {
@@ -317,7 +326,8 @@ test('explicit model migration preserves a permanent view while enforcing exact 
   const migrated = await f.broker().session(f.root, f.worker.id);
   assert.equal(migrated.model.id, replacement.id);
   assert.equal(migrated.state, 'completed');
-  assert.equal(migrated.schema, 2);
+  assert.equal(migrated.schema, 3);
+  assert.equal(migrated.mode, 'isolated');
   assert.equal(migrated.isolatedView.overlayId, overlay.overlayId);
   assert.equal(f.state.requests, requests, 'completed model migration must not start inference');
   await assert.rejects(f.call('subagent_resume', { ownerId, id: f.worker.id, requestId: 'bad-model', model: 'not-configured' }), { code: 'model_unavailable' });
@@ -365,7 +375,8 @@ test('pin release cannot orphan a persisted Session marker after interrupted ove
   assert.deepEqual(recovered.deletedSnapshots, []);
   await f.restart();
   const session = await f.broker().session(f.root, f.worker.id);
-  assert.equal(session.schema, 2);
+  assert.equal(session.schema, 3);
+  assert.equal(session.mode, 'isolated');
   assert.equal(session.isolatedView.overlayId, intent.binding.overlayId);
   const status = await f.call('subagent_view_status', { ...f.scope });
   assert.equal(status.items[0].overlayId, intent.binding.overlayId);

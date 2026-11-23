@@ -72,7 +72,7 @@ Implemented in the host runtime and the extension: the setting is read live thro
 - View and full records: the **Task Board** view renders bounded summaries only. `codexSubagent.openBoardRecord` reads the board summaries, takes the team's trusted `coordinatorOwnerId` from the record (never from UI input), and re-reads the team and task through `subagent_team_get`/`subagent_task_get`. The full JSON, including transition entries and reference URIs, opens read-only through the `codex-task-board-record` content-provider scheme, so nothing implies an editable or savable document.
 - Shutdown: root shutdown awaits `board.close()` before the `SessionStore` owner lock is released.
 
-Validation `resultRef` entries remain manual metadata: they record an id, version and URI without automatically fetching or verifying content. Opt-in [isolated file views](isolated-views.md) now provide shared immutable snapshots, private overlays, sealed submissions and explicit retention. Governed view cleanup now treats current board references and retained evidence pins as retention roots; consumers must still pin exact inputs before use. Opt-in isolated runner execution for bound workers is implemented too (see below). Opt-in step-5 coordinator integration is implemented as explicit decisions, while automatic dispatch, automatic acceptance and peer messaging remain unimplemented. Subsequent consumers must pin exact artifacts and preserve the task/worker state separation.
+Validation `resultRef` entries remain manual metadata: they record an id, version and URI without automatically fetching or verifying content. Opt-in [isolated file views](isolated-views.md) now provide shared immutable snapshots, private overlays, sealed submissions and explicit retention. Governed view cleanup now treats current board references and retained evidence pins as retention roots; consumers must still pin exact inputs before use. Opt-in isolated runner execution for bound workers is implemented too (see below). Opt-in step-5 coordinator integration is implemented as explicit decisions, and opt-in step-6 [team mail](team-mailbox.md) carries durable structured peer messages, while automatic dispatch and automatic acceptance remain unimplemented. Subsequent consumers must pin exact artifacts and preserve the task/worker state separation.
 
 ## Isolated runner workspaces
 
@@ -86,7 +86,7 @@ Isolated runner execution is a separate, opt-in service layered on the existing 
 - **Caches.** Only `npm`/`pip` download caches are reused. Installed dependencies, build output and temporary directories are fresh per slot, so a run never inherits another run's tree, and nothing installs without approval; combine steps inside one approved command (for example `npm ci && npm test`).
 - **Containment.** Windows uses a Job Object with a suspended assign, no breakaway and an active-zero drain proof; POSIX uses an owned process group plus an inherited marker discovered through readable `/proc` or `ps`. Incomplete or failed scans quarantine instead of guessing, no path kills by bare PID, and runtime identity is validated before recovery. Deliberately scrubbed environment values and changed OS identity are outside this contract: containment is not an OS sandbox.
 - **MCP surface.** `subagent_runner_status` pages leases, queue entries or result summaries for the caller's owner and team with a bounded summary block; `subagent_runner_result` returns one full immutable result plus derived current-revision and staleness fields that are null when the current index is unavailable, never rewriting the evidence; `subagent_runner_cleanup` reconciles the scope with no new command and carries a `destructiveHint` tool annotation so clients can warn before calling it.
-- **Coordinator control.** Governed step-4 startup now executes explicit create-bind-start decisions; no task planner, automatic acceptance or peer messaging exists, and integration requires the explicit step-5 decisions. A stored command result is evidence only: it is not an artifact pin and not a validation verdict, and a command that ran on one input revision never validates a later one.
+- **Coordinator control.** Governed step-4 startup now executes explicit create-bind-start decisions, no task planner or automatic acceptance exists, opt-in [team mail](team-mailbox.md) carries structured peer messages, and integration requires the explicit step-5 decisions. A stored command result is evidence only: it is not an artifact pin and not a validation verdict, and a command that ran on one input revision never validates a later one.
 
 ## Coordinator integration (step 5)
 
@@ -105,22 +105,69 @@ checks. The journal is per file, an interrupted publication is proof-only, and
 no Git commit or network publish occurs. See
 [coordinator integration](integration.md).
 
+## Team mailbox (step 6)
+
+Opt-in durable messages between one coordinator and the members of one team,
+gated by the User-only `codexSubagent.taskBoard.messaging.enabled` flag on top of
+`codexSubagent.taskBoard.enabled` and stored per canonical root beside the
+board. It is a record channel. It starts nothing, resumes nothing and changes
+no board record. A send never mutates scheduling. Only the governed scheduler clears the wait it observes once a correlated live reply exists.
+
+- **Identity.** Coordinators call the three mailbox tools with `ownerId` and the
+  optional `workspaceRoot`. Workers call the same names with their session
+  identity and reach only their own team and root. The coordinator reads every
+  retained team event, while a worker reads only what it sent or received, and
+  only while its membership is live.
+- **Sends.** One event carries `teamId`, `taskId`, `requestId`, `kind` and a body
+  of at most 1024 UTF-8 bytes, with one to four destinations from worker ids or
+  the team coordinator. A `replyTo` reply routes to the original sender alone.
+  An exact retry replays the retained receipt, changed arguments conflict and an
+  expired replay is refused while its tombstone lasts.
+- **Delivery.** Mail is durable before it is offered, it is offered in bounded
+  batches only at normal provider boundaries of a worker that is already
+  running, and it is delivered when the provider emits a part for that prompt
+  and the receipt commits. The bounded block is checkpointed into the worker's
+  own transcript exactly once, before the receipt, so later requests replay the
+  same body and event id as ordinary history while a failed receipt is retried
+  when that retained input is presented again. Acknowledgment is a separate
+  explicit call. A stopped worker stays stopped, and nothing is broadcast or
+  answered automatically.
+- **Waits.** A governed bound worker asks with `subagent_mailbox_wait` as the
+  only tool call of its round. The wait yields capacity, an authorized matching
+  reply clears only the observed wait generation, and cancellation or timeout
+  fences it. `subagent_schedule` against the observed wait revision stays the
+  coordinator's own decision, and a message by itself never starts a turn or
+  changes permissions.
+- **References.** A message carries identity, never retention. `artifact_ready`
+  names an exact sealed `{id, version, uri}`, evidence names the exact runner ref
+  and an attempt is `{id, revision}`. Unretained values are reported, existing
+  retention and composition APIs grant access, and no message exposes another
+  worker's mutable overlay.
+- **Authority.** An `interface_response` is informational. A contract agreement is
+  an explicit `subagent_task_update` with the expected task revision, and board
+  state, verdicts, attempt acceptance and apply stay separate decisions.
+
 ## Resource governance and create-bind-start
 
 Step 4 is implemented behind the User-only resources flag. Its
 [configuration and contracts](resource-governance.md) distinguish inference,
 runnable effects, dependency/message waits, physical runner ownership and
-retained storage. Schema-3 startup persists a non-runnable gate before the
-atomic board membership/assignment transaction and private-view binding. An
-OS-user ledger grants explicit coordinator decisions through fair eligible
-queues, reserves service capacity and retains uncertain ownership through
-cancellation/reload. Legacy schemas, histories and per-root pool dimensions
-remain supported.
+retained storage. Every session is stored in the one current format, schema
+3 with an explicit `mode` (`standalone`, `isolated` or `governed`), derived by
+the host and never chosen by input; older session formats are refused and
+preserved rather than read, upgraded or mapped. Governed startup persists a
+non-runnable gate before the atomic board membership/assignment transaction
+and private-view binding. An OS-user ledger grants explicit coordinator
+decisions through fair eligible queues, reserves service capacity and retains
+uncertain ownership through cancellation/reload. Current histories and
+per-root pool dimensions remain supported.
 
 Owner receipt epochs, compressed archives, compact reference identity history,
 evidence pins and explicit collection bound metadata alongside content GC.
 Missing namespace documents fail closed and expired requests cannot become
 fresh mutations. Validation and integration are explicit coordinator stages
 with exact input revision and retention obligations, described in
-[coordinator integration](integration.md). Peer messaging remains a subsequent
-stage with explicit wakeup obligations.
+[coordinator integration](integration.md). Opt-in [team mail](team-mailbox.md)
+is the step-6 messaging stage. It delivers durable events to a worker that is
+already running, waits explicitly with `subagent_mailbox_wait`, and grants no
+wake, dispatch or permission authority on its own.

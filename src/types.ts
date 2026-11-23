@@ -7,7 +7,14 @@ export type Part =
   | { type: 'call'; id: string; name: string; input: Record<string, unknown> }
   | { type: 'result'; id: string; text: string };
 
-export interface Message { role: 'user' | 'assistant'; parts: Part[] }
+/**
+ * Host-only reference to one peer mailbox notice checkpointed WITH a user
+ * message. It is durable deduplication metadata (never inferred from message
+ * text) and is stripped before any provider request, so a replayed prompt still
+ * carries exactly the untrusted block the worker was shown.
+ */
+export interface PeerNoticeRef { id: string; teamId: string }
+export interface Message { role: 'user' | 'assistant'; parts: Part[]; peerNotices?: PeerNoticeRef[] }
 export interface Model {
   id: string; name: string; vendor: string; family: string; version: string; maxInputTokens: number;
 }
@@ -28,8 +35,17 @@ export interface Turn {
   attemptsLog?: { attempt: number; output: string; error?: Failure; endedAt: string }[];
   archived?: boolean;
 }
+/**
+ * The ONE current Session format is schema 3 with an explicit, required mode
+ * and no default. "standalone" is an ordinary spawn, "isolated" is a
+ * permanently bound private worker, and "governed" additionally carries its
+ * create-bind-start setup. There is no old-version reader: a record with
+ * schema 1, schema 2, a missing mode or an unknown mode is malformed and is
+ * never inferred, upgraded or silently mapped onto a mode.
+ */
+export type SessionMode = 'standalone' | 'isolated' | 'governed';
 export interface Session {
-  schema: 1 | 2 | 3; id: string; title: string; model: Model; instructions: string;
+  schema: 3; mode: SessionMode; id: string; title: string; model: Model; instructions: string;
   permission: 'read-only' | 'workspace-write'; state: State; messages: Message[]; turns: Turn[];
   operations: Record<string, { fingerprint: string; turnId: string }>;
   summary?: { text: string; through: number }; revision: number; createdAt: string; updatedAt: string;

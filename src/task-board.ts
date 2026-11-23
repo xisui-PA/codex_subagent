@@ -127,7 +127,7 @@ export class TaskBoard {
         if (await fs.lstat(path.join(this.directory, 'task-board.namespace.json')).then(() => true, () => false) || await fs.lstat(path.join(this.directory, 'board-retention')).then(() => true, () => false)) {
           throw new WorkerError('board_malformed', 'The task board is missing beside durable namespace metadata. Restore it; expired requests must not become fresh operations.');
         }
-        this.data = { schema: 1, workspaceRoot: this.root, teams: [], tasks: [], requests: {} };
+        this.data = { schema: 2, workspaceRoot: this.root, teams: [], tasks: [], requests: {} };
         return;
       }
       throw new WorkerError('board_unreadable', `Cannot read task board ${this.file}: ${error instanceof Error ? error.message : String(error)}`);
@@ -452,13 +452,9 @@ export class TaskBoard {
     }
   }
   private async commit(draft: BoardData, authorize?: () => void): Promise<void> {
-    // Older non-strict board readers must reject expiry metadata instead of
-    // stripping it and making retired request IDs eligible for fresh effects.
-    // Once expiry metadata is published the board never downgrades, so clearing
-    // a finished deletion intent cannot make an older host accept retired IDs.
-    if (draft.schema === 2 || draft.receiptEpochs || draft.receiptArchives || draft.receiptArchiveDeletes?.length || draft.receiptArchivePublications?.length || draft.referenceHistory) {
-      draft.schema = 2;
-    }
+    // Every draft is already the current schema-2 shape, so the strict parse is
+    // the single durable gate: it rejects any other version instead of promoting
+    // or rewriting one.
     boardDataSchema.parse(draft);
     this.validateGraph(draft);
     this.mutationGuard?.();
@@ -480,7 +476,6 @@ export class TaskBoard {
    * mutation still goes through commit().
    */
   private async commitPublicationIntent(draft: BoardData): Promise<void> {
-    draft.schema = 2;
     boardDataSchema.parse(draft);
     this.mutationGuard?.();
     await this.ensureNamespace();

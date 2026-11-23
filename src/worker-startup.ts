@@ -11,8 +11,14 @@ export const startupSchema = setupSchema.extend({
   requestId: z.string().min(1).max(200)
 }).strict();
 export type WorkerStartup = z.infer<typeof startupSchema>;
-/** Future message delivery supplies an explicit wake; no peer transport here. */
-export const scheduleWaitSchema = z.strictObject({ kind: z.literal('message'), key: z.string().min(1).max(200) });
+/**
+ * Two wait kinds at the same opaque generation: an explicit coordinator message
+ * wait, and a peer reply wait whose key is the observed question ID. Neither
+ * transports anything here and the key is never parsed.
+ */
+export const scheduleWaitKinds = ['message', 'mailbox_reply'] as const;
+/** No generation is recorded for 0. */
+export const scheduleWaitSchema = z.strictObject({ kind: z.enum(scheduleWaitKinds), key: z.string().min(1).max(200) });
 export type ScheduleWait = z.infer<typeof scheduleWaitSchema>;
 /** Opaque schedule-wait generation; a worker with no recorded generation is at 0. */
 export function waitRevision(waiting: { scheduleWaitRevision?: number }): number {
@@ -65,7 +71,7 @@ const descriptions: Record<GovernedTool, string> = {
   subagent_metadata_rollover: 'Explicitly expire one owner request epoch, compress its receipts and preserve immutable identities. Quiesce setup first. Old request IDs fail request_expired; new IDs use the returned eN: prefix. expectedEpoch makes retries safe.',
   subagent_resource_collect: 'Collect explicitly named unreferenced final command results, scoped released lease history and optionally expired receipt archives. Active work, pins, board references and uncertainty are retained. Cleanup never runs a command.',
   subagent_evidence_retention: 'Pin or release an exact immutable evidence URI for a named consumer, integration operation or retained validation report. Pin before consumption or publishing a reference. Names cannot be rebound without releasing the exact prior URI.',
-  subagent_schedule: 'Set or clear an explicit coordinator message wait at the next execution boundary of a governed worker. No peer messaging, planning, automatic delivery or effect interruption. Null wakes the worker. Pass expectedWaitRevision, the scheduleWaitRevision this worker returned: the set or wake applies only at that generation, an identical request that was already applied is a no-op, and a superseded generation or a different wait at it fails revision_conflict with nothing changed. Read the worker again before retrying a conflict.'
+  subagent_schedule: 'Set or clear an explicit coordinator message wait at the next execution boundary of a governed worker. kind mailbox_reply is the same opaque wait as message, keyed by the peer question ID; it never carries peer text, never supersedes an existing coordinator wait and never starts a stopped worker. Null wakes the worker. Pass expectedWaitRevision, the scheduleWaitRevision this worker returned: the set or wake applies only at that generation, an identical request that was already applied is a no-op, and a superseded generation or a different wait at it fails revision_conflict with nothing changed. Read the worker again before retrying a conflict.'
 };
 export const governedMcpTools = Object.entries(governedSchemas).map(([name, schema]) => {
   const json = z.toJSONSchema(schema);

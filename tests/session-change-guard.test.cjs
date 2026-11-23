@@ -11,9 +11,11 @@ const SESSION_FILE = `${FIXTURE_ID}.json`;
 
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 
-// Minimal schema-valid session; the store creates it with the wx open flag, not atomicWrite.
+// Minimal current (schema 3, explicit standalone mode) session; the store
+// creates it with the wx open flag, not atomicWrite.
 const fakeSession = () => ({
-  schema: 1,
+  schema: 3,
+  mode: 'standalone',
   id: FIXTURE_ID,
   title: 'original',
   model: { id: 'byok/qwen', name: 'Qwen', vendor: 'test', family: 'qwen', version: '1', maxInputTokens: 10_000 },

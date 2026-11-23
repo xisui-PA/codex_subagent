@@ -1935,10 +1935,11 @@ test('an unused opted-out legacy runner scope never touches the shared ledger wh
   t.after(() => broker.close().catch(() => undefined));
   const local = broker.local.get(root);
   const model = { id: 'byok/qwen', name: 'Qwen', vendor: 'test', family: 'qwen', version: '1', maxInputTokens: 1000 };
-  // A legacy (non-governed) session: it never opted into governed runners.
+  // A current standalone (non-governed) session: it never opted into
+  // governed runners.
   const create = async label => {
     const id = hex32(`opt-out-${label}`);
-    await local.store.create({ schema: 1, id, title: label, model, instructions: '', permission: 'workspace-write', state: 'completed',
+    await local.store.create({ schema: 3, mode: 'standalone', id, title: label, model, instructions: '', permission: 'workspace-write', state: 'completed',
       messages: [], turns: [{ id: `turn-${label}`, input: label, state: 'completed', started: true, attempts: 1, output: 'done', tools: [], createdAt: ISO, updatedAt: ISO }],
       operations: {}, revision: 1, createdAt: ISO, updatedAt: ISO, ownerId: 'parent' });
     return id;

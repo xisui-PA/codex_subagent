@@ -10,7 +10,10 @@ import type { ResourceConfig, WorkLane } from './resource-governor';
 import { isGovernedTool } from './worker-startup';
 import { WorkerEngine, type ExecutionGovernance } from './engine';
 import { TaskBoard } from './task-board';
-import type { BoardActor } from './task-board-types';
+import type { BoardActor, WorkerActor } from './task-board-types';
+import { mailboxWriteRequired, TeamMailbox, type MailboxMessage } from './team-mailbox';
+import { invokeMailbox, isMailboxTool, mailboxStorageReservation, workerMailboxTools } from './mailbox-tools';
+import type { MailboxPort } from './mailbox-tools';
 import { boardAdmissionLane, boardStorageReservation, invokeBoard, isBoardTool, workerBoardTools } from './task-board-tools';
 import type { BoardPort } from './task-board-tools';
 import { summarizeBoard } from './task-board-summary';
@@ -30,6 +33,14 @@ export interface RuntimeOptions {
   onChange: () => void; onError: (message: string) => void;
   /** Opt-in task board gate; absent or false keeps every board surface off. Read on every call. */
   taskBoardEnabled?: () => boolean;
+  /**
+   * Opt-in durable team mail gate. Absent or false keeps every mailbox surface
+   * off: no mailbox storage is opened, no mailbox tool is advertised and every
+   * mailbox call fails closed. It can only ever narrow the board (mail also
+   * requires taskBoard.enabled), is read on every call, and never affects board
+   * records, legacy workers or the separate resource-governance opt-in.
+   */
+  messagingEnabled?: () => boolean;
   isolatedViewsEnabled?: () => boolean;
   integrationEnabled?: () => boolean;
   /**
@@ -49,9 +60,23 @@ export interface RuntimeOptions {
   /** All file-backed and associated untitled buffers in the owning window, including clean ones. */
   publicationDocuments?: () => OpenDocument[];
 }
-interface Local { root: string; roots: string[]; store: SessionStore; engine: WorkerEngine; files: FileTools; host: BridgeHost; board: BoardHost; isolation: IsolatedViewHost; lifecycle: WorkerLifecycle }
+interface Local { root: string; roots: string[]; store: SessionStore; engine: WorkerEngine; files: FileTools; host: BridgeHost; board: BoardHost; mailbox: MailboxHost; isolation: IsolatedViewHost; lifecycle: WorkerLifecycle }
 const identifier = z.string().regex(/^[a-f0-9]{32}$/);
 const changeIdentifier = z.string().uuid();
+/**
+ * The domain error code carried by a failed tool result, read without throwing so
+ * the coordinator mailbox branch can tell an internal `mailbox_write_required`
+ * probe answer apart from every real error, which it returns unchanged.
+ */
+function resultErrorCode(result: ToolResult): string | undefined {
+  try {
+    const value = JSON.parse(result.content[0].text) as { error?: { code?: unknown } };
+    return typeof value.error?.code === 'string' ? value.error.code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function unpack<T>(result: ToolResult): T {
   const value = JSON.parse(result.content[0].text) as T & { error?: { code: string; message: string; retryable?: boolean } };
   if (result.isError || value.error) {
@@ -163,6 +188,37 @@ class BoardHost implements BoardPort {
     return (await this.open()).getTeam(actor, id);
   }
 
+  /**
+   * Synchronous live team list from the ACTUAL loaded board, used by durable
+   * mail delivery. A missing, failed or closing board throws instead of
+   * answering an empty list, so mail never authorizes against a guess.
+   */
+  teams(actor: BoardActor): { id: string; coordinatorOwnerId: string; memberWorkerIds: string[] }[] {
+    this.assertUsable();
+    if (!this.board) {
+      throw new WorkerError('unavailable', 'The task board has not loaded.');
+    }
+    return this.board.listTeams(actor);
+  }
+
+  /** Synchronous live team record; the domain enforces coordinator/member visibility. */
+  team(actor: BoardActor, teamId: string): { coordinatorOwnerId: string; memberWorkerIds: string[] } {
+    this.assertUsable();
+    if (!this.board) {
+      throw new WorkerError('unavailable', 'The task board has not loaded.');
+    }
+    return this.board.getTeam(actor, teamId);
+  }
+
+  /** Synchronous live task routing: the team a task belongs to, authorized for this actor. */
+  taskTeam(actor: BoardActor, taskId: string): string {
+    this.assertUsable();
+    if (!this.board) {
+      throw new WorkerError('unavailable', 'The task board has not loaded.');
+    }
+    return this.board.getTask(actor, taskId).teamId;
+  }
+
   /** Synchronous live authorization used immediately before private publication. */
   assertTeam(ownerId: string, teamId: string, workerId?: string): void {
     this.assertUsable();
@@ -197,6 +253,190 @@ class BoardHost implements BoardPort {
 
   async updateTask(actor: BoardActor, input: unknown, authorize?: () => void): Promise<unknown> {
     return (await this.open()).updateTask(actor, input, authorize);
+  }
+}
+
+/**
+ * Lazy, single-flight mailbox handle for one canonical root.
+ *
+ * Durable mail lives inside the root's own store directory, under the same
+ * owner lock as the sessions and the board, so it is opened on demand, cached
+ * once (concurrent callers share one promise) and closed before the store
+ * releases ownership. The feature gate is live: a disabled or closing host
+ * refuses before any storage is opened, and a failure is reported and cached so
+ * mailbox calls keep failing closed while standalone workers and board records
+ * stay usable. Nothing here repairs or resets mailbox data.
+ *
+ * It is also the MailboxPort the adapters call. Every authorization read is a
+ * synchronous read of the ACTUAL loaded board - the only identity authority -
+ * so live membership, coordinator ownership, worker existence and root sharing
+ * are rechecked by the domain on every call. Writes are fenced by the store's
+ * durable write path, so their bytes are accounted for the owning root, and the
+ * commit guard rechecks the live feature, the host state and cancellation
+ * immediately before the domain publishes.
+ */
+class MailboxHost implements MailboxPort {
+  private mailbox?: TeamMailbox;
+  private opening?: Promise<TeamMailbox>;
+  private failure?: string;
+  /** Set the instant close() starts, so no new open/read/write can begin retirement. */
+  private closing = false;
+  private drained?: Promise<void>;
+
+  constructor(
+    private readonly directory: string,
+    private readonly board: BoardHost,
+    private readonly enabled: () => boolean,
+    private readonly guard: () => void,
+    private readonly withStorageWrite: <T>(action: () => Promise<T>) => Promise<T>
+  ) {}
+
+  /** Host-stopping / feature-off gate shared by open, reads and the commit guard. */
+  private assertUsable(): void {
+    if (this.closing) {
+      throw new WorkerError('host_stopping', 'The mailbox is closing; the call was not applied.', true);
+    }
+    if (!this.enabled()) {
+      throw new WorkerError('feature_disabled', 'Team mail is disabled; enable codexSubagent.taskBoard.messaging.enabled and codexSubagent.taskBoard.enabled in User Settings.');
+    }
+  }
+
+  /**
+   * Guard handed to the mailbox's own commit: this host closing is as fatal as
+   * the broker stopping, because the root owner lock is released once close drains.
+   */
+  private commitGuard(): void {
+    this.assertUsable();
+    this.guard();
+  }
+
+  get error(): string | undefined {
+    return this.failure;
+  }
+
+  open(): Promise<TeamMailbox> {
+    this.assertUsable();
+    if (!this.opening) {
+      this.opening = (async () => {
+        // Authorization reads must come from the loaded board, never a guess.
+        await this.board.open();
+        const mailbox = new TeamMailbox(this.directory, {
+          team: (actor: BoardActor, teamId: string) => {
+            this.assertUsable();
+            const team = this.board.team(actor, teamId);
+            return { coordinatorOwnerId: team.coordinatorOwnerId, memberWorkerIds: [...team.memberWorkerIds] };
+          },
+          task: (actor: BoardActor, taskId: string) => {
+            this.assertUsable();
+            return { teamId: this.board.taskTeam(actor, taskId) };
+          },
+          guard: () => this.commitGuard()
+        });
+        await mailbox.open();
+        this.mailbox = mailbox;
+        return mailbox;
+      })().catch((error: unknown) => {
+        this.failure = `${failure(error).code}: ${failure(error).message}`;
+        throw error;
+      });
+    }
+    return this.opening;
+  }
+
+  /**
+   * Idempotent retirement: refuse new work immediately, then drain the SAME
+   * pending open and close that mailbox before the root owner lock is released.
+   */
+  close(): Promise<void> {
+    this.closing = true;
+    this.drained ??= (async () => {
+      const pending = this.opening;
+      const mailbox = pending ? await pending.catch(() => undefined) : this.mailbox;
+      this.opening = undefined;
+      this.mailbox = undefined;
+      await mailbox?.close();
+    })();
+    return this.drained;
+  }
+
+  /** Send: one durable message. The store write fence only covers the mailbox write. */
+  async send(actor: BoardActor, input: unknown, guard?: () => void): Promise<unknown> {
+    const mailbox = await this.open();
+    return this.withStorageWrite(() => mailbox.send(actor, input, () => {
+      guard?.();
+      this.commitGuard();
+    }));
+  }
+
+  async list(actor: BoardActor, input: unknown): Promise<unknown> {
+    return (await this.open()).list(actor, input);
+  }
+
+  async acknowledge(actor: BoardActor, input: unknown, guard?: () => void): Promise<unknown> {
+    const mailbox = await this.open();
+    return this.withStorageWrite(() => mailbox.acknowledge(actor, input, () => {
+      guard?.();
+      this.commitGuard();
+    }));
+  }
+
+  /**
+   * The read-only port a coordinator admission probe uses. An exact send replay or
+   * an acknowledgement that changes nothing answers exactly as a real call would;
+   * anything that would change durable state answers the internal
+   * `mailbox_write_required`, which the caller answers by re-running the identical
+   * arguments through the normal, fenced port. It deliberately never takes the
+   * store write fence or a storage reservation, so a no-op retry cannot queue
+   * behind an exhausted budget, and the domain refuses before its commit, so this
+   * port can never publish. It carries the same composed host/feature/
+   * cancellation guard and grants no identity or authority of its own.
+   */
+  readonlyPort(): MailboxPort {
+    return {
+      send: async (actor, input, guard) => (await this.open()).send(actor, input, () => {
+        guard?.();
+        this.commitGuard();
+      }, { readOnly: true }),
+      list: async (actor, input) => (await this.open()).list(actor, input),
+      acknowledge: async (actor, input, guard) => (await this.open()).acknowledge(actor, input, () => {
+        guard?.();
+        this.commitGuard();
+      }, { readOnly: true })
+    };
+  }
+
+  /**
+   * Synchronous pending read from the loaded mailbox. Delivery only ever sees
+   * messages that are already durable, so an unopened mailbox has nothing to
+   * offer instead of creating storage at a prompt boundary. Several teams name
+   * the internal multi-team read, which keeps root delivery order; a bound
+   * worker passes its single bound team. `limit` is the engine's bounded SCAN
+   * size (bounded again by the mailbox's retained-message cap), independent of
+   * the smaller per-turn injection count.
+   */
+  pending(actor: WorkerActor, teamId: string | readonly string[], limit: number): MailboxMessage[] {
+    this.assertUsable();
+    const mailbox = this.mailbox;
+    return mailbox ? mailbox.pending(actor, teamId, limit) : [];
+  }
+
+  /** Delivery receipt: exactly the notices the provider accepted. */
+  async delivered(actor: WorkerActor, teamId: string, ids: string[], guard?: () => void): Promise<void> {
+    if (!ids.length) {
+      return;
+    }
+    const mailbox = await this.open();
+    await this.withStorageWrite(() => mailbox.delivered(actor, teamId, ids, () => {
+      guard?.();
+      this.commitGuard();
+    }));
+  }
+
+  /** Synchronous reply state of one durable message; an unopened mailbox cannot answer. */
+  replyState(actor: WorkerActor, teamId: string, messageId: string): 'waiting' | 'ready' | 'unavailable' {
+    this.assertUsable();
+    const mailbox = this.mailbox;
+    return mailbox ? mailbox.replyState(actor, teamId, messageId) : 'unavailable';
   }
 }
 
@@ -312,6 +552,29 @@ export class WorkerBroker {
   /** Live board gate: settings can flip at any time, so this is read on every call. */
   private boardEnabled(): boolean {
     return this.options.taskBoardEnabled?.() === true;
+  }
+
+  /**
+   * Live team-mail gate: the separate messaging opt-in can only ever narrow the
+   * board, so both flags must be on. A settings read that throws fails closed for
+   * mail alone: unrelated board and legacy worker paths keep working.
+   */
+  private mailboxEnabled(): boolean {
+    try {
+      return this.boardEnabled() && this.options.messagingEnabled?.() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Live commit guard for a mailbox write: the same host state as the board, plus its own opt-in. */
+  private mailboxGuard(): void {
+    if (this.closed) {
+      throw new WorkerError('host_stopping', 'The host is stopping; the message was not applied.', true);
+    }
+    if (!this.mailboxEnabled()) {
+      throw new WorkerError('feature_disabled', 'Team mail was disabled before this message applied.');
+    }
   }
 
   /**
@@ -505,12 +768,21 @@ export class WorkerBroker {
     });
   }
 
-  private workerTools(files: FileTools, board: BoardHost, isolation: IsolatedViewHost): WorkspaceTools {
+  /**
+   * Private tools for one worker: file and board tools stay exactly as they were,
+   * and the outermost mailbox wrapper adds session-bound mail tools whose worker
+   * identity is this scoped session. The wait hook is bound to this host's
+   * lifecycle, so only a governed, host-bound worker can hold a peer wait.
+   */
+  private workerTools(files: FileTools, board: BoardHost, mailbox: MailboxHost, isolation: IsolatedViewHost, lifecycle: () => WorkerLifecycle): WorkspaceTools {
     const scoped = (session: Session): WorkspaceTools => {
       if (session.startup && session.startup.phase !== 'started') {
         throw new WorkerError('startup_incomplete', 'Incomplete startup has no worker tools.');
       }
-      return session.schema === 2 || session.isolatedView ? isolation.scoped(session) : files.forSession(session);
+      // Live files ONLY for an explicit standalone worker with no binding. Any
+      // other mode, an unknown/malformed record or any existing binding resolves
+      // through the private host, which fails closed instead of using live files.
+      return session.mode === 'standalone' && !session.isolatedView ? files.forSession(session) : isolation.scoped(session);
     };
     return {
       get workspaceRoot() {
@@ -518,7 +790,21 @@ export class WorkerBroker {
       },
       definitions: permission => files.definitions(permission),
       execute: (name, input, permission, signal, session, authorize) => (session ? scoped(session) : files).execute(name, input, permission, signal, session, authorize),
-      forSession: session => workerBoardTools(board, session, () => this.boardEnabled(), this.options.onChange, scoped(session))
+      forSession: session => workerMailboxTools(mailbox, session, {
+        enabled: () => this.mailboxEnabled(),
+        // Definitions only: a live nonmember sees no mailbox tool, and an
+        // unloaded, corrupt or disabled board hides them instead of guessing.
+        // Authorization of a real call stays the domain's live membership check.
+        member: () => {
+          try {
+            return board.teams({ kind: 'worker', workerId: session.id }).length > 0;
+          } catch {
+            return false;
+          }
+        },
+        wait: (teamId, messageId, signal) => lifecycle().waitForPeer(session.id, teamId, messageId, signal),
+        onChange: this.options.onChange
+      }, workerBoardTools(board, session, () => this.boardEnabled(), this.options.onChange, scoped(session)))
     };
   }
 
@@ -591,13 +877,153 @@ export class WorkerBroker {
     return {
       drainAdmissions: workerId => lifecycle().drainAdmissions(workerId),
       waitReady: (session, signal) => lifecycle().waitReady(session, signal),
-      stream: (session, messages, tools, signal, maintenance) => lifecycle().stream(session, messages, tools, signal, maintenance),
+      stream: (session, messages, tools, signal, maintenance, prepare) => lifecycle().stream(session, messages, tools, signal, maintenance, prepare),
       archive: (session, summary, signal) => lifecycle().archive(session, summary, signal, queue),
       execute: (session, name, signal, action) => lifecycle().execute(session, name, signal, action),
       activeForModel: (modelId, excludeId) => lifecycle().activeForModel(modelId, excludeId),
       authorize: (session, effect) => lifecycle().authorize(session, effect)
     };
   }
+  /**
+   * Automatic peer delivery for this root's engine. Notices are produced ONLY at
+   * prompt preparation for a worker that is already running: nothing here starts,
+   * resumes or wakes a worker, and no storage, runnable or runner slot is
+   * acquired while the engine holds one.
+   *
+   * The read is effectively synchronous once the lazily opened mailbox is ready:
+   * pending messages are ordered by the mailbox's INTERNAL root sequence (never
+   * by a public per-team ordinal), and the live team filter is a synchronous
+   * read of the ACTUAL board, with no await between that filter and returning to
+   * provider preparation. A bound worker is limited to its bound team from the
+   * CURRENT store session; a legacy member sees only the teams it is still a
+   * live member of.
+   */
+  private peerDelivery(store: SessionStore, board: BoardHost, mailbox: MailboxHost): {
+    read(session: Session, signal: AbortSignal, limit: number): Promise<{ id: string; teamId: string; text: string }[]>;
+    delivered(session: Session, notices: readonly { id: string; teamId: string; text: string }[], signal: AbortSignal): Promise<void>;
+  } {
+    /** Structured JSON keeps the whole durable record visible to the worker. */
+    const notice = (message: MailboxMessage) => ({ id: String(message.id), teamId: String(message.teamId), text: JSON.stringify(message) });
+    return {
+      read: async (session, signal, limit) => {
+        if (limit <= 0 || !this.mailboxEnabled()) {
+          return [];
+        }
+        try {
+          signal.throwIfAborted();
+          // The current store session is the only identity authority for a worker.
+          const current = store.get(session.id);
+          const actor: WorkerActor = { kind: 'worker', workerId: current.id };
+          // A governed worker is scoped to its bound team (startup record or its
+          // private view); a legacy member sees the teams it is still a member of.
+          const bound = current.startup?.teamId ?? current.isolatedView?.teamId;
+          const visible = (): { id: string }[] => {
+            const teams = board.teams(actor);
+            return bound ? teams.filter(team => team.id === bound) : teams;
+          };
+          // Live membership is decided BEFORE any storage is opened, so a
+          // nonmember never touches the mailbox and a corrupt or unreadable
+          // mailbox can never fail an unrelated standalone worker turn.
+          if (!visible().length) {
+            return [];
+          }
+          await mailbox.open();
+          signal.throwIfAborted();
+          // Re-check after the await: this same synchronous board read authorizes
+          // the pending scan below, with no further await before the provider.
+          const teams = visible();
+          if (!teams.length) {
+            return [];
+          }
+          // ONE multi-team read: the domain authorizes every team and returns
+          // the messages in its INTERNAL root order before applying the scan
+          // limit, so an older notice of a later team can never starve behind a
+          // busy first team. The limit is the engine's bounded SCAN size (up to
+          // the mailbox's 200-message bound), NOT its 8-notice per-turn
+          // injection cap; the domain bounds it again. A public per-team
+          // sequence must never be used to re-sort.
+          return mailbox.pending(actor, teams.map(team => team.id), limit).map(notice);
+        } catch {
+          if (signal.aborted) {
+            signal.throwIfAborted();
+          }
+          // Automatic delivery is best-effort: a disabled feature, a closing host,
+          // an unloaded or corrupt board or an unreadable mailbox yields an empty
+          // batch instead of failing a turn. Nothing is lost: the messages stay
+          // pending for a later boundary.
+          return [];
+        }
+      },
+      delivered: async (session, notices, signal) => {
+        if (!notices.length || !this.mailboxEnabled()) {
+          return;
+        }
+        signal.throwIfAborted();
+        let actor: WorkerActor;
+        try {
+          actor = { kind: 'worker', workerId: store.get(session.id).id };
+        } catch {
+          return;
+        }
+        const byTeam = new Map<string, string[]>();
+        for (const entry of notices) {
+          const ids = byTeam.get(entry.teamId) ?? [];
+          ids.push(entry.id);
+          byTeam.set(entry.teamId, ids);
+        }
+        for (const [teamId, ids] of byTeam) {
+          try {
+            await mailbox.delivered(actor, teamId, ids, () => signal.throwIfAborted());
+          } catch (error) {
+            if (['feature_disabled', 'host_stopping'].includes(failure(error).code)) {
+              return;
+            }
+            throw error;
+          }
+        }
+      }
+    };
+  }
+
+  /**
+   * Reply state of one durable message for a worker-bound wait. The bound team
+   * comes from the current store session, either its startup record or its
+   * private view; a legacy or unbound worker, a nonmember, a disabled feature or
+   * an unreadable mailbox all answer 'unavailable', so a wait fails closed
+   * instead of guessing or opening unrelated storage.
+   */
+  private async mailboxReplyState(mailbox: MailboxHost, board: BoardHost, store: SessionStore, session: Session, messageId: string, signal: AbortSignal): Promise<'waiting' | 'ready' | 'unavailable'> {
+    if (!this.mailboxEnabled()) {
+      return 'unavailable';
+    }
+    let current: Session;
+    try {
+      current = store.get(session.id);
+    } catch {
+      return 'unavailable';
+    }
+    const teamId = current.startup?.teamId ?? current.isolatedView?.teamId;
+    if (!teamId) {
+      return 'unavailable';
+    }
+    // A nonmember never opens storage: the wait answers unavailable instead.
+    try {
+      if (!board.teams({ kind: 'worker', workerId: current.id }).some(team => team.id === teamId)) {
+        return 'unavailable';
+      }
+    } catch {
+      return 'unavailable';
+    }
+    signal.throwIfAborted();
+    try {
+      await mailbox.open();
+      signal.throwIfAborted();
+      return mailbox.replyState({ kind: 'worker', workerId: current.id }, teamId, messageId);
+    } catch {
+      return 'unavailable';
+    }
+  }
+
   private async ensure(root: string): Promise<Local | undefined> {
     if (!this.closed && this.local.has(root)) {
       return this.local.get(root);
@@ -650,11 +1076,18 @@ export class WorkerBroker {
         () => !this.resourcesEnabled(), action => store.withStorageWrite(action));
       // An enabled board loads before any worker turn runs. Board trouble is
       // reported and cached but never blocks the standalone worker host.
+      // Durable mail is a separate live opt-in over the board. It lives in the same
+      // store directory (so it shares the root owner lock), opens lazily on the
+      // first mailbox call, and a disabled flag never creates any storage.
+      const mailbox = new MailboxHost(path.join(directory, 'mailbox'), board, () => this.mailboxEnabled(), () => this.mailboxGuard(),
+        action => store.withStorageWrite(action));
       if (this.boardEnabled()) {
         await board.open().catch(error => this.options.onError(`board ${root}: ${failure(error).message}`));
       }
       const isolation = this.isolationHost(root, store, board);
-      const engine: WorkerEngine = new WorkerEngine(store, this.options.provider, this.workerTools(files, board, isolation), this.options.settings, this.executionGovernance(() => lifecycle));
+      const engine: WorkerEngine = new WorkerEngine(store, this.options.provider, this.workerTools(files, board, mailbox, isolation, () => lifecycle), this.options.settings, this.executionGovernance(() => lifecycle),
+        // Automatic peer delivery is opt-in, root-scoped and never starts a worker.
+        this.peerDelivery(store, board, mailbox));
       const lifecycle: WorkerLifecycle = new WorkerLifecycle(root, store, engine, board, isolation, this.resources, this.options.provider, this.options.settings, () => {
         if (this.closed) {
           throw new WorkerError('host_stopping', 'The host is stopping.', true);
@@ -665,7 +1098,10 @@ export class WorkerBroker {
       }, this.freshPinGate(), () => {
         // Reported by the lifecycle only from real accounting/acquisition/enrollment.
         this.resourceUsed = true;
-      });
+      },
+      // Worker-bound reply state for durable mail waits; an unbound worker or a
+      // disabled feature answers 'unavailable' instead of opening storage.
+      (session, messageId, signal) => this.mailboxReplyState(mailbox, board, store, session, messageId, signal));
       engine.onChange = this.options.onChange;
       engine.onError = (id, error) => this.options.onError(`${id}: ${failure(error).message}`);
       try {
@@ -678,17 +1114,17 @@ export class WorkerBroker {
         }
         restored();
       } catch (error) {
-        await lifecycle.close(); await engine.shutdown(); await isolation.close(); await board.close(); await store.close(); throw error;
+        await lifecycle.close(); await engine.shutdown(); await isolation.close(); await board.close(); await mailbox.close(); await store.close(); throw error;
       }
       const host = new BridgeHost();
-      const local: Local = { root, roots, store, engine, files, host, board, isolation, lifecycle };
+      const local: Local = { root, roots, store, engine, files, host, board, mailbox, isolation, lifecycle };
       this.local.set(root, local);
       try {
         await host.start(this.options.registry, roots, (name, args, signal, cwd) => this.invoke(cwd || root, name, args, signal));
       } catch (error) {
         this.local.delete(root);
         await lifecycle.close();
-        const closing = Promise.all([board.close(), isolation.close()]);
+        const closing = Promise.all([board.close(), mailbox.close(), isolation.close()]);
         await engine.shutdown(); await closing; await store.close(); throw error;
       }
       return local;
@@ -737,6 +1173,10 @@ export class WorkerBroker {
       } catch (error) {
         return this.boardFailure('invalid_arguments', failure(error).message);
       }
+    }
+    if (isMailboxTool(name) && !this.mailboxEnabled()) {
+      // Structured failure before routing: disabled mail never opens a store or a bridge.
+      return this.boardFailure('feature_disabled', 'Team mail is disabled; enable codexSubagent.taskBoard.messaging.enabled (which requires codexSubagent.taskBoard.enabled) in User Settings.');
     }
     if (isBoardTool(name) && !this.boardEnabled()) {
       // Structured failure before routing: a disabled board never opens a store or a bridge.
@@ -847,7 +1287,12 @@ export class WorkerBroker {
       }
       if (['subagent_resume', 'subagent_send'].includes(name) && args && typeof args === 'object' && 'id' in args) {
         const session = engine.session(identifier.parse(args.id));
-        if (session.schema === 2 || session.isolatedView) {
+        // Revert/control routing: only an unbound standalone worker belongs to
+        // live files. A record claiming a binding, an isolated mode or an unknown
+        // mode is re-proved through the private host and fails closed; a governed
+        // setup that has not bound yet is refused by the engine's own
+        // startup_incomplete check before any tool or provider request.
+        if (session.isolatedView !== undefined || (session.mode !== 'standalone' && session.mode !== 'governed')) {
           engine.assertOwner(session.id, 'ownerId' in args ? z.string().optional().parse(args.ownerId) : undefined);
           await route.local.isolation.assertWorkerUsable(session, signal);
         }
@@ -866,6 +1311,54 @@ export class WorkerBroker {
         const replay = args && typeof args === 'object' && 'ownerId' in args && typeof args.ownerId === 'string' && 'requestId' in args && typeof args.requestId === 'string' && board.hasRequest(args.ownerId, args.requestId);
         const result = await this.storageOperation(route.local, boardStorageReservation(lane), async () => invokeBoard(board, name, args), signal, /_get$|_list$/.test(name) || !!replay, lane);
         if (!result.isError && /_create$|_update$/.test(name)) {
+          this.options.onChange();
+        }
+        return result;
+      }
+      if (isMailboxTool(name)) {
+        // Opt-in durable mail is record-only: it never dispatches a worker, edits
+        // files or changes the board. The flag is re-read here (so even bad ids
+        // answer feature_disabled) and again inside the mailbox's own commit guard,
+        // and the domain rechecks live membership and coordinator ownership.
+        if (!this.mailboxEnabled()) {
+          throw new WorkerError('feature_disabled', 'Team mail is disabled; enable codexSubagent.taskBoard.messaging.enabled (which requires codexSubagent.taskBoard.enabled) in User Settings.');
+        }
+        const reading = name === 'subagent_mailbox_list';
+        // The domain calls this immediately before its durable publication, so a
+        // cancelled call that waited behind another write never publishes.
+        const commit = (): void => {
+          signal?.throwIfAborted();
+          this.mailboxGuard();
+        };
+        // A pure list reserves and accounts nothing. A send or acknowledgement is
+        // first ATTEMPTED read-only, through the domain's own mutex, so an exact
+        // replay or an acknowledgement that changes nothing answers here with no
+        // reservation and no write: an idempotent retry never queues behind an
+        // exhausted budget and never charges it. Only a call that really changes
+        // durable state comes back as `mailbox_write_required`, and only then is
+        // the identical argument re-run through the governed reservation. The probe
+        // cannot publish (the domain refuses before its commit) and the admitted
+        // path still writes solely through the fenced normal port, so neither the
+        // probe nor the gap between the two can produce an unreserved write. The
+        // probe completes before admission is awaited, so no mailbox or store lock
+        // is held while waiting.
+        const probe = reading
+          ? await invokeMailbox(route.local.mailbox, name, args, commit)
+          : await invokeMailbox(route.local.mailbox.readonlyPort(), name, args, commit);
+        if (!probe.isError) {
+          if (!reading) {
+            this.options.onChange();
+          }
+          return probe;
+        }
+        // Every other failure - identity, membership, expiry, conflict, capacity,
+        // cancellation or a disabled feature - is returned exactly as it was.
+        if (reading || resultErrorCode(probe) !== mailboxWriteRequired) {
+          return probe;
+        }
+        const result = await this.storageOperation(route.local, mailboxStorageReservation(),
+          () => invokeMailbox(route.local!.mailbox, name, args, commit), signal);
+        if (!result.isError) {
           this.options.onChange();
         }
         return result;
@@ -949,7 +1442,7 @@ export class WorkerBroker {
         }));
       }
       if (name === 'subagent_health') {
-        return respond({ ready: true, root: route.root, workspaceRoots: route.local.roots, models: await engine.models(), capabilities: files.definitions('workspace-write').map(t => t.name), diagnostics: store.diagnostics, sessionsDirectory: store.directory, taskBoard: { enabled: this.boardEnabled(), ...(route.local.board.error ? { error: route.local.board.error } : {}) } });
+        return respond({ ready: true, root: route.root, workspaceRoots: route.local.roots, models: await engine.models(), capabilities: files.definitions('workspace-write').map(t => t.name), diagnostics: store.diagnostics, sessionsDirectory: store.directory, taskBoard: { enabled: this.boardEnabled(), ...(route.local.board.error ? { error: route.local.board.error } : {}) }, ...(this.mailboxEnabled() ? { messaging: { enabled: true, ...(route.local.mailbox.error ? { error: route.local.mailbox.error } : {}) } } : {}) });
       }
       if (['subagent_send', 'subagent_resume'].includes(name) && args && typeof args === 'object' && 'id' in args) {
         const session = engine.session(identifier.parse(args.id));
@@ -1130,7 +1623,7 @@ export class WorkerBroker {
         // history requests cannot forward back to the same retiring owner.
         await local.host.close();
         await local.lifecycle.close();
-        const closing = Promise.all([local.board.close(), local.isolation.close()]);
+        const closing = Promise.all([local.board.close(), local.mailbox.close(), local.isolation.close()]);
         await local.engine.shutdown(); await closing;
         await local.store.close();
         this.local.delete(root);
@@ -1155,7 +1648,7 @@ export class WorkerBroker {
       await local.lifecycle.close();
       // Keep the exact owner discoverable while effects drain. Incoming requests
       // receive host_stopping instead of falling back to an unrelated checkout.
-      const closing = Promise.all([local.board.close(), local.isolation.close()]);
+      const closing = Promise.all([local.board.close(), local.mailbox.close(), local.isolation.close()]);
       // A sibling drain may still be awaiting (engine, bridge) when this pair fails;
       // this handler only keeps the pair from being reported as an UNHANDLED rejection
       // in that window. The `await closing` below still reports the real error once, and

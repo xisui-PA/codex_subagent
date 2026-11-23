@@ -229,13 +229,19 @@ const emptyBoardNode: BoardNode = {
 export class TaskBoardTree implements vscode.TreeDataProvider<BoardNode> {
   private readonly change = new vscode.EventEmitter<BoardNode | undefined | null | void>();
   readonly onDidChangeTreeData = this.change.event;
-  private statuses: readonly BoardWorkspaceStatus[] = [];
+  /** Last adopted rendered roots and their serialized visible value. */
+  private roots: BoardNode[] = [emptyBoardNode];
+  private rendered = JSON.stringify([emptyBoardNode]);
 
-  /** Adopt host summaries; only the outer arrays are copied, rows stay read-only by contract. */
+  /** Adopt the rendered tree only when its visible value changes; equal polls must not redraw. */
   refresh(statuses: readonly BoardWorkspaceStatus[] = []): void {
-    this.statuses = statuses.map(status => ({
-      workspaceRoot: status.workspaceRoot, teams: [...status.teams], tasks: [...status.tasks], error: status.error
-    }));
+    const roots = statuses.length ? statuses.map(workspaceNode) : [emptyBoardNode];
+    const rendered = JSON.stringify(roots);
+    if (rendered === this.rendered) {
+      return;
+    }
+    this.roots = roots;
+    this.rendered = rendered;
     this.change.fire();
   }
 
@@ -265,7 +271,7 @@ export class TaskBoardTree implements vscode.TreeDataProvider<BoardNode> {
     if (node) {
       return node.children ?? [];
     }
-    return this.statuses.length ? this.statuses.map(workspaceNode) : [emptyBoardNode];
+    return this.roots;
   }
 
   dispose(): void {

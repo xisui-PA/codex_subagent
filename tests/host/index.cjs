@@ -27,9 +27,14 @@ exports.run = async () => {
     assert.equal(health.taskBoard.enabled, false, 'The task board must be off unless opted in');
     const boardError = async name => JSON.parse((await api.invoke(name, { ownerId: 'host-smoke' })).content[0].text).error;
     assert.match((await boardError('subagent_team_list')).code, /feature_disabled/, 'Disabled board calls must be refused');
+    // Mail is a separate opt-in on top of the board and is gated live on every call.
+    const unknownTeamId = randomUUID().replaceAll('-', '');
+    const mailList = async args => JSON.parse((await api.invoke('subagent_mailbox_list', { ownerId: 'host-smoke', ...args })).content[0].text);
+    assert.match((await mailList({ teamId: unknownTeamId })).error.code, /feature_disabled/, 'Mailbox calls must be refused while mail is off by default');
     const boardSetting = vscode.workspace.getConfiguration('codexSubagent');
     await boardSetting.update('taskBoard.enabled', true, vscode.ConfigurationTarget.Global);
     assert.equal(JSON.parse((await api.invoke('subagent_health', {})).content[0].text).taskBoard.enabled, true, 'The opt-in must reach the host live');
+    assert.match((await mailList({ teamId: unknownTeamId })).error.code, /feature_disabled/, 'The board opt-in alone must not enable mail');
     const boardTeam = JSON.parse((await api.invoke('subagent_team_create', { ownerId: 'host-smoke', requestId: randomUUID(), name: 'Host smoke team', description: 'Host smoke board' })).content[0].text);
     const boardTask = JSON.parse((await api.invoke('subagent_task_create', { ownerId: 'host-smoke', requestId: randomUUID(), teamId: boardTeam.id, title: 'Host smoke task', description: 'Host smoke work', acceptanceCriteria: ['literal <script> criterion'] })).content[0].text);
     await vscode.commands.executeCommand('codexSubagent.openBoardRecord', { workspaceRoot: await fs.realpath(process.env.CODEX_TEST_WORKSPACE), teamId: boardTeam.id, taskId: boardTask.id });
@@ -40,6 +45,26 @@ exports.run = async () => {
     assert.deepEqual(recordJson.task.acceptanceCriteria, ['literal <script> criterion'], 'Full criteria stay literal in the record');
     assert.equal(recordJson.task.history.lastSequence >= 1, true, 'The full record keeps its transition history');
     assert.equal(recordJson.team.coordinatorOwnerId, 'host-smoke', 'The record came from the trusted coordinator identity');
+    // Mail turns on live from the User setting: the coordinator reads a fresh
+    // team immediately, with an empty page and the initial cursor.
+    await boardSetting.update('taskBoard.messaging.enabled', true, vscode.ConfigurationTarget.Global);
+    const mailPage = await mailList({ teamId: boardTeam.id });
+    assert.equal(mailPage.error, undefined, 'Mailbox reads must answer live once the User opt-in is set');
+    assert.equal(mailPage.teamId, boardTeam.id);
+    assert.deepEqual(mailPage.messages, [], 'A freshly created team has no mail');
+    assert.equal(mailPage.nextCursor, 0, 'A fresh mailbox starts at cursor 0');
+    // The flag is honored only from User Settings: a checkout that names it in
+    // its own workspace settings must stay inert while the User value is off.
+    await boardSetting.update('taskBoard.messaging.enabled', false, vscode.ConfigurationTarget.Global);
+    const workspaceSettings = path.join(process.env.CODEX_TEST_WORKSPACE, '.vscode', 'settings.json');
+    await fs.mkdir(path.dirname(workspaceSettings), { recursive: true });
+    await fs.writeFile(workspaceSettings, JSON.stringify({ 'codexSubagent.taskBoard.enabled': true, 'codexSubagent.taskBoard.messaging.enabled': true }));
+    try {
+      assert.match((await mailList({ teamId: boardTeam.id })).error.code, /feature_disabled/, 'A workspace override must not activate mail');
+    } finally {
+      await fs.rm(path.dirname(workspaceSettings), { recursive: true, force: true });
+      await boardSetting.update('taskBoard.messaging.enabled', false, vscode.ConfigurationTarget.Global);
+    }
     await boardSetting.update('taskBoard.enabled', false, vscode.ConfigurationTarget.Global);
     const afterDisable = JSON.parse((await api.invoke('subagent_task_get', { ownerId: 'host-smoke', id: boardTask.id })).content[0].text).error;
     assert.match(afterDisable.code, /feature_disabled/, 'Disabling must refuse board calls again');
