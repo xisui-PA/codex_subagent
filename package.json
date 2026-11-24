@@ -76,6 +76,12 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "codexSubagent.refreshBoard",
+        "title": "Refresh Task Board",
+        "category": "Codex Subagent",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "codexSubagent.openWorker",
         "title": "Open Worker Transcript",
         "category": "Codex Subagent",
@@ -149,7 +155,19 @@
       },
       {
         "command": "codexSubagent.cleanupWorkers",
-        "title": "Clean Up Saved Workers",
+        "title": "Delete Workers...",
+        "category": "Codex Subagent",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "codexSubagent.deleteSelectedWorkers",
+        "title": "Delete Selected Workers",
+        "category": "Codex Subagent",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "codexSubagent.deleteGroupWorkers",
+        "title": "Delete Workers in This Group...",
         "category": "Codex Subagent",
         "icon": "$(trash)"
       },
@@ -176,6 +194,18 @@
         "title": "Revoke Shell Approval",
         "category": "Codex Subagent",
         "icon": "$(shield)"
+      },
+      {
+        "command": "codexSubagent.deleteTask",
+        "title": "Delete Task",
+        "category": "Codex Subagent",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "codexSubagent.deleteTeam",
+        "title": "Delete Team",
+        "category": "Codex Subagent",
+        "icon": "$(trash)"
       }
     ],
     "viewsContainers": {
@@ -225,7 +255,7 @@
     "menus": {
       "view/title": [
         {
-          "command": "codexSubagent.refresh",
+          "command": "codexSubagent.refreshBoard",
           "when": "view == codexSubagent.taskBoard",
           "group": "navigation"
         },
@@ -322,6 +352,16 @@
           "group": "actions"
         },
         {
+          "command": "codexSubagent.deleteSelectedWorkers",
+          "when": "view == codexSubagent.workers && viewItem =~ /^worker(Running|Completed|Resumable)$/",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.deleteGroupWorkers",
+          "when": "view == codexSubagent.workers && viewItem == workerGroup",
+          "group": "actions"
+        },
+        {
           "command": "codexSubagent.configureModel",
           "when": "view == codexSubagent.models && viewItem == modelEntry",
           "group": "actions"
@@ -329,6 +369,16 @@
         {
           "command": "codexSubagent.openModelSettings",
           "when": "view == codexSubagent.models",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.deleteTask",
+          "when": "view == codexSubagent.taskBoard && viewItem == boardTask",
+          "group": "actions"
+        },
+        {
+          "command": "codexSubagent.deleteTeam",
+          "when": "view == codexSubagent.taskBoard && viewItem == boardTeam",
           "group": "actions"
         }
       ]

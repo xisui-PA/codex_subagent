@@ -10,7 +10,7 @@ import type { IsolatedViewIdentity, IsolatedViewPort, IsolatedViewState } from '
 import { fileModeOf } from './snapshot-content';
 import type { OpenDocument, SnapshotEntry, SnapshotManifest } from './snapshot-content';
 import { IntegrationAttempts } from './integration-attempts';
-import type { EvidenceCheck, IntegrationAction } from './integration-attempts';
+import type { EvidenceCheck, IntegrationAction, IntegrationAttemptRef } from './integration-attempts';
 import { publishIntegration, type IntegrationPublicationOptions } from './integration-publication';
 import type { PublicationChange, PublicationEntry } from './integration-publication';
 import type { TaskBoard } from './task-board';
@@ -209,6 +209,9 @@ export function publicationPlan(base: SnapshotManifest, candidate: IsolatedViewS
   };
 }
 
+/** Owner+team key of one integration deletion fence; NUL cannot appear in an id. */
+const integrationFenceKey = (ownerId: string, teamId: string): string => `${ownerId}\u0000${teamId}`;
+
 /** Bounded, printable internal pin name; the attempt key namespace keeps it exact. */
 const integrationPinName = (index: number, ref: IntegrationArtifactRef): string =>
   `integration/${index}/${ref.id}/${ref.version}`;
@@ -222,6 +225,15 @@ export class IsolatedViewHost {
   private openingRunners?: Promise<RunnerExecution>;
   private integration?: IntegrationAttempts;
   private openingIntegration?: Promise<IntegrationAttempts>;
+  /** Synchronous per-owner/team deletion fences; see reserveIntegrationScope. */
+  private readonly integrationDeleteFences = new Map<string, number>();
+  /**
+   * Synchronously counted integration ACTIONS that have entered and not yet
+   * drained, per owner/team. It is registered before the first await of
+   * `integrate`, so a manual deletion can never observe a scope as idle while an
+   * action is still on its way in.
+   */
+  private readonly integrationInflight = new Map<string, number>();
   private closing = false;
   private drained?: Promise<void>;
   constructor(
@@ -1087,6 +1099,152 @@ export class IsolatedViewHost {
   }
 
   /**
+   * Inspect this team's durable integration attempts for a manual deletion.
+   *
+   * A missing integration namespace is empty, so a workspace that never
+   * integrated deletes normally. A present but unreadable ledger, or a present
+   * ledger while integration is disabled, fails closed: the deletion cannot be
+   * proven safe and nothing is guessed or bootstrapped.
+   */
+  /**
+   * Synchronous deletion fence for one owner/team's integration scope.
+   *
+   * It is registered BEFORE the first await of the deletion, so the
+   * feature-off/missing-namespace fast path is fenced exactly like the open
+   * service: turning integration on in the middle of the deletion cannot let a
+   * new `begin` compose from the record that is about to disappear.
+   *
+   * It also REFUSES (without installing a fence) while an integration action for
+   * this scope has already entered. That action may already hold the service
+   * mutex and be composing or applying, and a manual delete must never abort it:
+   * because no fence is installed in that case, the running action's own live
+   * authorization keeps passing and it drains normally. No queue and no polling:
+   * a new entry that sees a held fence is simply refused.
+   */
+  reserveIntegrationScope(ownerId: string, teamId: string): () => void {
+    const key = integrationFenceKey(ownerId, teamId);
+    if (this.integrationDeleteFences.has(key)) {
+      throw new WorkerError('board_deleting', 'Another deletion for this team is still being applied; retry after it finishes.', true);
+    }
+    if (this.integrationInflight.has(key)) {
+      throw new WorkerError('integration_busy', 'An integration action for this team is still running, so the deletion was not started. Wait for it to finish (or use subagent_integration release), then retry; no integration work is stopped automatically.');
+    }
+    this.integrationDeleteFences.set(key, 1);
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      this.integrationDeleteFences.delete(key);
+    };
+  }
+
+  /**
+   * Synchronously registers one entered integration action and returns its
+   * idempotent release. Callers must invoke it before their first await and
+   * release only after the action has really drained.
+   */
+  private enterIntegration(ownerId: string, teamId: string): () => void {
+    const key = integrationFenceKey(ownerId, teamId);
+    this.integrationInflight.set(key, (this.integrationInflight.get(key) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      const left = (this.integrationInflight.get(key) ?? 1) - 1;
+      if (left > 0) {
+        this.integrationInflight.set(key, left);
+      } else {
+        this.integrationInflight.delete(key);
+      }
+    };
+  }
+
+  /** Refuse new integration work for a team whose record deletion is in flight. */
+  private assertNoIntegrationFence(ownerId: string, teamId: string): void {
+    if (this.integrationDeleteFences.has(integrationFenceKey(ownerId, teamId))) {
+      throw new WorkerError('board_deleting', 'This team is being deleted; no integration attempt was begun or continued. Retry after the deletion finishes.', true);
+    }
+  }
+
+  async withIntegrationScope<T>(
+    ownerId: string, teamId: string,
+    action: (attempts: readonly IntegrationAttemptRef[]) => T | Promise<T>
+  ): Promise<T> {
+    // Host lifetime only: a board-only workspace (private views off) must still
+    // be able to delete, so this never consults the views feature flag. The
+    // integration opt-in is consulted separately below.
+    this.runnerLifetimeGuard();
+    // Registered synchronously, before ANY await, and held across the whole
+    // inspection + deletion commit.
+    const release = this.reserveIntegrationScope(ownerId, teamId);
+    try {
+      if (this.integration) {
+        return await this.integration.inspectScope(ownerId, teamId, action);
+      }
+      if (this.openingIntegration) {
+        return await (await this.openingIntegration).inspectScope(ownerId, teamId, action);
+      }
+      if (!this.integrationEnabled()) {
+        if (await this.integrationDirectoryPresent()) {
+          throw new WorkerError('feature_disabled', 'Integration attempts exist for this workspace, so this deletion cannot be proven safe while integration is disabled. Enable codexSubagent.isolatedViews.integration.enabled, release this team\'s attempt with subagent_integration release, then retry; no attempt or pin is released automatically.');
+        }
+        return await action([]);
+      }
+      const service = await this.openIntegration(() => {
+        this.runnerLifetimeGuard();
+        if (!this.integrationEnabled()) {
+          throw new WorkerError('feature_disabled', 'Integration was disabled before this deletion was inspected.');
+        }
+      });
+      return await service.inspectScope(ownerId, teamId, action);
+    } finally {
+      release();
+    }
+  }
+
+  /** Absent only when nothing exists (ENOENT); any other inspection error fails closed. */
+  private async integrationDirectoryPresent(): Promise<boolean> {
+    try {
+      await fs.lstat(this.integrationDirectory);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Refuse a deletion while this team still holds an unreleased runner lease.
+   *
+   * Runner leases are team-scoped and carry no task attribution, so a live lease
+   * may belong to a validation worker whose result serves the task being
+   * deleted. The only safe answer is to let it finish (or collect its result)
+   * first: nothing is stopped automatically. A missing runner namespace is
+   * empty; a present but unreadable one fails closed through `runnerStore()`.
+   */
+  async assertTeamRunnersIdle(teamId: string): Promise<void> {
+    // Host lifetime only, exactly like runner metadata observation: the runner
+    // EXECUTION flag never hides existing leases, so a disabled runner feature
+    // with durable leases still refuses instead of deleting over live work.
+    this.runnerLifetimeGuard();
+    const runners = await this.runnerStore();
+    if (!runners) {
+      return;
+    }
+    const busy = (runners.status().pool?.leases ?? [])
+      .filter(lease => lease.owner.teamId === teamId && lease.state !== 'released');
+    if (busy.length) {
+      throw new WorkerError('runner_busy', `Team ${teamId} still has ${busy.length} live or draining runner lease(s): ${busy.slice(0, 8).map(lease => `${lease.leaseId} (${lease.state})`).join(', ')}. Wait for them to finish or collect their results before deleting; no command is stopped automatically.`);
+    }
+  }
+
+  /**
    * Live authorization for one integration action. `guard` is the invoke-level
    * check (operation abort + host/feature/team), so a revoked or aborted call is
    * refused at EVERY port side effect, not only when it entered. `apply`
@@ -1099,6 +1257,10 @@ export class IsolatedViewHost {
     return () => {
       guard?.();
       this.commitGuard();
+      // NO deletion-fence check here: an action that already entered owns its
+      // lifetime and must drain. A deletion cannot install a fence in this scope
+      // while the action is in flight (see reserveIntegrationScope), so the
+      // evidence this guard proves is still valid for the record it started on.
       if (!this.integrationEnabled()) {
         throw new WorkerError('feature_disabled', 'Integration requires User Settings codexSubagent.taskBoard.enabled, codexSubagent.isolatedViews.enabled, codexSubagent.resources.enabled and codexSubagent.isolatedViews.integration.enabled.');
       }
@@ -1124,11 +1286,24 @@ export class IsolatedViewHost {
    * It is never derived from caller input.
    */
   private async integrate(args: IntegrationAction, guard?: () => void, recoveryError?: WorkerError): Promise<unknown> {
-    const authorize = this.integrationAuthorize(args, guard);
-    authorize();
-    const attempts = await this.openIntegration(authorize);
-    authorize();
-    return attempts.invoke(args, authorize, recoveryError);
+    // Two SYNCHRONOUS steps, adjacent and before any await: refuse a scope whose
+    // deletion fence is held, then register this action's live entry. Because
+    // both sides of the handshake are synchronous, a deletion either sees this
+    // action (and refuses integration_busy without installing a fence) or this
+    // action sees the fence (and is refused board_deleting). An action that is
+    // already entered can therefore never be aborted by a later deletion, and a
+    // just-entered action can never slip behind an inspection.
+    this.assertNoIntegrationFence(args.ownerId, args.teamId);
+    const release = this.enterIntegration(args.ownerId, args.teamId);
+    try {
+      const authorize = this.integrationAuthorize(args, guard);
+      authorize();
+      const attempts = await this.openIntegration(authorize);
+      authorize();
+      return await attempts.invoke(args, authorize, recoveryError);
+    } finally {
+      release();
+    }
   }
 
   /**

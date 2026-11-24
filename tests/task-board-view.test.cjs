@@ -128,6 +128,8 @@ test('root exposes each workspace, then teams, then tasks with canonical ids', a
   assert.equal(teams[0].label, 'Alpha');
   assert.match(tree.getTreeItem(teams[0]).description, /rev 4/);
   assert.equal(tree.getTreeItem(teams[0]).collapsibleState, 2, 'teams open too');
+  assert.equal(tree.getTreeItem(teams[0]).contextValue, 'boardTeam');
+  assert.deepEqual(teams[0].target, { workspaceRoot: WS, teamId: TEAM_A });
 
   const tasks = await tree.getChildren(teams[0]);
   assert.deepEqual(tasks.map(node => node.label), ['Wire board view', 'Second task']);
@@ -159,6 +161,7 @@ test('task rows show state, revision and assignee, with ids that survive revisio
   assert.match(item.tooltip, /revision 7/);
   assert.match(item.tooltip, /Open the task record/, 'the tooltip points at the full record');
   assert.equal(item.contextValue, 'boardTask');
+  assert.deepEqual(row.target, { workspaceRoot: WS, teamId: TEAM_A, taskId: TASK_ONE });
   assert.equal(item.command.command, 'codexSubagent.openBoardRecord');
   assert.deepEqual(item.command.arguments, [{ workspaceRoot: WS, teamId: TEAM_A, taskId: TASK_ONE }]);
 
@@ -353,9 +356,13 @@ test('host errors stay inspectable and tasks without a team are never hidden', a
   assert.equal(errorItem.iconPath.id, 'warning');
 
   assert.match(children[2].label, /Tasks without a team/);
+  assert.equal(children[2].target, undefined, 'a synthetic orphan group is not a real team target');
+  assert.equal(tree.getTreeItem(children[2]).contextValue, undefined, 'the synthetic group offers no delete action');
   const orphans = await tree.getChildren(children[2]);
   assert.deepEqual(orphans.map(node => node.id), [`board:${WS}/team:${TEAM_B}/task:${TASK_TWO}`]);
   assert.equal(orphans[0].label, 'Orphan task');
+  assert.equal(orphans[0].target, undefined, 'no deletion target without a live team');
+  assert.equal(tree.getTreeItem(orphans[0]).contextValue, undefined, 'orphan tasks offer no delete menu');
 });
 
 test('refresh adopts read-only summaries, ignores later caller mutations, and dispose stops notifications', async () => {

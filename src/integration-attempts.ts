@@ -968,6 +968,52 @@ function legacyZeroEffect(attempt: Attempt): boolean {
 }
 
 /** One service instance per root/owner host; all state is serialized and durable. */
+/** Bounded, read-only projection of ONE durable attempt for a deletion decision. */
+export interface IntegrationAttemptRef {
+  id: string;
+  teamId: string;
+  status: Attempt['status'];
+  /** Selected sources, consumer and dependency task ids: the exact records it names. */
+  taskIds: string[];
+  /**
+   * The ATTEMPT-SPECIFIC snapshot identities this attempt really consumes: its
+   * derived seed, every retained source/candidate seal and every inherited
+   * ancestor seed. The ordinary base capture is deliberately excluded - it is a
+   * SHARED starting point of unrelated team tasks, so a worker bound to it is no
+   * evidence at all. The host maps these ids to LIVE bound sessions, which is
+   * how a validation or integration worker whose own task is not in `taskIds` is
+   * still seen.
+   */
+  seedSnapshotIds: string[];
+}
+
+/** Attempt states whose durable effect is still IN FLIGHT. */
+const IN_FLIGHT_ATTEMPTS: ReadonlySet<Attempt['status']> = new Set(['intent', 'applying', 'releasing']);
+/** Attempt states that no longer need their team to stay reachable. */
+const SETTLED_ATTEMPTS: ReadonlySet<Attempt['status']> = new Set(['released', 'abandoned']);
+
+/**
+ * Which attempts block a manual hard deletion.
+ *
+ * A TASK delete is blocked only by an in-flight attempt that names that exact
+ * task (a selected source, the consumer, or a dependency). Ready/candidate/
+ * validated/accepted attempts hold exact inputs but no in-flight effect, and
+ * applied/failed/interrupted/released/abandoned are historical, so none of them
+ * blocks a task delete merely because a task label appears in the record.
+ *
+ * A TEAM delete is blocked by every attempt that still needs the team and its
+ * pins to stay reachable: only explicitly released or abandoned history is not
+ * a permanent blocker.
+ */
+export function integrationDeleteBlockers(
+  attempts: readonly IntegrationAttemptRef[],
+  scope: { teamId: string; taskId?: string }
+): IntegrationAttemptRef[] {
+  return attempts.filter(attempt => attempt.teamId === scope.teamId && (scope.taskId !== undefined
+    ? IN_FLIGHT_ATTEMPTS.has(attempt.status) && attempt.taskIds.includes(scope.taskId)
+    : !SETTLED_ATTEMPTS.has(attempt.status)));
+}
+
 export class IntegrationAttempts {
   /**
    * Proves a STORED attempt's immutable base lineage before any NEW decision,
@@ -1105,6 +1151,61 @@ export class IntegrationAttempts {
    * proof-only mode - and every other call rethrows that original error before
    * any publication intent or receipt is written.
    */
+  /**
+   * Read-only, mutex-serialized inspection of this owner/team's attempts.
+   *
+   * It NEVER bootstraps: an uninitialized store answers as empty, while an
+   * established namespace with a missing/corrupt ledger fails closed through the
+   * loader. It publishes no marker, writes no receipt and holds no pin, so a
+   * deletion can ask "is anything in flight?" without creating integration state.
+   */
+  async inspectScope<T>(ownerId: string, teamId: string, action: (attempts: readonly IntegrationAttemptRef[]) => T | Promise<T>): Promise<T> {
+    return this.mutex.run(async () => {
+      if (this.closing) {
+        throw new WorkerError('integration_closed', 'Integration attempts are closing; new and queued calls are rejected.');
+      }
+      try {
+        await this.open(undefined, false);
+      } catch (error) {
+        if (error instanceof WorkerError && error.code === 'attempt_missing') {
+          return action([]);
+        }
+        throw error;
+      }
+      try {
+        const data = this.data ?? this.transient;
+        if (!data) {
+          return action([]);
+        }
+        return await action(data.attempts
+          .filter(attempt => attempt.ownerId === ownerId && attempt.teamId === teamId)
+          .map(attempt => ({
+            id: attempt.id,
+            teamId: attempt.teamId,
+            status: attempt.status,
+            taskIds: [...new Set([
+              ...attempt.requirements.sources.map(source => source.taskId),
+              ...(attempt.requirements.consumer ? [attempt.requirements.consumer.taskId] : []),
+              ...attempt.dependencies.map(dependency => dependency.taskId)
+            ])],
+            seedSnapshotIds: [...new Set([
+              ...(attempt.derivedSnapshotId ? [attempt.derivedSnapshotId] : []),
+              ...(attempt.candidate ? [attempt.candidate.submission.snapshotId] : []),
+              ...attempt.producerSubmissions.map(entry => entry.submission.snapshotId),
+              ...attempt.inherited?.map(entry => entry.snapshotId) ?? []
+            // A no-conflict composition can reuse the ORDINARY base as its seed, so
+            // the shared originals are removed again: sharing them is never
+            // evidence that a worker belongs to this attempt.
+            ].filter(id => id !== attempt.baseSnapshotId && id !== attempt.sourceSnapshotId))]
+          })));
+      } finally {
+        // A transient (valid but unmarked) ledger is held for exactly ONE reply,
+        // exactly like the read-only details page; it is never cached.
+        this.transient = undefined;
+      }
+    });
+  }
+
   async invoke(args: IntegrationAction, authorize: () => void, recoveryError?: WorkerError): Promise<unknown> {
     const action = parseAction(args);
     return this.mutex.run(async () => {

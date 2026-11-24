@@ -13,6 +13,14 @@ import { applyEditorChange, openText } from './editor';
 import { WorkerPanel, PanelMessage } from './panel';
 import { eligibleModels, parseModelSettings, poolAllows } from './model-settings';
 import { ModelsTree } from './models-view';
+import { manualBoardDelete } from './board-delete-actions';
+import type { BoardDeleteKind, BoardDeletePorts, BoardDeleteTarget } from './board-delete-actions';
+import {
+  groupWorkerTargets, manualWorkerDelete, workerDeleteChoices, workerDeleteScopeFromNode,
+  workerDeleteTargetFromNode, workerDeleteTargetsFromArgs, workerDeleteTargetsFromSessions,
+  workerGroupChoices, workerGroupKey
+} from './worker-delete-actions';
+import type { WorkerDeleteScope, WorkerDeleteSummary, WorkerDeleteTarget } from './worker-delete-actions';
 import { TaskBoardTree } from './task-board-view';
 import { prepareRuntime, register, repairRegistration } from './registration';
 import { WorkerBroker, unpack } from './runtime';
@@ -26,7 +34,7 @@ import { UserModelSettingsCache } from './user-model-settings';
 
 let cleanup: (() => Promise<void>) | undefined;
 interface WorkerNode { kind: 'worker'; session: SessionHeader }
-interface GroupNode { kind: 'group'; id: string; label: string; workers: WorkerNode[] }
+interface GroupNode { kind: 'group'; id: string; label: string; workspaceRoot: string; ownerId?: string; ownerLabel?: string; workers: WorkerNode[] }
 type TreeNode = WorkerNode | GroupNode;
 class WorkerTree implements vscode.TreeDataProvider<TreeNode> {
   private readonly change = new vscode.EventEmitter<void>();
@@ -50,7 +58,7 @@ class WorkerTree implements vscode.TreeDataProvider<TreeNode> {
   }
   getTreeItem(node: TreeNode): vscode.TreeItem {
     if (node.kind === 'group') {
-      const item = new vscode.TreeItem(node.label, vscode.TreeItemCollapsibleState.Expanded); item.id = node.id; item.iconPath = new vscode.ThemeIcon('comment-discussion'); return item;
+      const item = new vscode.TreeItem(node.label, vscode.TreeItemCollapsibleState.Expanded); item.id = node.id; item.contextValue = 'workerGroup'; item.iconPath = new vscode.ThemeIcon('comment-discussion'); return item;
     }
     const s = node.session;
     const item = new vscode.TreeItem(s.title);
@@ -68,9 +76,20 @@ class WorkerTree implements vscode.TreeDataProvider<TreeNode> {
     }
     const groups = new Map<string, GroupNode>();
     for (const s of this.sessions) {
-      const id = `${s.workspaceRoot}:${s.ownerId || 'ungrouped'}`;
+      // Explicit metadata, not the compound row id: an ownerless group and a
+      // real owner whose id is 'ungrouped' stay distinct.
+      const workspaceRoot = s.workspaceRoot || '';
+      const ownerId = s.ownerId || undefined;
+      const id = workerGroupKey(workspaceRoot, ownerId);
       if (!groups.has(id)) {
-        groups.set(id, { kind: 'group', id, label: `${s.ownerLabel || s.ownerId || 'Ungrouped'} · ${path.basename(s.workspaceRoot || 'workspace')}`, workers: [] });
+        groups.set(id, {
+          kind: 'group', id,
+          label: `${s.ownerLabel || ownerId || 'Ungrouped'} · ${path.basename(workspaceRoot || 'workspace')}`,
+          workspaceRoot,
+          ...(ownerId ? { ownerId } : {}),
+          ...(s.ownerLabel ? { ownerLabel: s.ownerLabel } : {}),
+          workers: []
+        });
       }
       groups.get(id)!.workers.push({ kind: 'worker', session: s });
     }
@@ -97,8 +116,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     void vscode.commands.executeCommand('setContext', 'codexSubagent.modelsEmpty', models.pool.empty);
   };
   syncModels();
+  // Retain the Workers view handle: a Command Palette call passes no tree
+  // arguments, so only the live view knows its current selection.
+  const workersView = vscode.window.createTreeView('codexSubagent.workers', { treeDataProvider: tree, canSelectMany: true });
   context.subscriptions.push(log, tree, models, status,
-    vscode.window.registerTreeDataProvider('codexSubagent.workers', tree),
+    workersView,
     vscode.window.createTreeView('codexSubagent.models', { treeDataProvider: models, dragAndDropController: models, canSelectMany: true }));
   // Task board: opt-in and read-only, driven only by the User-level setting.
   // inspect().globalValue is deliberate: the effective value could come from a
@@ -436,9 +458,57 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
     }
   });
 
+  /**
+   * Manual hard deletion of one board record. The helper resolves the node
+   * against a fresh board status, prepares read-only, asks for an explicit modal
+   * confirmation, and sends exactly one strict delete with the host-returned
+   * request id and revision. No actor is ever supplied by this UI, and refresh
+   * touches the board only.
+   */
+  const boardDeletePorts = (kind: BoardDeleteKind): BoardDeletePorts => ({
+    boardStatus: () => requireBroker().boardStatus(),
+    prepare: async (workspaceRoot, input) => unpack(await requireBroker().invoke(workspaceRoot, 'ui_board_delete_prepare', input)),
+    invoke: async (workspaceRoot, name, args) => unpack(await requireBroker().invoke(workspaceRoot, name, args)),
+    confirm: async (message, detail) => await vscode.window.showWarningMessage(message, { modal: true, detail }, 'Delete') === 'Delete',
+    pick: async choices => await vscode.window.showQuickPick(choices, {
+      title: kind === 'task' ? 'Delete a task record' : 'Delete a team record',
+      placeHolder: 'Only the board record is removed; no worker, artifact or retained resource is deleted.'
+    }),
+    info: message => { void vscode.window.showInformationMessage(message); },
+    refresh: refreshBoard,
+    seed: () => randomUUID()
+  });
+  const boardDeleteTarget = (arg: unknown): BoardDeleteTarget | undefined => {
+    if (!arg || typeof arg !== 'object') {
+      return undefined;
+    }
+    const value = (arg as { target?: unknown }).target;
+    if (!value || typeof value !== 'object') {
+      return undefined;
+    }
+    const candidate = value as { workspaceRoot?: unknown; teamId?: unknown; taskId?: unknown };
+    if (typeof candidate.workspaceRoot !== 'string' || typeof candidate.teamId !== 'string'
+      || (candidate.taskId !== undefined && typeof candidate.taskId !== 'string')) {
+      return undefined;
+    }
+    return {
+      workspaceRoot: candidate.workspaceRoot, teamId: candidate.teamId,
+      ...(candidate.taskId !== undefined ? { taskId: candidate.taskId } : {})
+    };
+  };
+  const deleteBoard = async (kind: BoardDeleteKind, arg: unknown): Promise<void> => {
+    if (!boardEnabled()) {
+      throw new WorkerError('feature_disabled', 'The task board is disabled; enable codexSubagent.taskBoard.enabled in User Settings.');
+    }
+    await manualBoardDelete(boardDeletePorts(kind), { kind, target: boardDeleteTarget(arg) });
+  };
+  command('deleteTask', async (...args: unknown[]) => deleteBoard('task', args[0]));
+  command('deleteTeam', async (...args: unknown[]) => deleteBoard('team', args[0]));
+
   // Commands are registered before any host startup or model-provider access.
   command('showLog', async () => log.show());
   command('refresh', refresh);
+  command('refreshBoard', refreshBoard);
   command('retryHost', configure);
   command('enableModel', async () => {
     await provider.enable(); broker?.settingsChanged(); await refresh();
@@ -739,20 +809,104 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ invo
       await exportSession(s);
     }
   });
-  command('deleteWorker', async arg => {
-    const s = await selected(arg); if (s && await vscode.window.showWarningMessage(`Delete “${s.title}” and its archived history?`, { modal: true }, 'Delete') === 'Delete') {
-      await control(s, 'subagent_delete');
+  // Manual worker deletion: one confirmation, then a fresh authoritative
+  // session per confirmed target and the existing subagent_delete operation.
+  // The helper never stops, resumes or creates a worker, never touches board
+  // records, and refreshes the trees once at the end.
+  const workerDeletePorts = {
+    session: async (workspaceRoot: string, id: string) => await requireBroker().session(workspaceRoot, id),
+    remove: async (workspaceRoot: string, id: string, ownerId: string | undefined): Promise<void> => {
+      unpack(await requireBroker().invoke(workspaceRoot, 'subagent_delete', { id, ...(ownerId ? { ownerId } : {}) }));
+    },
+    confirm: async (message: string, detail: string): Promise<boolean> =>
+      await vscode.window.showWarningMessage(message, { modal: true, detail }, 'Delete') === 'Delete',
+    info: (message: string): void => { void vscode.window.showInformationMessage(message); },
+    refresh
+  };
+  const reportWorkerDelete = (summary: WorkerDeleteSummary): void => {
+    for (const failed of summary.failed) {
+      log.appendLine(`${new Date().toISOString()} Delete worker ${failed.target.id} in ${failed.target.workspaceRoot}: ${failed.code ? `${failed.code}: ` : ''}${failed.message}`);
     }
+  };
+  const workerTarget = (session: Session): WorkerDeleteTarget => ({
+    workspaceRoot: session.workspaceRoot || roots()[0],
+    id: session.id,
+    ...(session.ownerId ? { ownerId: session.ownerId } : {}),
+    ...(session.ownerLabel ? { ownerLabel: session.ownerLabel } : {}),
+    title: session.title,
+    state: session.state
   });
-  command('cleanupWorkers', async () => {
-    const all = (await requireBroker().list()).filter(s => !['running', 'queued'].includes(s.state));
-    const picked = await vscode.window.showQuickPick(all.map(s => ({ label: s.title, description: `${s.state} · ${s.updatedAt.slice(0, 10)}`, session: s })), { title: 'Delete saved workers and archives', canPickMany: true });
-    if (!picked?.length || await vscode.window.showWarningMessage(`Permanently delete ${picked.length} saved workers?`, { modal: true }, 'Delete') !== 'Delete') {
+  const workerGroupScope = async (arg: unknown): Promise<WorkerDeleteScope | undefined> => {
+    const direct = workerDeleteScopeFromNode(arg);
+    if (direct) {
+      return direct;
+    }
+    // Palette or an unusable node: offer fresh explicit groups. Never infer a
+    // group from a label, a stale row id or an arbitrary first worker.
+    const choices = workerGroupChoices(workerDeleteTargetsFromSessions(await requireBroker().list()));
+    if (!choices.length) {
+      void vscode.window.showInformationMessage('No saved worker groups are available to delete.');
+      return undefined;
+    }
+    const choice = await vscode.window.showQuickPick(choices, {
+      title: 'Delete workers in this group',
+      placeHolder: 'Choose an exact workspace and owner group; nothing is deleted until you confirm.'
+    });
+    return choice?.scope;
+  };
+  command('deleteWorker', async (...args: unknown[]) => {
+    const clicked = workerDeleteTargetFromNode(args[0]);
+    let targets: WorkerDeleteTarget[] = clicked ? [clicked] : [];
+    if (!targets.length) {
+      const s = await selected(args[0]); if (!s) {
+        return;
+      }
+      targets = [workerTarget(s)];
+    }
+    reportWorkerDelete(await manualWorkerDelete(workerDeletePorts, { targets }));
+  });
+  command('deleteSelectedWorkers', async (...args: unknown[]) => {
+    // A context menu supplies the clicked node (and its selected nodes); the
+    // Command Palette supplies neither, so only the live Workers view selection
+    // applies. A supplied context never falls back to that selection, and group
+    // or malformed rows still never expand.
+    const targets = args.length
+      ? workerDeleteTargetsFromArgs(args[0], args[1])
+      : workerDeleteTargetsFromArgs(undefined, workersView.selection);
+    if (!targets.length) {
+      void vscode.window.showInformationMessage('Select one or more saved workers in the Codex Workers view. Group rows are never expanded; use Delete Workers in This Group for a parent group.');
       return;
     }
-    for (const choice of picked) {
-      await control(await requireBroker().session(choice.session.workspaceRoot || roots()[0], choice.session.id), 'subagent_delete');
+    reportWorkerDelete(await manualWorkerDelete(workerDeletePorts, { targets }));
+  });
+  command('deleteGroupWorkers', async (...args: unknown[]) => {
+    const scope = await workerGroupScope(args[0]);
+    if (!scope) {
+      return;
     }
+    // Fresh pre-confirmation list restricted to this exact root and owner; the
+    // finite snapshot cannot grow while the confirmation is open.
+    const targets = groupWorkerTargets(workerDeleteTargetsFromSessions(await requireBroker().list()), scope);
+    reportWorkerDelete(await manualWorkerDelete(workerDeletePorts, {
+      targets, scope,
+      unavailableMessage: `No saved workers remain in ${scope.label || scope.ownerId || 'Ungrouped'} (${scope.workspaceRoot}).`
+    }));
+  });
+  command('cleanupWorkers', async () => {
+    const choices = workerDeleteChoices(workerDeleteTargetsFromSessions(await requireBroker().list()));
+    if (!choices.length) {
+      void vscode.window.showInformationMessage('No saved workers are available to delete.');
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(choices, {
+      title: 'Delete saved workers and their archives',
+      placeHolder: 'Select one or more saved workers; running or queued workers are skipped after confirmation.',
+      canPickMany: true, matchOnDescription: true, matchOnDetail: true
+    });
+    if (!picked?.length) {
+      return;
+    }
+    reportWorkerDelete(await manualWorkerDelete(workerDeletePorts, { targets: picked.map(choice => choice.target) }));
   });
   command('revokeShellApproval', async () => {
     const granted = approvals.getGrantedRoots();

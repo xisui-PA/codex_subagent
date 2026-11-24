@@ -8,7 +8,7 @@ const path = require('node:path');
 // Loader: STEP5_TEST_BUILD names a dedicated compile, otherwise the repository
 // .test-build that npm test produces on a clean checkout.
 const BUILD = path.resolve(__dirname, '..', process.env.STEP5_TEST_BUILD?.trim() || '.test-build');
-const { IntegrationAttempts, integrationActionSchema } = require(path.join(BUILD, 'integration-attempts'));
+const { IntegrationAttempts, integrationActionSchema, integrationDeleteBlockers } = require(path.join(BUILD, 'integration-attempts'));
 const { WorkerError } = require(path.join(BUILD, 'types'));
 // The transport regression drives the REAL BridgeHost/forward path, so every
 // request is measured exactly as the relay builds it (1,000,000-byte cap).
@@ -4856,4 +4856,45 @@ test('details paging fences a view content change at the SAME attempt revision',
   assert.notEqual(oldHead.text + secondPage.text, firstText);
   assert.notEqual(oldHead.text + secondPage.text, secondText);
   assert.equal(await fs.readFile(ledgerFile, 'utf8'), ledger, 'paging never rewrote the ledger');
+});
+// A manual board deletion asks this module ONE read-only question. The decision
+// is pure, so the exact in-flight/historical split is provable without a board,
+// a model or any effect: only genuinely in-flight work blocks, and only for the
+// tasks it actually names.
+test('deletion blockers consider only in-flight attempts and their exact task references', () => {
+  const attempt = (id, status, taskIds) => ({ id, teamId: TEAM, status, taskIds });
+  const attempts = [
+    attempt('11'.repeat(32), 'intent', [TASK_A]),
+    attempt('12'.repeat(32), 'applying', []),
+    attempt('13'.repeat(32), 'releasing', [TASK_B]),
+    attempt('14'.repeat(32), 'ready', [TASK_A]),
+    attempt('15'.repeat(32), 'candidate', [TASK_A]),
+    attempt('16'.repeat(32), 'accepted', [TASK_A]),
+    attempt('17'.repeat(32), 'applied', [TASK_A]),
+    attempt('18'.repeat(32), 'released', [TASK_A]),
+    attempt('19'.repeat(32), 'abandoned', []),
+    attempt('20'.repeat(32), 'failed', [TASK_C]),
+    { id: '21'.repeat(32), teamId: '99'.repeat(16), status: 'applying', taskIds: [TASK_A] }
+  ];
+
+  // A task delete is blocked by an in-flight attempt that NAMES that task only.
+  assert.deepEqual(integrationDeleteBlockers(attempts, { teamId: TEAM, taskId: TASK_A }).map(entry => entry.id), ['11'.repeat(32)]);
+  assert.deepEqual(integrationDeleteBlockers(attempts, { teamId: TEAM, taskId: TASK_B }).map(entry => entry.id), ['13'.repeat(32)]);
+  assert.deepEqual(integrationDeleteBlockers(attempts, { teamId: TEAM, taskId: TASK_C }), [],
+    'a failed historical attempt never blocks the task it once named');
+  assert.deepEqual(integrationDeleteBlockers(attempts, { teamId: TEAM, taskId: '22'.repeat(16) }), []);
+  // An in-flight attempt with no task reference is not tied to any task, so it
+  // blocks no task; it does block its team.
+  assert.deepEqual(integrationDeleteBlockers(attempts, { teamId: TEAM }).map(entry => entry.id), [
+    '11'.repeat(32), '12'.repeat(32), '13'.repeat(32), '14'.repeat(32), '15'.repeat(32), '16'.repeat(32), '17'.repeat(32),
+    // A FAILED attempt still owns its durable record and any pins it adopted, so
+    // it keeps its release path reachable for the team.
+    '20'.repeat(32)
+  ]);
+  // Released and abandoned history is never a permanent blocker, and another
+  // team's attempts are never inspected.
+  const settled = attempts.filter(entry => ['18'.repeat(32), '19'.repeat(32)].includes(entry.id));
+  assert.deepEqual(integrationDeleteBlockers(settled, { teamId: TEAM }), []);
+  assert.deepEqual(integrationDeleteBlockers(attempts, { teamId: '99'.repeat(16) }).map(entry => entry.id),
+    ['21'.repeat(32)]);
 });

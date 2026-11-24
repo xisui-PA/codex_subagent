@@ -22,7 +22,10 @@ export type PeerReplyState = 'waiting' | 'ready' | 'unavailable';
 
 type IsolatedSpawn = ReturnType<typeof governedSchemas.subagent_isolated_spawn.parse>;
 /** `heartbeats` counts explicit parent renewals applied to this preparation. */
-interface Preparing { mutex: Mutex; controller: AbortController; ownerId: string; requestId: string; fingerprint: string; lane: IsolatedSpawn['setup']['lane']; users: number; expiresAt?: number; leaseSeconds: number; heartbeats: number }
+interface Preparing { mutex: Mutex; controller: AbortController; ownerId: string; requestId: string; fingerprint: string; lane: IsolatedSpawn['setup']['lane']; users: number; expiresAt?: number; leaseSeconds: number; heartbeats: number; teamId: string; taskId: string }
+
+/** Stable key of one manual board-deletion reservation; `*` means the whole team. */
+const deletionKey = (scope: { teamId: string; taskId?: string }): string => `${scope.teamId}:${scope.taskId ?? '*'}`;
 /** One durable registration; `heartbeats` is the count observed when it was written. */
 interface Registration { promise: Promise<{ expiresAt?: number; leaseSeconds: number }>; heartbeats: number }
 /** Internal control flow: the requested wait is already stored at its observed generation. */
@@ -51,6 +54,12 @@ export class WorkerLifecycle implements ExecutionGovernance {
   private readonly controls = new Map<string, number>();
   private readonly inference = new Map<string, { workerId: string; modelId: string }>();
   private readonly admissions = new Map<string, { workerId: string; promise: Promise<void> }>();
+  /**
+   * Synchronous per-record deletion reservations. A startup can hold a ready
+   * task/team before ANY durable session exists, so this in-memory fence is the
+   * only thing that can prove a deletion does not race a governed preparation.
+   */
+  private readonly deleting = new Map<string, number>();
   async drainAdmissions(workerId: string): Promise<void> {
     await Promise.all([...this.admissions.values()].filter(a => a.workerId === workerId).map(a => a.promise));
   }
@@ -89,6 +98,66 @@ export class WorkerLifecycle implements ExecutionGovernance {
   /** The exact store this host owns is now a real participant in the aggregate. */
   private joined(): void {
     this.participate?.();
+  }
+
+  /**
+   * Synchronous deletion reservation for one team/task.
+   *
+   * It refuses while a governed startup for the same record is still being
+   * prepared (an in-process preparation is the only place a startup can hold a
+   * record before any durable session exists) and otherwise makes every later
+   * `prepare()` for that record refuse until it is released. It never waits,
+   * never cancels a worker and never touches storage, so the runtime can hold it
+   * across the whole durable deletion and unrelated startups keep running.
+   *
+   * `workerIds` are the exact session identities the host derived from durable
+   * records (current assignment, team membership, or an integration attempt's
+   * seed bindings). They are checked against the REAL in-flight governed work of
+   * this process - the model admission and inference tokens - because a governed
+   * provider can still be held here after the outer engine job was aborted, and
+   * neither `session.state` nor `engine.active` proves the effect drained.
+   */
+  reserveBoardDelete(scope: { teamId: string; taskId?: string; workerIds?: readonly string[] }): () => void {
+    for (const preparing of this.preparations.values()) {
+      if (preparing.teamId !== scope.teamId) {
+        continue;
+      }
+      if (scope.taskId !== undefined && preparing.taskId !== scope.taskId) {
+        continue;
+      }
+      throw new WorkerError('worker_busy', 'A governed startup for this team or task is still being prepared. Finish or cancel it before deleting; no worker is stopped automatically.');
+    }
+    const named = new Set(scope.workerIds ?? []);
+    if (named.size) {
+      const inferring = [...this.inference.values()].filter(token => named.has(token.workerId)).map(token => token.workerId);
+      const admitting = [...this.admissions.values()].filter(entry => named.has(entry.workerId)).map(entry => entry.workerId);
+      const busy = [...new Set([...inferring, ...admitting])];
+      if (busy.length) {
+        throw new WorkerError('worker_busy', `Worker ${busy.slice(0, 4).join(', ')} still holds live governed work or an admission for this ${scope.taskId ? 'task' : 'team'}; its tools and model effects have not drained. Wait for the stop to settle before deleting; no worker is stopped automatically.`);
+      }
+    }
+    const key = deletionKey(scope);
+    this.deleting.set(key, (this.deleting.get(key) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      const left = (this.deleting.get(key) ?? 1) - 1;
+      if (left > 0) {
+        this.deleting.set(key, left);
+      } else {
+        this.deleting.delete(key);
+      }
+    };
+  }
+
+  /** Refuse a governed startup whose team/task is inside a held deletion reservation. */
+  private assertNotDeletingFor(teamId: string, taskId: string): void {
+    if (this.deleting.has(deletionKey({ teamId })) || this.deleting.has(deletionKey({ teamId, taskId }))) {
+      throw new WorkerError('board_deleting', 'This team or task is being deleted; no startup was admitted and no binding was written. Retry after the deletion finishes.', true);
+    }
   }
 
   /** Synchronous admission fence; no mutex is held while a control waits. */
@@ -315,6 +384,10 @@ export class WorkerLifecycle implements ExecutionGovernance {
       guard();
       const actor = { kind: 'coordinator', ownerId: a.ownerId } as const;
       if (this.store.get(session.id).startup!.phase === 'created') {
+        // Rechecked immediately before the durable assignment: a deletion that
+        // reserved this record while the session was being created wins here,
+        // so no assignment/binding is ever written against a removed record.
+        this.assertNotDeletingFor(setup.teamId, setup.taskId);
         await this.withStorage(boardStorageReservation(setup.lane), () => board.assignStartup(a.ownerId, {
           requestId: board.requestId(a.ownerId, `setup:${digest([a.ownerId, a.requestId]).slice(0, 40)}`), teamId: setup.teamId, taskId: setup.taskId,
           workerId: session.id, teamRevision: setup.teamRevision, taskRevision: setup.taskRevision
@@ -412,6 +485,7 @@ export class WorkerLifecycle implements ExecutionGovernance {
   }
   private async prepare(a: IsolatedSpawn, signal: AbortSignal, action: (signal: AbortSignal, preparing: Preparing) => Promise<unknown>): Promise<unknown> {
     this.assertNotMaintaining(a.ownerId);
+    this.assertNotDeletingFor(a.setup.teamId, a.setup.taskId);
     const key = digest([a.ownerId, a.requestId]); const fingerprint = digest(a);
     let entry = this.preparations.get(key);
     if (entry && entry.fingerprint !== fingerprint) {
@@ -421,7 +495,7 @@ export class WorkerLifecycle implements ExecutionGovernance {
       if (this.preparations.size >= 32 || (a.setup.lane === 'work' && [...this.preparations.values()].filter(e => e.lane === 'work').length >= 28)) {
         throw new WorkerError('resource_queue_full', 'Pending setup is full for this root/lane (32 total, at most 28 work). Wait or cancel setup; 4 entries remain reserved for validation/integration.');
       }
-      entry = { mutex: new Mutex(), controller: new AbortController(), ownerId: a.ownerId, requestId: a.requestId, fingerprint, lane: a.setup.lane, users: 0, expiresAt: a.parentPolicy === 'cancel-on-expiry' ? Date.now() + a.leaseSeconds * 1000 : undefined, leaseSeconds: a.leaseSeconds, heartbeats: 0 };
+      entry = { mutex: new Mutex(), controller: new AbortController(), ownerId: a.ownerId, requestId: a.requestId, fingerprint, lane: a.setup.lane, users: 0, expiresAt: a.parentPolicy === 'cancel-on-expiry' ? Date.now() + a.leaseSeconds * 1000 : undefined, leaseSeconds: a.leaseSeconds, heartbeats: 0, teamId: a.setup.teamId, taskId: a.setup.taskId };
       // Reserve the entry synchronously, so a same-host duplicate joins this
       // one instead of registering a second intent for the same identity.
       this.preparations.set(key, entry);

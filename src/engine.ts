@@ -114,8 +114,32 @@ export const defaults: Settings = {
   maxOutputChars: 200_000, maxHistoryBytes: 20_000_000, maxSessions: 200, retries: 2, autoCompact: true
 };
 
+/**
+ * Exact record scope of ONE manual board deletion, plus the persisted identity
+ * snapshot the host read from the live board. A task scope matches only work of
+ * that task (or its current persisted assignee); a team scope matches the team's
+ * governed/bound workers and its current members. Nothing else is stopped.
+ */
+export interface DeletionScope {
+  teamId: string;
+  /** Present for a task deletion; absent deletes the whole team. */
+  taskId?: string;
+  /** The task's CURRENT persisted assignee, so an ordinary unbound worker matches. */
+  workerId?: string;
+  /** The team's current members, so an ordinary member's live work blocks a team delete. */
+  workerIds?: readonly string[];
+}
+
 export class WorkerEngine {
   private readonly mutex = new Mutex();
+  /**
+   * Scoped manual board-deletion fences. schedule() is synchronous and runs
+   * outside `mutex` (from reschedule() and from every detached job's finally), so
+   * this set is the ONLY thing that can prove no work starts during a delete: it
+   * is registered synchronously, consulted synchronously by schedule() and by
+   * every guarded entry point, and released only after the durable action.
+   */
+  private readonly deleteFences = new Set<DeletionScope>();
   private readonly active = new Map<string, { controller: AbortController; promise: Promise<void>; maintenance?: 'compact' | 'edit' }>();
   private stopped = false;
   // Schedule can run inside detached job promises; a malformed pool saved by
@@ -324,6 +348,9 @@ export class WorkerEngine {
     return existing;
   }
   async spawn(input: SpawnInput, startup?: WorkerStartup, preparing?: { authorize(): void; expiresAt(): number | undefined; leaseSeconds(): number }): Promise<Session> {
+    if (startup) {
+      this.assertNotDeletingScope(startup.teamId, startup.taskId);
+    }
     return this.mutex.run(async () => {
       const fingerprint = digest({ action: startup ? 'isolated_spawn' : 'spawn', ...(startup ? { startup } : {}), requestId: input.requestId, task: input.task, model: input.model, title: input.title, instructions: input.instructions, permission: input.permission, ...(input.ownerId ? { ownerId: input.ownerId, ownerLabel: input.ownerLabel } : {}), ...(input.parentPolicy === 'cancel-on-expiry' ? { parentPolicy: input.parentPolicy, leaseSeconds: input.leaseSeconds } : {}) });
       const existing = this.findOperation(input.requestId, fingerprint, input.ownerId);
@@ -369,8 +396,141 @@ export class WorkerEngine {
       return this.store.get(session.id);
     });
   }
+  /**
+   * Hold one scoped deletion fence for the whole durable deletion, including
+   * the board's rename and its in-memory adoption.
+   *
+   * The fence is registered before the control mutex is taken, so an in-flight
+   * start/resume either already committed (and is then seen by the idle check)
+   * or is refused by its own fence check. `schedule()` skips fenced sessions even
+   * though it never runs under this mutex. Unrelated teams and tasks keep
+   * scheduling: only matching sessions are held back.
+   */
+  async withDeletionFence<T>(scope: DeletionScope, action: () => Promise<T>): Promise<T> {
+    if (this.stopped) {
+      throw new WorkerError('host_stopping', 'Extension is shutting down.', true);
+    }
+    if (!scope.teamId || (scope.taskId !== undefined && !scope.taskId)) {
+      throw new WorkerError('invalid_arguments', 'A deletion fence requires the exact team and task identity.');
+    }
+    this.deleteFences.add(scope);
+    try {
+      return await this.mutex.run(async () => {
+        if (this.stopped) {
+          throw new WorkerError('host_stopping', 'Extension is shutting down.', true);
+        }
+        this.assertDeletionIdle(scope);
+        return action();
+      });
+    } finally {
+      this.deleteFences.delete(scope);
+      // A control that committed a queued session while this fence was held had
+      // its schedule() pass skipped, so a deletion refusal must hand that work
+      // back to the normal scheduler instead of leaving it queued until an
+      // unrelated reschedule. Nothing is started on its behalf here, and
+      // cancelled/suspended turns stay gated by schedule()'s own checks.
+      this.schedule();
+    }
+  }
+
+  /** Refuse the delete while any matching worker still holds live or draining work. */
+  private assertDeletionIdle(scope: DeletionScope): void {
+    for (const session of this.store.list()) {
+      if (!this.inDeletionScope(scope, session)) {
+        continue;
+      }
+      const pendingStartup = session.startup !== undefined && !['started', 'cancelled'].includes(session.startup.phase);
+      if (!this.active.has(session.id) && !['queued', 'running'].includes(session.state) && !pendingStartup) {
+        continue;
+      }
+      const state = pendingStartup ? `startup ${session.startup!.phase}` : session.state;
+      const draining = this.active.has(session.id) ? ', its tools are still settling' : '';
+      throw new WorkerError('worker_busy',
+        `Worker ${session.id} still has live work for this ${scope.taskId ? 'task' : 'team'} (${state}${draining}). Cancel it and wait for its tools to settle before deleting; no worker is stopped automatically.`);
+    }
+  }
+
+  /**
+   * Exact scope match, using ONLY identities the host derived from durable
+   * records.
+   *
+   * A governed worker belongs to the task named by its own startup. Otherwise a
+   * worker belongs only when the host named its exact session id: the task's
+   * CURRENT persisted assignee (`workerId`), or an attempt-associated worker
+   * (`workerIds`) such as a validation worker bound to the selected attempt's
+   * derived seed. A bound worker is accepted only inside its own team, so a
+   * binding to another team (or a worker running another task) is never matched -
+   * an unrelated worker or task is neither stopped nor deleted.
+   */
+  private inDeletionScope(scope: DeletionScope, session: Pick<Session, 'id'> & Partial<Pick<Session, 'startup' | 'isolatedView'>>): boolean {
+    // Two SEPARATE identities the host may have proven from durable records:
+    // the task's CURRENT persisted assignee, and a worker proven to belong to
+    // this task through an attempt-specific derived seed. They are not the same
+    // claim, so neither may be dropped because the other does not match.
+    const assigned = scope.workerId !== undefined && session.id === scope.workerId;
+    const named = assigned || (scope.workerIds ?? []).includes(session.id);
+    if (scope.taskId !== undefined) {
+      const teamOk = session.startup !== undefined ? session.startup.teamId === scope.teamId
+        : session.isolatedView !== undefined ? session.isolatedView.teamId === scope.teamId
+          : true;
+      if (!teamOk) {
+        return false;
+      }
+      // A governed worker whose OWN startup names this task always matches.
+      if (session.startup !== undefined && session.startup.taskId === scope.taskId) {
+        return true;
+      }
+      // Otherwise only a host-named identity matches: the current assignee (bound
+      // or not) or an attempt-associated worker, including a GOVERNED validation/
+      // integration worker assigned a different task but bound to this task's
+      // attempt-specific derived seed. This is the whole fence, so it holds during
+      // prompt counting before any lifecycle admission or inference token exists.
+      return named;
+    }
+    if (session.startup) {
+      return session.startup.teamId === scope.teamId;
+    }
+    if (session.isolatedView) {
+      return session.isolatedView.teamId === scope.teamId;
+    }
+    return named;
+  }
+
+  /** Refuse new control work for a session whose record is being deleted. */
+  private assertNotDeleting(session: Pick<Session, 'id'> & Partial<Pick<Session, 'startup' | 'isolatedView'>>): void {
+    for (const scope of this.deleteFences) {
+      if (this.inDeletionScope(scope, session)) {
+        throw new WorkerError('board_deleting', 'This task or team is being deleted; no new work or maintenance was started. Retry after the deletion finishes.', true);
+      }
+    }
+  }
+
+  /** Refuse a governed setup for a team/task whose deletion fence is already held. */
+  private assertNotDeletingScope(teamId: string, taskId?: string): void {
+    for (const scope of this.deleteFences) {
+      if (scope.teamId !== teamId) {
+        continue;
+      }
+      if (scope.taskId !== undefined && scope.taskId !== taskId) {
+        continue;
+      }
+      throw new WorkerError('board_deleting', 'This task or team is being deleted; no new work was started. Retry after the deletion finishes.', true);
+    }
+  }
+
+  /** True when this exact session is inside a held deletion fence (used by schedule()). */
+  private deleting(session: Pick<Session, 'id'> & Partial<Pick<Session, 'startup' | 'isolatedView'>>): boolean {
+    for (const scope of this.deleteFences) {
+      if (this.inDeletionScope(scope, session)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** The only entry from durable setup into runnable state. */
   async startPrepared(id: string, authorize?: () => void): Promise<Session> {
+    this.assertNotDeleting(this.store.get(id));
     return this.mutex.run(async () => {
       const session = this.store.get(id);
       if (session.startup?.phase === 'started') {
@@ -421,6 +581,7 @@ export class WorkerEngine {
     }
   }
   async send(id: string, requestId: string, message: string): Promise<Session> {
+    this.assertNotDeleting(this.store.get(id));
     return this.mutex.run(async () => {
       const fingerprint = digest({ action: 'send', id, requestId, message });
       const existing = this.findOperation(requestId, fingerprint, this.store.get(id).ownerId);
@@ -459,6 +620,7 @@ export class WorkerEngine {
     });
   }
   async resume(id: string, requestId: string, model?: string, message?: string): Promise<Session> {
+    this.assertNotDeleting(this.store.get(id));
     return this.mutex.run(async () => {
       const fingerprint = digest({ action: 'resume', id, requestId, model, message });
       const existing = this.findOperation(requestId, fingerprint, this.store.get(id).ownerId);
@@ -617,6 +779,7 @@ export class WorkerEngine {
     });
   }
   async compact(id: string, revision: number, summary?: string): Promise<Session> {
+    this.assertNotDeleting(this.store.get(id));
     const result = await this.mutex.run(async () => {
       const s = this.session(id);
       if (this.stopped) {
@@ -746,6 +909,7 @@ export class WorkerEngine {
     return { execution };
   }
   async edit<T>(id: string, action: (session: Session, signal: AbortSignal) => Promise<T>, maintenance?: { kind: 'isolation'; activity: string }): Promise<T> {
+    this.assertNotDeleting(this.store.get(id));
     const { execution } = await this.mutex.run(async () => {
       if (this.stopped) {
         throw new WorkerError('host_stopping', 'Extension is shutting down.', true);
@@ -932,6 +1096,12 @@ export class WorkerEngine {
         // Sessions whose model left the pool still schedule so run() reaches
         // the live membership rejection instead of stalling forever.
         if (s.startup && s.startup.phase !== 'started') {
+          continue;
+        }
+        // The scoped deletion fence stops ONLY the team/task being deleted. This
+        // is the synchronous hook that reschedule() and every detached job's
+        // finally rely on while a delete holds its durable action.
+        if (this.deleting(s)) {
           continue;
         }
         if (!s.startup && !this.slotAvailable(s)) {

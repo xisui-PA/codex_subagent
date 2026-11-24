@@ -1,16 +1,17 @@
 import * as vscode from 'vscode';
+import type { BoardDeleteTarget } from './board-delete-actions';
 import type { BoardTaskSummary, BoardTeamSummary, BoardWorkspaceStatus } from './task-board-summary';
 
 export type { BoardTaskSummary, BoardTeamSummary, BoardWorkspaceStatus } from './task-board-summary';
 
 /**
- * Read-only native tree over bounded board summaries.
+ * Summary-only native tree over bounded board summaries.
  *
  * A status row carries previews and totals, never full records: text is clipped,
  * detail lists are samples, and transition entries and reference URIs live in the
  * record behind `codexSubagent.openBoardRecord`. Every row says so instead of
- * implying it shows everything. The view never mutates the board, so it offers no
- * create, accept or integrate action.
+ * implying it shows everything. The view changes nothing automatically; manual
+ * Delete Task/Team is the only confirmed record removal it offers.
  */
 
 /** Flat display node; children are prebuilt so tree identity and content stay deterministic. */
@@ -23,6 +24,8 @@ export interface BoardNode {
   tooltip?: string;
   icon?: string;
   command?: vscode.Command;
+  /** Explicit deletion target metadata; no compound node id is ever parsed. */
+  target?: BoardDeleteTarget;
   children?: BoardNode[];
 }
 
@@ -58,9 +61,9 @@ const stateIcons: Record<BoardTaskSummary['state'], string> = {
 /** Rows that hold children: workspaces and teams open like the workers tree, details stay folded. */
 const expanded = (kind: BoardNode['kind']): boolean => kind === 'workspace' || kind === 'team';
 
-/** Actionable guidance row; the view stays read-only, so it only explains where data comes from. */
+/** Actionable guidance row; the view stays summary-only, so it explains where data comes from. */
 const emptyRow = (id: string, label: string, tooltip: string): BoardNode =>
-  ({ kind: 'empty', id, label, description: 'Read-only view', tooltip, icon: 'info' });
+  ({ kind: 'empty', id, label, description: 'Summary only', tooltip, icon: 'info' });
 
 function teamNode(workspaceRoot: string, team: BoardTeamSummary, tasks: BoardTaskSummary[]): BoardNode {
   const path = `${boardPath(workspaceRoot)}/team:${team.id}`;
@@ -75,13 +78,14 @@ function teamNode(workspaceRoot: string, team: BoardTeamSummary, tasks: BoardTas
       `members ${team.memberWorkerIds.length}`, team.descriptionPreview
     ].filter(Boolean).join('\n'),
     icon: 'organization',
+    target: { workspaceRoot, teamId: team.id },
     children: tasks.length
       ? tasks.map(task => taskNode(workspaceRoot, task))
       : [emptyRow(`${path}/empty`, 'No tasks in this team yet', 'Tasks appear here once the coordinator creates them for this team.')]
   };
 }
 
-function taskNode(workspaceRoot: string, task: BoardTaskSummary): BoardNode {
+function taskNode(workspaceRoot: string, task: BoardTaskSummary, deletable = true): BoardNode {
   return {
     kind: 'task',
     id: taskPath(workspaceRoot, task),
@@ -93,6 +97,7 @@ function taskNode(workspaceRoot: string, task: BoardTaskSummary): BoardNode {
       task.truncated ? 'Some previews are shortened.' : undefined, FULL_RECORD
     ].filter(Boolean).join('\n'),
     icon: stateIcons[task.state],
+    ...(deletable ? { target: { workspaceRoot, teamId: task.teamId, taskId: task.id } } : {}),
     command: {
       command: 'codexSubagent.openBoardRecord',
       title: 'Open Board Record',
@@ -196,7 +201,7 @@ function workspaceNode(status: BoardWorkspaceStatus): BoardNode {
       description: `${orphans.length} task(s)`,
       tooltip: 'These tasks reference a team id that is not present in this snapshot; they stay visible so no task is hidden.',
       icon: 'warning',
-      children: orphans.map(task => taskNode(status.workspaceRoot, task))
+      children: orphans.map(task => taskNode(status.workspaceRoot, task, false))
     });
   }
   if (!children.length) {
@@ -209,7 +214,7 @@ function workspaceNode(status: BoardWorkspaceStatus): BoardNode {
     label: status.workspaceRoot,
     description: `${status.teams.length} team(s) - ${status.tasks.length} task(s)`,
     tooltip: [`Workspace ${status.workspaceRoot}`, `teams ${status.teams.length}`, `tasks ${status.tasks.length}`,
-      'Read-only: changes are made by the coordinator, not this view.'].join('\n'),
+      'Summary only: create, update, accept and integrate work happen through the coordinator; Delete Task/Team is the one confirmed manual record removal in this view.'].join('\n'),
     icon: 'folder',
     children
   };
@@ -223,8 +228,8 @@ const emptyBoardNode: BoardNode = {
 };
 
 /**
- * Native tree over read-only board summaries. It never mutates the board: it
- * only groups teams and tasks and exposes their bounded details.
+ * Native tree over summary-only board views. Nothing changes automatically: it
+ * only groups teams and tasks, exposes bounded details and offers confirmed deletion.
  */
 export class TaskBoardTree implements vscode.TreeDataProvider<BoardNode> {
   private readonly change = new vscode.EventEmitter<BoardNode | undefined | null | void>();
@@ -262,7 +267,12 @@ export class TaskBoardTree implements vscode.TreeDataProvider<BoardNode> {
       item.command = node.command;
     }
     if (node.kind === 'task') {
-      item.contextValue = 'boardTask';
+      if (node.target) {
+        item.contextValue = 'boardTask';
+      }
+    }
+    if (node.kind === 'team' && node.target) {
+      item.contextValue = 'boardTeam';
     }
     return item;
   }

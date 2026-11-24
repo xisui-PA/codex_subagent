@@ -11,6 +11,22 @@ import { isGovernedTool } from './worker-startup';
 import { WorkerEngine, type ExecutionGovernance } from './engine';
 import { TaskBoard } from './task-board';
 import type { BoardActor, WorkerActor } from './task-board-types';
+import { taskDeleteInput, teamDeleteInput } from './task-board-types';
+
+/** Strict kinds a board deletion can name. */
+const boardDeletePrepareInput = z.object({
+  kind: z.enum(['task', 'team']),
+  teamId: z.string().regex(/^[a-f0-9]{32}$/),
+  taskId: z.string().regex(/^[a-f0-9]{32}$/).optional(),
+  // A SEED, not the final request id: the host prefixes the owner's current
+  // epoch. 48 characters leave room for that prefix inside the 64-char cap.
+  requestId: z.string().min(1).max(48)
+}).strict().refine(value => value.kind === 'team' ? value.taskId === undefined : value.taskId !== undefined,
+  'A task deletion requires taskId; a team deletion forbids it.');
+
+/** Bounded single-line preview for deletion messages and preparation rows. */
+const previewText = (text: string, max = 120): string => text.length > max ? `${text.slice(0, max - 3)}...` : text;
+import { integrationDeleteBlockers } from './integration-attempts';
 import { mailboxWriteRequired, TeamMailbox, type MailboxMessage } from './team-mailbox';
 import { invokeMailbox, isMailboxTool, mailboxStorageReservation, workerMailboxTools } from './mailbox-tools';
 import type { MailboxPort } from './mailbox-tools';
@@ -1218,6 +1234,115 @@ export class WorkerBroker {
     }
     const { engine, store, files } = route.local;
     const respond = (value: unknown): ToolResult => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
+    if (name === 'ui_board_delete_prepare') {
+      // READ-ONLY preparation for the future UI command: no actor, no write, no
+      // enrollment, no worker start/stop. The host derives the live owner and the
+      // exact current revision, and names the request through the owner's CURRENT
+      // epoch, so the UI can submit that exact input unchanged and an exact retry
+      // still replays (or reports request_expired) instead of becoming a fresh delete.
+      const prepared = boardDeletePrepareInput.parse(args);
+      if (!this.boardEnabled()) {
+        throw new WorkerError('feature_disabled', 'The task board is disabled; enable codexSubagent.taskBoard.enabled in User Settings.');
+      }
+      const board = await route.local.board.open();
+      const context = board.deletionContext({ kind: prepared.kind, teamId: prepared.teamId, taskId: prepared.taskId, requestId: prepared.requestId });
+      if (!context || context.replay) {
+        throw new WorkerError('not_found', 'That board record is no longer on this workspace board. Refresh the Task Board; a deleted record is never prepared again.');
+      }
+      const actor = { kind: 'coordinator' as const, ownerId: context.ownerId };
+      const team = board.getTeam(actor, prepared.teamId);
+      const requestId = board.requestId(context.ownerId, prepared.requestId);
+      if (prepared.kind === 'task') {
+        const task = board.getTask(actor, prepared.taskId!);
+        return respond({ kind: 'task', teamId: team.id, taskId: task.id, title: previewText(task.title), revision: task.revision, requestId });
+      }
+      return respond({ kind: 'team', teamId: team.id, name: previewText(team.name), revision: team.revision, requestId });
+    }
+    if (name === 'ui_board_delete_task' || name === 'ui_board_delete_team') {
+      // Trusted, UI-only manual HARD deletion. No MCP tool, worker catalog or
+      // `subagent_health.capabilities` entry reaches this route, and the
+      // coordinator identity is derived HERE from the persisted board (the live
+      // team, or the exact deletion acknowledgment). A caller-supplied ownerId is
+      // impossible: the strict inputs reject unknown fields.
+      const deletingTask = name === 'ui_board_delete_task';
+      const taskRequest = deletingTask ? taskDeleteInput.parse(args) : undefined;
+      const request = taskRequest ?? teamDeleteInput.parse(args);
+      if (!this.boardEnabled()) {
+        throw new WorkerError('feature_disabled', 'The task board is disabled; enable codexSubagent.taskBoard.enabled in User Settings.');
+      }
+      const local = route.local;
+      const board = await local.board.open();
+      const teamId = request.teamId;
+      const taskId = taskRequest?.taskId;
+      const context = board.deletionContext({ kind: deletingTask ? 'task' : 'team', teamId, taskId, requestId: request.requestId });
+      if (!context) {
+        throw new WorkerError('not_found', 'That board record is no longer on this workspace board. Refresh the Task Board; a deleted record is never restored.');
+      }
+      const actor = { kind: 'coordinator' as const, ownerId: context.ownerId };
+      // The trusted cancellation check is re-applied immediately before the
+      // durable rename: an aborted request never publishes, and a commit is never
+      // undone afterwards.
+      const guard = (): void => signal?.throwIfAborted();
+      const remove = (): Promise<unknown> => deletingTask
+        ? board.deleteTask(actor, request, guard)
+        : board.deleteTeam(actor, request, guard);
+      if (context.replay) {
+        // The record is intentionally gone: an exact retry answers from the
+        // durable acknowledgment and needs no live-work fence or admission.
+        const ack = await remove();
+        this.options.onChange();
+        return respond(ack);
+      }
+      // The persisted identity snapshot, never a UI argument: an ordinary
+      // unbound worker is only reachable through its current assignment, and a
+      // team's members are its live member list.
+      const team = board.getTeam(actor, teamId);
+      const task = taskId ? board.getTask(actor, taskId) : undefined;
+      // Exact identities the host derived from durable records only. A TASK delete
+      // is about that task's CURRENT assignee; a TEAM delete is about the team's
+      // live members. A validation/integration worker attached to an attempt's
+      // stored seed is added below, from those attempt records and their live
+      // bindings, so an unrelated worker is never swept in.
+      const base = new Set<string>(taskId ? [] : team.memberWorkerIds);
+      if (task?.assigneeWorkerId) {
+        base.add(task.assigneeWorkerId);
+      }
+      // Only ATTEMPT-SPECIFIC seeds/candidate inputs count. The ordinary base
+      // capture is shared by unrelated team tasks, so a worker bound to it is no
+      // evidence and must never block another task's deletion.
+      const boundTo = (seedSnapshotIds: readonly string[]): string[] => seedSnapshotIds.length === 0 ? [] : local.store.list()
+        .filter(session => session.isolatedView !== undefined && seedSnapshotIds.includes(session.isolatedView.snapshotId))
+        .map(session => session.id);
+      const scope = { teamId, taskId, workerId: task?.assigneeWorkerId ?? undefined, workerIds: [] as string[] };
+      const ack = await this.storageOperation(local, boardStorageReservation('work'), async () => {
+        return await local.isolation.withIntegrationScope(context.ownerId, teamId, async attempts => {
+          const blockers = integrationDeleteBlockers(attempts, { teamId, taskId });
+          if (blockers.length) {
+            const named = blockers.slice(0, 8).map(attempt => `${attempt.id} (${attempt.status})`).join(', ');
+            throw new WorkerError('integration_busy', `Team ${teamId} still has ${blockers.length} unfinished integration attempt(s): ${named}. Release ${blockers.length === 1 ? 'it' : 'them'} with subagent_integration release before deleting; no attempt or pin is released automatically.`);
+          }
+          // Only attempts that still hold this team/task and are not explicitly
+          // settled can attach a worker to this deletion. An idle ready attempt
+          // therefore adds nothing of its own; a LIVE worker on its derived seed
+          // does, including one whose own task is a different task.
+          const associated = attempts.filter(attempt => attempt.status !== 'released' && attempt.status !== 'abandoned'
+            && (taskId === undefined || attempt.taskIds.includes(taskId)));
+          scope.workerIds = [...new Set([...base, ...boundTo(associated.flatMap(attempt => attempt.seedSnapshotIds))])];
+          // The lifecycle reservation refuses a governed startup, a still-held
+          // model admission or in-flight inference of any named worker, and it is
+          // taken BEFORE the engine fence so nothing can start meanwhile.
+          const release = local.lifecycle.reserveBoardDelete({ teamId, taskId, workerIds: scope.workerIds });
+          try {
+            await local.isolation.assertTeamRunnersIdle(teamId);
+            return await local.engine.withDeletionFence(scope, remove);
+          } finally {
+            release();
+          }
+        });
+      }, signal, false, 'work');
+      this.options.onChange();
+      return respond(ack);
+    }
     let releaseControl: (() => void) | undefined;
     try {
       if (name === 'subagent_spawn' && args && typeof args === 'object' && 'ownerId' in args && typeof args.ownerId === 'string') {

@@ -19,7 +19,12 @@ import {
   taskSchema,
   teamCreateInput,
   teamSchema,
-  teamUpdateInput
+  teamUpdateInput,
+  deletionReceipt,
+  taskDeleteInput,
+  teamDeleteInput,
+  taskDeletedReceipt,
+  teamDeletedReceipt
 } from './task-board-types';
 import type {
   BoardActor,
@@ -31,7 +36,10 @@ import type {
   TaskState,
   Team,
   TeamCreateInput,
-  TeamUpdateInput
+  TeamUpdateInput,
+  TaskDeletedReceipt,
+  TeamDeletedReceipt,
+  RequestRecord
 } from './task-board-types';
 
 /** Resolves a worker id to its persistent session; undefined means the worker does not exist in this workspace. */
@@ -71,6 +79,19 @@ const WORKER_TRANSITIONS: Record<TaskState, readonly TaskState[]> = {
 };
 
 const isTerminalState = (s: TaskState): boolean => s === 'accepted' || s === 'cancelled';
+
+/** Literal single-line preview of a stored title, so a refusal message stays bounded. */
+function previewText(text: string, max = 80): string {
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+/** At most eight `id ("title")` pairs plus a remainder count. */
+function describeRecords(records: readonly { id: string; title: string }[]): string {
+  const shown = records.slice(0, 8).map(record => `${record.id} ("${previewText(record.title)}")`);
+  return records.length > shown.length
+    ? `${shown.join(', ')} and ${records.length - shown.length} more`
+    : shown.join(', ');
+}
 
 function requireCoordinator(actor: BoardActor): string {
   if (actor.kind !== 'coordinator') {
@@ -306,8 +327,9 @@ export class TaskBoard {
       }
     }
     for (const record of Object.values(data.requests)) {
-      if (!teamSchema.safeParse(record.result).success && !taskSchema.safeParse(record.result).success) {
-        throw new WorkerError('board_malformed', `Recorded receipt ${record.fingerprint} does not hold a team or task record.`);
+      if (!teamSchema.safeParse(record.result).success && !taskSchema.safeParse(record.result).success
+        && !deletionReceipt.safeParse(record.result).success) {
+        throw new WorkerError('board_malformed', `Recorded receipt ${record.fingerprint} does not hold a team, task or deletion acknowledgment.`);
       }
     }
   }
@@ -496,7 +518,15 @@ export class TaskBoard {
     authorize: (data: BoardData) => void,
     run: (draft: BoardData) => R,
     resultSchema: z.ZodType<R>,
-    guard?: () => void
+    guard?: () => void,
+    /**
+     * Optional REPLAY-ONLY authorization. A hard deletion is the one mutation
+     * whose live record is gone once it commits, so its exact retry must be
+     * proved from the durable acknowledgment instead of the removed record.
+     * It is never consulted for a fresh mutation, and it can only NARROW the
+     * ordinary authorization because it runs after it.
+     */
+    replayAuthorize?: (data: BoardData, recorded: RequestRecord) => void
   ): Promise<R> {
     this.requireOpen();
     return this.mutex.run(async () => {
@@ -510,6 +540,12 @@ export class TaskBoard {
       assertRequestEpoch(data, owner, input.requestId, key, recorded !== undefined, this.requestIdPolicy);
       if (recorded) {
         authorize(data);
+        if (replayAuthorize) {
+          // A hard deletion's live record is gone by design: prove the exact
+          // durable acknowledgment instead of the removed record. Changed
+          // arguments still conflict on the fingerprint below.
+          replayAuthorize(data, recorded);
+        }
         if (recorded.fingerprint !== fingerprint) {
           throw new WorkerError('request_reuse_conflict', 'This requestId was already used with different arguments; choose a new requestId.');
         }
@@ -541,6 +577,32 @@ export class TaskBoard {
   epoch(ownerId: string): number {
     return currentEpoch(this.requireOpen(), ownerId);
   }
+  /**
+   * Durable owner of a team id for receipt rollover: the live record, else a
+   * historical team receipt, else the exact team_deleted acknowledgment. It
+   * never throws, so one hard-deleted team cannot fail rollover with not_found;
+   * a receipt whose owner cannot be proved simply stays live and replayable.
+   */
+  private durableTeamOwner(data: BoardData, teamId: string): string | undefined {
+    const live = data.teams.find(team => team.id === teamId);
+    if (live) {
+      return live.coordinatorOwnerId;
+    }
+    for (const record of Object.values(data.requests)) {
+      const team = teamSchema.safeParse(record.result);
+      if (team.success && team.data.id === teamId) {
+        return team.data.coordinatorOwnerId;
+      }
+    }
+    for (const record of Object.values(data.requests)) {
+      const deletion = deletionReceipt.safeParse(record.result);
+      if (deletion.success && deletion.data.kind === 'team_deleted' && deletion.data.id === teamId) {
+        return deletion.data.coordinatorOwnerId;
+      }
+    }
+    return undefined;
+  }
+
   /** Recomputes the immutable reference identities one archived receipt set contributes. */
   private referenceHistoryFor(data: BoardData, selected: BoardData['requests']): BoardData['referenceHistory'] {
     const history = new Map((data.referenceHistory ?? []).map(entry => [digest([entry.taskId, entry.kind, entry.ref.id, entry.ref.version]), entry]));
@@ -681,8 +743,14 @@ export class TaskBoard {
       const selected: BoardData['requests'] = {};
       for (const [key, receipt] of Object.entries(data.requests)) {
         const team = teamSchema.safeParse(receipt.result); const task = taskSchema.safeParse(receipt.result);
-        const owner = team.success ? team.data.coordinatorOwnerId : task.success ? this.findTeam(data, task.data.teamId).coordinatorOwnerId : undefined;
-        if (owner !== ownerId) {
+        const deletion = deletionReceipt.safeParse(receipt.result);
+        // A hard-deleted team has no live record, so its task receipts resolve
+        // their owner from durable proof (a historical team receipt or the exact
+        // team_deleted acknowledgment) instead of failing rollover as not_found.
+        const owner = team.success ? team.data.coordinatorOwnerId
+          : task.success ? this.durableTeamOwner(data, task.data.teamId)
+            : deletion.success ? deletion.data.coordinatorOwnerId : undefined;
+        if (owner === undefined || owner !== ownerId) {
           continue;
         }
         selected[key] = receipt;
@@ -1354,6 +1422,166 @@ export class TaskBoard {
       ...structuredClone(task),
       readiness: { ready: unmet.length === 0 && blockers.length === 0, unmetDependencies: unmet, blockers }
     };
+  }
+
+  /**
+   * Durable owner resolution for one manual deletion route. Exactly two proofs
+   * are accepted: the live team record (a fresh deletion is authorized against
+   * it), or the EXACT deletion acknowledgment whose stored request key equals
+   * `digest(['coordinator', receipt.coordinatorOwnerId, requestId])` and whose
+   * kind/id/teamId match the request (an exact retry). No create/update/other
+   * historical receipt can ever authorize a deletion, so a stale receipt cannot
+   * be turned into delete authority by guessing a request id.
+   *
+   * Host-only: it carries no actor, returns no message text, and is not part of
+   * BoardPort, so no MCP or worker catalog can reach it.
+   */
+  deletionContext(input: { kind: 'task' | 'team'; teamId: string; requestId: string; taskId?: string }): { ownerId: string; replay: boolean } | undefined {
+    const data = this.requireOpen();
+    const target = input.kind === 'task' ? input.taskId : input.teamId;
+    if (!target) {
+      return undefined;
+    }
+    for (const [key, record] of Object.entries(data.requests)) {
+      const parsed = deletionReceipt.safeParse(record.result);
+      if (!parsed.success || parsed.data.id !== target) {
+        continue;
+      }
+      if (parsed.data.kind !== (input.kind === 'task' ? 'task_deleted' : 'team_deleted')) {
+        continue;
+      }
+      if (parsed.data.kind === 'task_deleted' && parsed.data.teamId !== input.teamId) {
+        continue;
+      }
+      if (key === digest(['coordinator', parsed.data.coordinatorOwnerId, input.requestId])) {
+        return { ownerId: parsed.data.coordinatorOwnerId, replay: true };
+      }
+    }
+    const team = data.teams.find(candidate => candidate.id === input.teamId);
+    return team ? { ownerId: team.coordinatorOwnerId, replay: false } : undefined;
+  }
+
+  /**
+   * Proves that one recorded result is the exact deletion acknowledgment this
+   * request claims. Actor, resource, kind and team must all match; anything else
+   * (including a create/update receipt reused under the same request id) is
+   * refused before the fingerprinted replay is answered.
+   */
+  private assertDeletionReplay(result: unknown, expected: { kind: 'task_deleted'; id: string; teamId: string } | { kind: 'team_deleted'; id: string }, owner: string): void {
+    const parsed = deletionReceipt.safeParse(result);
+    if (!parsed.success || parsed.data.kind !== expected.kind || parsed.data.id !== expected.id
+      || parsed.data.coordinatorOwnerId !== owner) {
+      throw new WorkerError('forbidden', 'This request id does not record this deletion for this coordinator.');
+    }
+    if (parsed.data.kind === 'task_deleted' && (expected.kind !== 'task_deleted' || parsed.data.teamId !== expected.teamId)) {
+      throw new WorkerError('forbidden', 'This request id does not record this deletion for this team.');
+    }
+  }
+
+  /** Fresh-or-replay guard for a deletion; the live record is never required to answer an exact retry. */
+  private authorizeDeletion(data: BoardData, expected: { kind: 'task_deleted'; id: string; teamId: string } | { kind: 'team_deleted'; id: string }, owner: string, requestId: string): void {
+    const recorded = data.requests[digest(['coordinator', owner, requestId])];
+    if (recorded !== undefined) {
+      this.assertDeletionReplay(recorded.result, expected, owner);
+      return;
+    }
+    const team = data.teams.find(candidate => candidate.id === (expected.kind === 'team_deleted' ? expected.id : expected.teamId));
+    if (!team) {
+      throw new WorkerError('not_found', `Team ${expected.kind === 'team_deleted' ? expected.id : expected.teamId} was not found on this board.`);
+    }
+    if (team.coordinatorOwnerId !== owner) {
+      throw new WorkerError('forbidden', `Team ${team.id} belongs to a different coordinator.`);
+    }
+    if (expected.kind === 'task_deleted') {
+      const task = data.tasks.find(candidate => candidate.id === expected.id);
+      if (!task || task.teamId !== team.id) {
+        throw new WorkerError('not_found', `Task ${expected.id} is not in team ${team.id}.`);
+      }
+    }
+  }
+
+  /**
+   * Manual HARD deletion of ONE task record, authorized only by the owning
+   * coordinator. The record is physically removed from the board array: no
+   * lifecycle transition, no implicit accept/cancel, no worker change, no pin
+   * release and no evidence/runner/integration cleanup happens here. EVERY task
+   * state is deletable - live execution is the runtime's fence, never a board
+   * state check - and the only board-level refusal left is a remaining
+   * dependent task.
+   */
+  async deleteTask(actor: BoardActor, input: unknown, authorize?: () => void): Promise<TaskDeletedReceipt> {
+    const trusted = boardActor.parse(actor);
+    const parsed = taskDeleteInput.parse(input);
+    const owner = requireCoordinator(trusted);
+    const expected = { kind: 'task_deleted' as const, id: parsed.taskId, teamId: parsed.teamId };
+    return this.mutate(trusted, 'deleteTask', `task:${parsed.taskId}`, parsed,
+      data => this.authorizeDeletion(data, expected, owner, parsed.requestId),
+      data => {
+        const team = this.findTeam(data, parsed.teamId);
+        const index = data.tasks.findIndex(candidate => candidate.id === parsed.taskId);
+        if (index < 0) {
+          throw new WorkerError('not_found', `Task ${parsed.taskId} was not found on this board.`);
+        }
+        const task = data.tasks[index];
+        if (task.teamId !== team.id) {
+          throw new WorkerError('not_found', `Task ${parsed.taskId} is not in team ${team.id}.`);
+        }
+        if (task.revision !== parsed.expectedRevision) {
+          throw new WorkerError('revision_conflict', `Task ${task.id} is at revision ${task.revision}; expected ${parsed.expectedRevision}.`);
+        }
+        const dependents = data.tasks.filter(other => other.id !== task.id
+          && other.dependencies.some(dependency => dependency.taskId === task.id));
+        if (dependents.length) {
+          throw new WorkerError('task_has_dependents', `Task ${task.id} ("${previewText(task.title)}") cannot be deleted: ${dependents.length} remaining task(s) depend on it: ${describeRecords(dependents)}. Remove those dependencies first.`);
+        }
+        const receipt: TaskDeletedReceipt = {
+          kind: 'task_deleted', id: task.id, teamId: task.teamId, coordinatorOwnerId: owner, revision: task.revision
+        };
+        data.tasks.splice(index, 1);
+        return receipt;
+      },
+      taskDeletedReceipt,
+      // The caller's trusted cancellation check, re-applied immediately before the
+      // rename exactly like every other board mutation: a request aborted while
+      // its I/O was paused never publishes, and there is no undo after a commit.
+      authorize,
+      (_data, recorded) => this.assertDeletionReplay(recorded.result, expected, owner));
+  }
+
+  /**
+   * Manual HARD deletion of ONE empty team record. A team that still holds any
+   * task is refused with the exact ids/titles: deleting the team would otherwise
+   * leave tasks that no longer have their team, a state validateGraph rejects.
+   */
+  async deleteTeam(actor: BoardActor, input: unknown, authorize?: () => void): Promise<TeamDeletedReceipt> {
+    const trusted = boardActor.parse(actor);
+    const parsed = teamDeleteInput.parse(input);
+    const owner = requireCoordinator(trusted);
+    const expected = { kind: 'team_deleted' as const, id: parsed.teamId };
+    return this.mutate(trusted, 'deleteTeam', `team:${parsed.teamId}`, parsed,
+      data => this.authorizeDeletion(data, expected, owner, parsed.requestId),
+      data => {
+        const index = data.teams.findIndex(candidate => candidate.id === parsed.teamId);
+        if (index < 0) {
+          throw new WorkerError('not_found', `Team ${parsed.teamId} was not found on this board.`);
+        }
+        const team = data.teams[index];
+        if (team.revision !== parsed.expectedRevision) {
+          throw new WorkerError('revision_conflict', `Team ${team.id} is at revision ${team.revision}; expected ${parsed.expectedRevision}.`);
+        }
+        const tasks = data.tasks.filter(task => task.teamId === team.id);
+        if (tasks.length) {
+          throw new WorkerError('team_has_tasks', `Team ${team.id} ("${previewText(team.name)}") still has ${tasks.length} task(s): ${describeRecords(tasks)}. Delete those tasks first.`);
+        }
+        const receipt: TeamDeletedReceipt = {
+          kind: 'team_deleted', id: team.id, coordinatorOwnerId: owner, revision: team.revision
+        };
+        data.teams.splice(index, 1);
+        return receipt;
+      },
+      teamDeletedReceipt,
+      authorize,
+      (_data, recorded) => this.assertDeletionReplay(recorded.result, expected, owner));
   }
 
   getTeam(actor: BoardActor, id: string): Team {

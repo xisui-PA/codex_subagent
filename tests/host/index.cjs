@@ -7,6 +7,16 @@ const vscode = require('vscode');
 exports.run = async () => {
   const manifest = JSON.parse(await fs.readFile(path.join(process.env.CODEX_TEST_REPOSITORY, 'package.json'), 'utf8'));
   const extensionId = (manifest.publisher + '.' + manifest.name).toLowerCase();
+  assert.equal(manifest.contributes.commands.find(command => command.command === 'codexSubagent.deleteTask')?.title, 'Delete Task');
+  assert.equal(manifest.contributes.commands.find(command => command.command === 'codexSubagent.deleteTeam')?.title, 'Delete Team');
+  const boardMenus = manifest.contributes.menus['view/item/context'];
+  assert.ok(boardMenus.some(entry => entry.command === 'codexSubagent.deleteTask' && entry.when === 'view == codexSubagent.taskBoard && viewItem == boardTask'), 'Task delete menu must target board tasks');
+  assert.ok(boardMenus.some(entry => entry.command === 'codexSubagent.deleteTeam' && entry.when === 'view == codexSubagent.taskBoard && viewItem == boardTeam'), 'Team delete menu must target board teams');
+  assert.equal(manifest.contributes.commands.find(command => command.command === 'codexSubagent.cleanupWorkers')?.title, 'Delete Workers...');
+  assert.equal(manifest.contributes.commands.find(command => command.command === 'codexSubagent.deleteSelectedWorkers')?.title, 'Delete Selected Workers');
+  assert.equal(manifest.contributes.commands.find(command => command.command === 'codexSubagent.deleteGroupWorkers')?.title, 'Delete Workers in This Group...');
+  assert.ok(boardMenus.some(entry => entry.command === 'codexSubagent.deleteSelectedWorkers' && entry.when === 'view == codexSubagent.workers && viewItem =~ /^worker(Running|Completed|Resumable)$/'), 'Selected-worker delete must target explicit worker rows only');
+  assert.ok(boardMenus.some(entry => entry.command === 'codexSubagent.deleteGroupWorkers' && entry.when === 'view == codexSubagent.workers && viewItem == workerGroup'), 'Group delete must target actual parent group rows');
   const extension = vscode.extensions.getExtension(extensionId);
   assert.ok(extension, 'Development extension must be loaded');
   const api = await extension.activate();
@@ -14,7 +24,7 @@ exports.run = async () => {
   const diagnostic = JSON.parse(vscode.window.activeTextEditor.document.getText());
   assert.ok(diagnostic.codexConfig.startsWith(process.env.CODEX_HOME), 'Must use the isolated test config');
   const commands = await vscode.commands.getCommands(true);
-  for (const name of ['setup', 'checkConnection', 'diagnostics', 'retryHost', 'sendMessage', 'resumeWorker', 'cleanupWorkers', 'revokeShellApproval']) { assert.ok(commands.includes('codexSubagent.' + name), name); }
+  for (const name of ['setup', 'checkConnection', 'diagnostics', 'retryHost', 'sendMessage', 'resumeWorker', 'deleteWorker', 'deleteSelectedWorkers', 'deleteGroupWorkers', 'cleanupWorkers', 'revokeShellApproval', 'deleteTask', 'deleteTeam']) { assert.ok(commands.includes('codexSubagent.' + name), name); }
   if (process.env.CODEX_TEST_SCENARIO !== 'workspace') {
     assert.ok(diagnostic.startupError, 'Empty-window diagnostics must remain available');
     await assert.rejects(api.invoke('subagent_health', {}), /trusted|workspace|host/i);

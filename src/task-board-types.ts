@@ -223,3 +223,50 @@ export const boardGetInput = z.object({ id: id32 }).strict();
 export type BoardGetInput = z.infer<typeof boardGetInput>;
 export const boardListInput = z.object({ teamId: id32.optional() }).strict();
 export type BoardListInput = z.infer<typeof boardListInput>;
+
+/**
+ * Minimal durable acknowledgment of ONE manual HARD board deletion.
+ *
+ * It deliberately copies NO task/team/history payload: the record is gone, so
+ * the receipt keeps only the identity a replay needs. `coordinatorOwnerId` is
+ * stored because the live team may be gone when a later receipt rollover has to
+ * resolve this receipt's owner. No schema version changes, no tombstone and no
+ * trash collection are introduced by these records.
+ */
+export const taskDeletedReceipt = z.object({
+  kind: z.literal('task_deleted'),
+  id: id32,
+  teamId: id32,
+  coordinatorOwnerId: z.string().min(1).max(limits.ownerId),
+  revision: z.number().int().nonnegative()
+}).strict();
+export type TaskDeletedReceipt = z.infer<typeof taskDeletedReceipt>;
+
+export const teamDeletedReceipt = z.object({
+  kind: z.literal('team_deleted'),
+  id: id32,
+  coordinatorOwnerId: z.string().min(1).max(limits.ownerId),
+  revision: z.number().int().nonnegative()
+}).strict();
+export type TeamDeletedReceipt = z.infer<typeof teamDeletedReceipt>;
+
+/** The only receipt shapes a hard deletion may persist. */
+export const deletionReceipt = z.discriminatedUnion('kind', [taskDeletedReceipt, teamDeletedReceipt]);
+export type DeletionReceipt = z.infer<typeof deletionReceipt>;
+
+/** Manual HARD task deletion: identity and exact revision only, never an actor. */
+export const taskDeleteInput = z.object({
+  requestId,
+  teamId: id32,
+  taskId: id32,
+  expectedRevision: z.number().int().nonnegative()
+}).strict();
+export type TaskDeleteInput = z.infer<typeof taskDeleteInput>;
+
+/** Manual HARD team deletion: identity and exact revision only, never an actor. */
+export const teamDeleteInput = z.object({
+  requestId,
+  teamId: id32,
+  expectedRevision: z.number().int().nonnegative()
+}).strict();
+export type TeamDeleteInput = z.infer<typeof teamDeleteInput>;
