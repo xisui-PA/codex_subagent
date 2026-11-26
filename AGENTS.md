@@ -154,12 +154,21 @@ for admission, leases and recovery.
 Seal the exact overlay revision. Retain exact submissions and runner results
 before consuming them or publishing references to them. Use `subagent_view_pin`
 for snapshots or submissions and `subagent_evidence_retention` for exact evidence
-URIs as applicable. Board references do not retain content. Review the sealed
+URIs as applicable. Legacy view retention does not treat a board reference as a
+root, while governed reference-aware cleanup does protect current board
+references, active receipt references and evidence pins, and keeps a managed
+command result's sealed input. Either way an explicit pin before consumption is
+the consumer's own step, and mail identity alone retains nothing. Review the sealed
 changes with `subagent_submission_read` and use the stored IDs, versions and URIs.
 
 [Isolated runner commands](docs/runner-workspaces.md) require
 `workspace-write`, an eligible model with write and shell access, and
-isolated command approval. Use relative project paths. Absolute paths still
+authorization under the isolated grant that currently applies to the command's
+logical project when it is requested. Grants are keyed by grant kind and logical
+project root, not by worker, so an existing isolated project-session grant can
+cover later isolated commands from several workers, while that grant kind stays
+separate from a legacy workspace grant. Parent Codex approvals and sandbox are
+not inherited. Use relative project paths. Absolute paths still
 have the OS account's access. For integration validation, match every stored
 result to its exact command and candidate input revision, and require success,
 confirmed drain and no imports. A command that imports changes leaves a new
@@ -169,14 +178,20 @@ Use `subagent_integration` for explicit coordinator decisions. For a
 publishing attempt, `begin` pins the exact selected task candidates and
 evidence over a common base and freezes the ordered validation commands.
 Start a `validation`-lane worker on a clean derived seed and keep its overlay
-at revision 0, or use an `integration`-lane worker to resolve conflicts.
+at revision 0, or use an `integration`-lane worker to resolve conflicts or to
+repair a conflict-free seed whose combined checks fail. Then rerun the exact
+agreed commands against the candidate's input revision.
 The worker seals the result. `candidate` records that seal and `validate`
 records matching runner evidence. After review, `accept` acknowledges the
 exact conflict paths and `apply` separately publishes against live workspace
-and editor preconditions. Board acceptance is a separate decision.
+and editor preconditions, where any open editor on a touched path is itself a
+conflict. Board acceptance is a separate decision.
 
 For a downstream artifact task, compose and retain the consumer's exact
-derived snapshot before starting the worker on it. See
+derived seed before starting the worker on it: `begin` with `consumer`, read the
+returned `derivedSnapshotId`, and bind or start the dependent worker on that
+value before its first implementation turn. Readiness alone delivers no files.
+See
 [coordinator integration](docs/integration.md) for the downstream conflict
 recipe and publication recovery. Inspect `status` after an ambiguous call
 before retrying its original request. An `interrupted` publication requires a
@@ -207,6 +222,101 @@ Withdraw tasks by explicit cancellation. Leave genuinely unfinished, failed or
 blocked tasks with accurate state, blockers and next action, and name them in
 the final response instead of claiming full completion or accepting them just
 to clear the board.
+
+## Parallel workflow
+
+See [parallel workflow](docs/parallel-workflow.md) for the operating protocol and
+the per-surface limits. These rules bind both roles, and the workflow stays
+experimental while its end-to-end checks are incomplete: never report it as
+verified.
+
+- Classify the work first. Clear-boundary work gets an agreed interface and
+  acceptance criteria on the board before implementation, then complementary
+  private outcomes over stable contracts; dependent implementation waits for the
+  exact contract ref. Coupled work gets one primary owner, with other workers
+  limited to investigation, test design, review and, when useful, private
+  alternative implementations. Select between competing approaches explicitly,
+  and never require overlapping alternatives to be merged or let a worker merge
+  them on its own.
+- Finish the lifecycle before a worker's first implementation turn: team,
+  `ready` unassigned task, snapshot, then binding through
+  `subagent_isolated_spawn` or, with only board and view support, an explicit
+  assignment plus `subagent_view_bind` on a stopped member. There is no general
+  deferred-spawn API; the legacy spawn-cancel-bind bootstrap keeps its earlier
+  legacy turns.
+- Workers seal an early checkpoint with `expectedRevision`, report the exact
+  `{id, version, uri}`, and stop for review. Never read or patch a worker's
+  mutable overlay while it is still running; review the sealed submission.
+- Agreements are board records: agreed contracts or verdicts through
+  `subagent_task_update` with the current `expectedRevision`, recorded by the
+  coordinator after a worker proposal. Mail kinds are
+  limited to `question`, `reply`, `interface_proposal`, `interface_response`,
+  `discovery`, `blocker`, `artifact_ready`, `integration_feedback` and
+  `escalation`; an `interface_response` is informational, a send never
+  dispatches or wakes a worker, and only the governed scheduler may clear the
+  wait generation it observes on a correlated reply. Pin exact artifacts and
+  evidence before consuming or publishing a reference, and release retention
+  after consumers finish.
+- Open blockers gate board transitions and acceptance: they refuse
+  `ready → in_progress`, `in_progress → submitted` and acceptance until a board
+  update clears them, and progress text or mail never does. Automatic execution
+  gating from blockers covers only governed create-bind-start workers, so
+  withhold send, resume and dispatch on a non-governed bound worker yourself
+  rather than relying on the board. Runner
+  evidence belongs to the input revision it ran on; an import advances the
+  overlay by one revision that nothing has validated yet. Combined validation
+  matches one exact stored result per agreed command, and board acceptance,
+  integration acceptance and `apply` are separate decisions. The
+  `integration`-lane worker is optional and is needed for composed conflicts
+  *and* for a conflict-free seed whose combined behavior fails; `apply` reports
+  any open editor on a touched path, not only dirty buffers, as a conflict.
+- Structural task edits are state-limited: assignments and dependencies change
+  only while the task is `ready` or `failed`, and every other state refuses them.
+  A worker finishing and reporting is not a board terminal state, so `submitted`,
+  `validating` and `accepted` stay the board's own facts. Give independent review,
+  a new role or another module its own fresh `ready` task and worker, keep
+  accepted tasks immutable, and for genuine rework preserve the earlier artifact
+  and history, record the real failed verdict and `failed` state, then move
+  `failed` -> `ready` with the reassignment and on to `in_progress`. Never mark
+  successful work `failed` merely to hand it off. A terminal task (`accepted`,
+  `cancelled`, `failed`) also stops its governed worker: later execution is
+  refused with `task_stopped`, so finish seals, checks and validations before
+  accepting and start any later role on a fresh task and worker.
+- Waits are explicit and generation-checked: `subagent_schedule` takes
+  `expectedWaitRevision` from the worker's `scheduleWaitRevision`, sets a
+  `{kind: 'message', key}` wait, and `wait: null` clears that same generation. A
+  `revision_conflict` changes nothing, so re-read the worker before retrying. A
+  message is not a wakeup and a stopped worker resumes only explicitly. Clearing
+  a wait automatically is scheduler-only and covers just the generation it
+  observes on a correlated authorized reply; a coordinator may also clear it
+  explicitly with `wait: null` at the generation it read. A
+  governed bound worker's `subagent_mailbox_wait` covers its own question or
+  interface proposal as the only tool call of that round.
+- Runner liveness is read from lease `state` plus the current summary and stored
+  `result.drained`, never from `phase` alone: the phase is a high-water mark that
+  only advances, so a released lease may still say `executing`.
+- Candidate refs are append-only board identities: a recorded `{id, version,
+  uri}` cannot be removed, an empty list adds nothing, a later version may extend
+  the same id, and acceptance needs the latest version of every distinct
+  recorded id to pass. So never promise candidate replacement or accept a failed
+  identity to clear the board; keep early checkpoints as sealed refs and progress
+  until you deliberately record one candidate. If failed ids cannot be
+  superseded, leave the task accurately `failed` or `cancelled` with retained
+  histories and open a fresh task for the final review. A board id is not proof
+  of a managed submission id: integration resolution decides that when the
+  attempt matches the exact ref.
+- Leave opt-in flags at their implemented defaults unless the plan needs them,
+  and treat cancellation, reload, `uncertain` attempts, quarantined slots and
+  archive/collection cleanup as explicit recovery decisions rather than automatic
+  behaviour.
+- The parallel benchmark and its focused suite live at `benchmarks/README.md`
+  and `tests/parallel-workflow.test.cjs`; they define what to measure and how.
+  Measured results belong in a separately dated artifact with its own inputs; the
+  dated record for this workflow is `docs/parallel-workflow-verification.md`,
+  which names its passed checks, artifact hashes and still-pending results. A
+  planned check or its absence is never evidence, and the workflow stays
+  experimental and opt-in while its open failure and missing platform checks
+  stand.
 
 ## Line endings and exact-text edits
 

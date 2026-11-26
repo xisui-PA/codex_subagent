@@ -196,13 +196,13 @@ The coordinator tools are `subagent_mailbox_send`, `subagent_mailbox_list` and `
 - **Authority stays separate.** An `interface_response` is informational. A real agreement is a `subagent_task_update` agreed-contract record with the expected task revision, and board states, verdicts, attempt acceptance and apply remain their own explicit decisions.
 - **Bounds.** Each root holds 200 live events and 1024 request records inside 1 MiB, with standard retention of 7 days. A reply can expire with its parent, and an expired request replay stays refused while its tombstone is retained for up to 14 days.
 
-See [team mailbox](docs/team-mailbox.md) for the wait contract, delivery guarantees and step-7 handoff notes.
+See [team mailbox](docs/team-mailbox.md) for the wait contract and delivery guarantees, and [parallel workflow](docs/parallel-workflow.md) for how a coordinator and its workers use mail, the board and sealed checkpoints together.
 
 ## Isolated team file views (opt-in)
 
 Enable both `codexSubagent.taskBoard.enabled` and `codexSubagent.isolatedViews.enabled` in **User Settings** to use immutable shared snapshots with private worker overlays. Capture once, explicitly bind a stopped owned team member, then resume it. Unbound turns retain legacy behavior; bound workers never fall back to live files when their view is unavailable. Bound workers also get bounded private shell once `isolatedViews.runners.enabled` is on; without it `run_command` returns `isolated_shell_unavailable` and the legacy workspace shell is never substituted. See [Isolated runner shell](#isolated-runner-shell-opt-in) and [isolated file views](docs/isolated-views.md).
 
-Workers can seal immutable submissions for review. Later edits leave earlier submissions unchanged; explicit retention pins and cleanup manage their lifetime. Board acceptance still does not imply integration: the opt-in [coordinator integration](docs/integration.md) workflow handles composition, validation and publication explicitly, and board references do not pin stored content automatically. See [isolated file views](docs/isolated-views.md) for tools, capture rules, supported layouts, limits, recovery and consumer obligations, and [isolated runner workspaces](docs/runner-workspaces.md) for the runner shell, its storage and its containment limits.
+Workers can seal immutable submissions for review. Later edits leave earlier submissions unchanged; explicit retention pins and cleanup manage their lifetime. Board acceptance still does not imply integration: the opt-in [coordinator integration](docs/integration.md) workflow handles composition, validation and publication explicitly, and a board reference does not pin stored content for a consumer automatically, even though governed reference-aware cleanup protects current board references and evidence pins during view release and cleanup. See [isolated file views](docs/isolated-views.md) for tools, capture rules, supported layouts, limits, recovery and consumer obligations, and [isolated runner workspaces](docs/runner-workspaces.md) for the runner shell, its storage and its containment limits.
 
 ## Isolated runner shell (opt-in)
 
@@ -231,11 +231,19 @@ A stored command result is evidence, not an artifact pin and not an automatic bo
 
 ## Governed isolated startup (opt-in)
 
-Step 4 adds `subagent_isolated_spawn`: create a stopped worker, atomically establish team membership/task assignment, bind its private snapshot, then start its first turn. Enable User `resources.enabled` with the board/view flags. Retry interrupted setup with the same request and arguments; ordinary send/resume cannot bypass incomplete setup.
+`subagent_isolated_spawn` provides create-bind-start: create a stopped worker, atomically establish team membership/task assignment, bind its private snapshot, then start its first turn. Enable User `resources.enabled` with the board/view flags. Retry interrupted setup with the same request and arguments; ordinary send/resume cannot bypass incomplete setup.
 
 Separate aggregate model, runnable, runner and storage budgets cover governed work across roots, worktrees, stores and extension hosts for this OS user. Fair queues yield resources during dependency/message/runner waits and reserve validation/integration headroom. Existing owning-store model ceilings, runner pool reopen settings and legacy spawn behavior remain explicit.
 
-Owner-scoped receipt epochs, compressed archives, exact evidence pins and reference-aware collection reclaim metadata without turning expired requests into fresh operations. See [resource governance and lifecycle](docs/resource-governance.md) for configuration, tools, retention limits and recovery. Step-5 [coordinator integration](docs/integration.md) composes exact sealed sources, validates one candidate and publishes only an accepted result.
+Owner-scoped receipt epochs, compressed archives, exact evidence pins and reference-aware collection reclaim metadata without turning expired requests into fresh operations. See [resource governance and lifecycle](docs/resource-governance.md) for configuration, tools, retention limits and recovery. [Coordinator integration](docs/integration.md) composes exact sealed sources, validates one candidate and publishes only an accepted result.
+
+## Parallel workflow
+
+The opt-in surfaces above add up to one operating protocol, described in [parallel workflow](docs/parallel-workflow.md): agree interfaces and acceptance criteria on the board before implementation, give clear-boundary work complementary private outcomes, and keep one primary owner for a coupled surface while other workers investigate, design tests, review sealed submissions or build private alternatives. Competing approaches are selected explicitly; overlapping alternatives never have to be merged, and no worker merges them on its own.
+
+Every implementation turn starts from a completed lifecycle — a team, a `ready` unassigned task, a snapshot and a binding — through governed create-bind-start or, with only the board and view flags, an explicit assignment plus `subagent_view_bind` on a stopped worker. Workers seal the exact revision and report its `{id, version, uri}`, then stop at an early checkpoint so the coordinator can review the sealed submission instead of a mutable implementation that is still being written. Open blockers refuse the board transitions from `ready` to `in_progress` and from `in_progress` to `submitted`, and board acceptance, until a board update clears them; progress text or mail never does, and only governed create-bind-start workers are also stopped automatically, so withhold send, resume and dispatch on any other bound worker. Runner evidence is bound to the input revision it ran on, combined validation matches one exact result per agreed command, and board acceptance, integration acceptance and apply stay three separate decisions.
+
+Two details are easy to get wrong. Retention is capability-dependent: legacy view retention does not treat a board reference as a root, whereas governed reference-aware cleanup protects current board references and evidence pins and keeps a managed result's sealed input, so an explicit pin before consumption is still the consumer's own step and mail identity alone retains nothing. And publish-time conflicts include any open editor on a touched path, not only a dirty buffer. The guide states the rest, including the coordinator's waiting, model-restriction and final board reconciliation duties. Treat the workflow as experimental while its end-to-end checks are incomplete.
 
 ## Preservation and workspaces
 
@@ -291,4 +299,4 @@ Do not bump the version after validation or rebuild a different artifact after C
 - Report issues: [GitHub Issues](https://github.com/xisui-PA/codex_subagent/issues)
 - License: [MIT](LICENSE)
 
-See [architecture notes](docs/design.md), [team mailbox](docs/team-mailbox.md), [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli), and [VS Code Language Model API](https://code.visualstudio.com/api/extension-guides/ai/language-model).
+See [architecture notes](docs/design.md), [parallel workflow](docs/parallel-workflow.md), [team mailbox](docs/team-mailbox.md), [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli), and [VS Code Language Model API](https://code.visualstudio.com/api/extension-guides/ai/language-model).

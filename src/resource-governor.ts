@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
-import { atomicWrite, digest } from './storage';
+import { atomicWrite, atomicWriteRenameRetryBudgetMs, digest } from './storage';
 import { WorkerError } from './types';
 import type { RunnerLeaseOwner, RunnerLeaseRecord } from './runner-pool';
 
@@ -13,20 +13,66 @@ import { waitingReasons } from './worker-startup';
 export { waitingReasons } from './worker-startup';
 export type WaitingReason = typeof waitingReasons[number];
 /**
- * Bounded liveness window for a WAITING ticket, in milliseconds. Only a ticket
- * whose owning caller polled it within this window is live; a ticket that
- * outlived it is withdrawn, so a cancelled request whose ledger withdrawal
- * failed, a crashed host or a closed consumer can never keep head-of-line
- * eligibility forever. Active, quarantined and drained claims - real or
- * uncertain effects - are never expired by it.
+ * Bounded wait for the ONE exclusive aggregate transaction lock.
+ *
+ * The allowance is derived from the publication schedule instead of restating a
+ * number: ONE transaction performs at most five atomicWrite publications - the
+ * two-phase namespace initialization (pending marker, empty ledger, established
+ * marker), a pre-commit hook's `registerStore.publishPending` marker, and the
+ * final ledger - and each of them may spend the whole shared rename-delay budget
+ * waiting for a transiently held target. `confirm()` entries and the registered
+ * marker/namespace publications happen outside this transaction and do not
+ * count. A contender behind one valid holder therefore waits five budgets plus
+ * the original 5 s contention/I/O margin. Only the WAIT is derived: publication
+ * retries, their authorization and every cap are unchanged.
+ *
+ * It is declared before the ticket liveness window because that window is derived
+ * from it: a live ticket or handoff has to outlast the next lock acquisition too.
+ */
+const transactionMaxPublications = 5;
+const transactionLockPollMs = 25;
+const transactionContentionMarginMs = 5_000;
+export const transactionLockWaitMs = transactionMaxPublications * atomicWriteRenameRetryBudgetMs + transactionContentionMarginMs;
+const transactionLockAttempts = Math.ceil(transactionLockWaitMs / transactionLockPollMs);
+/**
+ * Bounded liveness window for a WAITING ticket or an unacknowledged PROVISIONAL
+ * handoff, in milliseconds. Only a ticket whose owning caller polled it within
+ * this window is live; a ticket that outlived it is withdrawn, so a cancelled
+ * request whose ledger withdrawal failed, a crashed host or a closed consumer can
+ * never keep head-of-line eligibility forever. Active, quarantined and drained
+ * claims - real or uncertain effects - are never expired by it.
  *
  * The same bound governs a PROVISIONAL handoff: a grant whose caller has not yet
  * acknowledged it after its own callbacks and cancellation check. It charges
  * capacity exactly like an admitted effect while it is live, but a handoff nobody
  * ever acknowledged never became an effect, so past the window it is withdrawn as
  * no-effect instead of being quarantined.
+ *
+ * It is DERIVED from the two waits it must cover, never restated as a new magic
+ * number. A heartbeat is stamped BEFORE the publication that makes its row
+ * durable, so a row published after its own publication backoff has fully spent
+ * `atomicWriteRenameRetryBudgetMs` is already that old when any later transaction
+ * first reads it. The transaction that must act on it - the acknowledgement of a
+ * provisional handoff, or the next poll that keeps a waiting ticket's queue
+ * position - can then itself wait out a peer's whole publication AND the one
+ * exclusive lock's derived allowance before its own sweep runs. A liveness bound
+ * shorter than that sum would sweep the very live handoff or ticket it is about
+ * to confirm: a provisional grant would be born expired, its acknowledgement
+ * would report failure, and - under repeated publication or lock waits of that
+ * length - `acquire` could re-admit and re-publish the same key without ever
+ * returning a permit. The bound is therefore one shared publication budget, plus
+ * the derived transaction lock wait, plus the original 10 s own-callback/poll/I/O
+ * margin. That is a justified timing correction covering exactly those
+ * unavoidable latencies, not a capacity change: capacities, the
+ * five-attempt/four-delay publication schedule and the lock allowance are
+ * unchanged, and only a ticket's own poll refreshes its heartbeat. The trade-off
+ * is stated plainly: an abandoned no-effect ticket that is never polled again may
+ * remain until this heartbeat-expiry bound (about 105 s) instead of about 10 s,
+ * whenever an earlier explicit cancellation withdrawal or dead-process
+ * reconciliation has not already removed it.
  */
-export const WAITING_TICKET_WINDOW_MS = 10_000;
+const ticketLivenessMarginMs = 10_000;
+export const WAITING_TICKET_WINDOW_MS = atomicWriteRenameRetryBudgetMs + transactionLockWaitMs + ticketLivenessMarginMs;
 /** Runner tickets share the same bound; kept as its own name for their callers. */
 export const RUNNER_TICKET_WINDOW_MS = WAITING_TICKET_WINDOW_MS;
 /** Bounded retention of a known-drained reservation awaiting store reconciliation. */
@@ -195,8 +241,11 @@ interface RetainedDrain { store?: string; attempts: number; foreground?: boolean
 
 /**
  * One OS-user ledger, independent of extension storage, roots, worktrees and
- * extension hosts. Transactions are short; no lease, RPC, approval or effect is
- * awaited under the file lock. A stale/corrupt lock fails closed with a path.
+ * extension hosts. A transaction holds the lock only for its own bounded metadata
+ * work, and even that wait is finite: a publication rename may retry with the
+ * bounded backoff above, so a contender waits the derived, bounded allowance for
+ * it. No lease, RPC, approval or external effect is awaited under the file lock.
+ * A stale/corrupt lock fails closed with a path.
  */
 export class ResourceGovernor {
   readonly host = randomUUID();
@@ -270,16 +319,16 @@ export class ResourceGovernor {
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         // Windows can deny CREATE_NEW while the previous lock is being deleted.
-        // Retry only this exclusive acquisition, with the same bounded deadline;
-        // real access failures still fail closed without replacing the lock.
+        // Retry only this exclusive acquisition, with the bounded deadline derived
+        // above; real access failures still fail closed without replacing the lock.
         const turnover = process.platform === 'win32' && (code === 'EPERM' || code === 'EACCES');
         if (code !== 'EEXIST' && !turnover) {
           throw error;
         }
-        if (attempt >= 200) {
-          throw new WorkerError('resource_locked', `Resource transaction lock is unavailable (${code}): ${lock}. Restore account access if denied. For a stale lock, first confirm all worker hosts stopped, then remove only this lock; keep ledger.json.`, true);
+        if (attempt >= transactionLockAttempts) {
+          throw new WorkerError('resource_locked', `Resource transaction lock is still held after ${transactionLockWaitMs / 1_000}s (${code}): ${lock}. A live worker host may still be publishing its resource transaction, so do not remove a lock whose owner is running; retry once it finishes. Only when every worker host is confirmed stopped, remove this lock alone and keep ledger.json. Restore account access if access is denied.`, true);
         }
-        await delay(25);
+        await delay(transactionLockPollMs);
       }
     }
     try {

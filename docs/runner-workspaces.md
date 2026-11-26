@@ -273,7 +273,7 @@ in 92.6 s; the production webpack build and `build:test` were clean;
 registration file-symlink privilege case, 1 POSIX `chmod` snapshot case and 6
 POSIX runner-process cases. No real VS Code `npm run test:host` run is claimed.
 
-## Governed lifecycle and reclamation (step 4)
+## Governed lifecycle and reclamation
 
 The optional [resource-governance workflow](resource-governance.md) creates,
 assigns and binds schema-3 workers before their first turn. Older hosts reject
@@ -293,4 +293,6 @@ and explicit evidence pins before deleting named final results or released lease
 history. Receipt epochs reclaim metadata without resetting immutable identities
 or replaying expired requests. These operations do not validate imports or
 publish work. Integration remains a separate explicit coordinator workflow,
-described in [coordinator integration](integration.md).
+described in [coordinator integration](integration.md). How a coordinator and its
+workers combine runner evidence with board agreements and sealed checkpoints is
+described in [parallel workflow](parallel-workflow.md).

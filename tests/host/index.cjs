@@ -238,6 +238,12 @@ exports.run = async () => {
       unpack(await broker.invoke(root, 'ui_revert', { id: spawned.id, changeId: session.changes[0].id }));
       assert.equal(await fs.readFile(formatted, 'utf8'), 'initial');
     } finally { participant.dispose(); await broker.close(); }
+    // The integrated governed parallel workflow in this same real host: the
+    // compiled real broker over real VS Code editor buffers, plus the live
+    // extension API wiring. See tests/host/parallel-workflow.cjs for exactly
+    // which parts are real VS Code APIs and which parts are scripted model
+    // output. Only the MODEL and the fixture-scoped approval POLICY are scripted.
+    await require(path.join(__dirname, 'parallel-workflow.cjs')).run({ api, repository: process.env.CODEX_TEST_REPOSITORY });
   }
   console.log(`HOST_TEST_PASS:${process.env.CODEX_TEST_SCENARIO}`);
 };

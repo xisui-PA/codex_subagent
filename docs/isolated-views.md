@@ -11,7 +11,8 @@ integration. Opt-in [coordinator integration](integration.md) consumes
 sealed submissions only through explicit decisions. Bound workers
 also get an opt-in bounded private
 shell; unbound legacy workers keep their existing shell behavior unchanged.
-See [runner workspaces](runner-workspaces.md).
+See [runner workspaces](runner-workspaces.md). The coordinator and worker
+protocol that uses these stages is [parallel workflow](parallel-workflow.md).
 
 ## Enabling
 
@@ -174,7 +175,7 @@ existing transcript/tool-result retention is unchanged and may repeat text.
 
 Retention roots are: active overlays, unreleased seals/submissions, named
 pins, pending captures and internal binding pins/intents. Receipts,
-history, and board metadata are **not** roots for legacy views. Governed step-4
+history, and board metadata are **not** roots for legacy views. Governed
 cleanup additionally retains current board references, active receipt references
 and evidence pins, including the sealed inputs of retained managed results.
 
@@ -227,7 +228,7 @@ and evidence pins, including the sealed inputs of retained managed results.
   1024 pins, 4096 receipts, 64 pending captures; 1024 overlay revisions.
 - Text tools: read 2 MB, write 500,000 characters, search visits at most
   2000 entries with bounded results/pagination.
-- Capacities fail explicitly; nothing is evicted. Receipts remain replayable within their active request epoch. Step 4 adds
+- Capacities fail explicitly; nothing is evicted. Receipts remain replayable within their active request epoch. Governed resources add
   explicit owner-scoped archival/expiry and safe request-prefix rollover; see
   [resource governance](resource-governance.md).
 - Slow tools (snapshot create, cleanup, sealed submission inspection) get a

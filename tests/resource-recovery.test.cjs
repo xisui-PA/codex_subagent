@@ -1373,13 +1373,15 @@ test('a sibling poll never refreshes another ticket, so a cancelled runner canno
 
   // B keeps polling its OWN ticket in the same pool, inside the window: A is
   // still live and eligible, so it keeps the handoff and its window stays put.
-  for (let step = 0; step < 3; step += 1) {
-    clock.now += 3000;
+  // The step is derived from the exported window rather than restating its length.
+  const step = Math.floor(RUNNER_TICKET_WINDOW_MS / 4);
+  for (let index = 0; index < 3; index += 1) {
+    clock.now += step;
     assert.equal(await admission.tryAcquire(id('b'), owner('b'), 2), false, 'a live older ticket keeps the handoff');
     assert.equal((await ticket('a')).heartbeat, created, "a sibling's poll never refreshes this ticket's liveness");
   }
   // Past its own window the abandoned ticket is withdrawn, so B is admitted.
-  clock.now += 3000;
+  clock.now += RUNNER_TICKET_WINDOW_MS;
   assert.equal(await admission.tryAcquire(id('b'), owner('b'), 2), true);
   assert.equal(await ticket('a'), undefined);
   assert.equal((await ticket('b')).state, 'active');

@@ -73,6 +73,28 @@ export function digest(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
+/**
+ * Bounded publication-rename backoff: five attempts in total (the initial
+ * rename plus four retries), separated by 1, 2, 4 and 8 seconds. There is
+ * deliberately no fifth delay, so a target held open for longer than the
+ * schedule surfaces the last error instead of waiting again.
+ */
+const atomicWriteRenameDelays = [1_000, 2_000, 4_000, 8_000];
+/**
+ * The whole bounded publication wait of ONE atomicWrite: the sum of the rename
+ * delays above (15 s). Derived from that schedule so a caller that has to outlast
+ * a peer publication - the aggregate transaction lock wait in
+ * resource-governor - never restates the delays as its own constant.
+ */
+export const atomicWriteRenameRetryBudgetMs = atomicWriteRenameDelays.reduce((total, wait) => total + wait, 0);
+/** Only contention on the published path is transient; every other code is final. */
+const transientRenameErrors = new Set(['EPERM', 'EACCES', 'EBUSY']);
+
+function transientRenameError(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && transientRenameErrors.has(code);
+}
+
 export async function atomicWrite(file: string, text: string | Uint8Array, mode = 0o600, beforeRename?: () => void): Promise<void> {
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${randomUUID()}.tmp`;
@@ -88,8 +110,28 @@ export async function atomicWrite(file: string, text: string | Uint8Array, mode 
     } finally {
       await handle.close();
     }
-    beforeRename?.();
-    await fs.rename(temporary, file);
+    // Every attempt publishes the same temporary path, so a retry never
+    // rewrites or re-syncs content. Authorization is re-checked immediately
+    // before each rename and outside the retry catch: a cancellation or
+    // revocation during a backoff throws here, which fails the write instead
+    // of being retried as a rename failure, and removes the temporary path.
+    let attempt = 0;
+    for (;;) {
+      beforeRename?.();
+      try {
+        await fs.rename(temporary, file);
+        break;
+      } catch (error) {
+        if (attempt >= atomicWriteRenameDelays.length || !transientRenameError(error)) {
+          throw error;
+        }
+        const delay = atomicWriteRenameDelays[attempt];
+        attempt += 1;
+        await new Promise<void>(resolve => {
+          setTimeout(resolve, delay);
+        });
+      }
+    }
     published = true;
     // Flush the rename too. Some platforms do not support directory fsync.
     try {

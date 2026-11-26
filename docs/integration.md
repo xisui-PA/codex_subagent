@@ -1,4 +1,4 @@
-# Coordinator integration (step 5, opt-in)
+# Coordinator integration (opt-in)
 
 `subagent_integration` is one coordinator-only tool with one explicit action
 per call: `begin`, `status`, `details`, `candidate`, `validate`, `accept`,
@@ -6,7 +6,9 @@ per call: `begin`, `status`, `details`, `candidate`, `validate`, `accept`,
 sealed submissions, composes a private seed
 over their common base snapshot, records immutable validation results, and
 publishes only after separate accept and apply decisions. Every stage is a
-coordinator decision, and the tool never writes a task-board record.
+coordinator decision, and the tool never writes a task-board record. Where this
+workflow sits beside agreements, sealed checkpoints and coordination duties is
+described in [parallel workflow](parallel-workflow.md).
 
 ## Enabling
 

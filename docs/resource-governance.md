@@ -1,4 +1,4 @@
-# Governed isolated workers (step 4, opt-in)
+# Governed isolated workers (opt-in)
 
 Enable `codexSubagent.resources.enabled`, `taskBoard.enabled` and
 `isolatedViews.enabled` in **User Settings**. Physical commands additionally
@@ -6,7 +6,10 @@ require `isolatedViews.runners.enabled`, workspace-write permission, an enabled
 exact model allowing writes/shell, and command approval. No repository setting
 can enable these features or widen their budgets. Legacy `subagent_spawn`
 continues starting an ordinary worker immediately, with its original history,
-permissions, idempotency, model selection, cancellation and drain behavior.
+permissions, idempotency, model selection, cancellation and drain behavior. The
+coordinator and worker protocol built on these surfaces is
+[parallel workflow](parallel-workflow.md); this document remains the
+configuration, admission and lifecycle reference.
 
 ## Create, bind, start
 
@@ -157,6 +160,23 @@ charges capacity exactly like an admitted effect, it is never counted as an
 effect, and it is withdrawn without an effect when its own bounded window ends,
 when its host closes or when its process dies. A ledger containing that state
 fails closed on an older build instead of being misread as an effect.
+
+That liveness window is derived rather than restated: one shared publication
+budget (the 1/2/4/8 s rename schedule, 15 s), plus the derived aggregate
+transaction lock wait (about 80 s), plus the original 10 s own-callback/poll/I/O
+margin, about 105 s. A heartbeat is stamped before the publication that makes its
+row durable, so a provisional grant published after a fully spent backoff is
+already 15 s old when the acknowledgement - which may itself wait out a peer's
+publication and the exclusive lock - first reads it. A shorter window can sweep
+that handoff as it is being confirmed, so under repeated publication or lock waits
+of that length `acquire` can re-admit and re-publish instead of ever returning a
+permit, and a live waiting ticket can be dropped while a peer holds the lock. This
+is a timing correction, not a capacity increase: capacities, the
+five-attempt/four-delay publication schedule and the lock allowance are unchanged,
+and only a ticket's own poll refreshes its heartbeat. An abandoned no-effect
+ticket that is never polled again may therefore remain until that ~105 s
+heartbeat-expiry bound rather than ~10 s, whenever an earlier explicit
+cancellation withdrawal or dead-process reconciliation has not already removed it.
 
 A one-slot root remains usable, but cannot run two commands concurrently. Legacy runners
 retain their previous pool/approval behavior and do not acquire governed
@@ -478,7 +498,11 @@ active effects stay quarantined. Missing ledger/board documents beside durable
 namespace markers fail closed. A stale transaction lock requires confirming
 hosts have stopped before removing the lock; never delete the ledger to obtain
 capacity. Exclusive lock acquisition retries Windows delete-turnover access
-errors for the same bounded interval; persistent denial still fails closed.
+errors for a bounded interval derived from the publication schedule: a
+contender outlasts one live holder's maximum five publication retries
+(5 x 15 s) plus the original 5 s contention/I/O margin, about 80 s.
+Contention is reported as a lock still held by a possibly running owner,
+not as proven stale state, and persistent denial still fails closed.
 A non-draining provider can retain a model reservation indefinitely.
 These conservative cases require repair/proof, rather than automatic eviction.
 There is no automatic store eviction or identity-namespace reset. At immutable

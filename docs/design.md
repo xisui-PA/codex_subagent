@@ -72,7 +72,7 @@ Implemented in the host runtime and the extension: the setting is read live thro
 - View and full records: the **Task Board** view renders bounded summaries only. `codexSubagent.openBoardRecord` reads the board summaries, takes the team's trusted `coordinatorOwnerId` from the record (never from UI input), and re-reads the team and task through `subagent_team_get`/`subagent_task_get`. The full JSON, including transition entries and reference URIs, opens read-only through the `codex-task-board-record` content-provider scheme, so nothing implies an editable or savable document. Manual hard deletion is available only through `codexSubagent.deleteTask` and `codexSubagent.deleteTeam` (view context menu or Command Palette). Each resolves the requested node against a fresh board status, prepares read-only through `ui_board_delete_prepare`, shows an explicit modal confirmation naming the item, root and ids, and then sends exactly one `ui_board_delete_task`/`ui_board_delete_team` with the host-returned epoch-qualified request id and exact revision. Cancellation mutates nothing; an error is surfaced without automatic reprepare or retry and refreshes only the board view. These routes are not MCP tool-catalog entries. Deletion is hard, keeps the normal idempotency receipts, never cascades from a team, and removes neither artifacts nor retained worker/runner/integration content; deleting a team ends live membership authorization, so retained resources must be administered first.
 - Shutdown: root shutdown awaits `board.close()` before the `SessionStore` owner lock is released.
 
-Validation `resultRef` entries remain manual metadata: they record an id, version and URI without automatically fetching or verifying content. Opt-in [isolated file views](isolated-views.md) now provide shared immutable snapshots, private overlays, sealed submissions and explicit retention. Governed view cleanup now treats current board references and retained evidence pins as retention roots; consumers must still pin exact inputs before use. Opt-in isolated runner execution for bound workers is implemented too (see below). Opt-in step-5 coordinator integration is implemented as explicit decisions, and opt-in step-6 [team mail](team-mailbox.md) carries durable structured peer messages, while automatic dispatch and automatic acceptance remain unimplemented. Subsequent consumers must pin exact artifacts and preserve the task/worker state separation.
+Validation `resultRef` entries remain manual metadata: they record an id, version and URI without automatically fetching or verifying content. Opt-in [isolated file views](isolated-views.md) now provide shared immutable snapshots, private overlays, sealed submissions and explicit retention. Governed view cleanup now treats current board references and retained evidence pins as retention roots; consumers must still pin exact inputs before use. Opt-in isolated runner execution for bound workers is implemented too (see below). [Coordinator integration](integration.md) is implemented as explicit decisions, and opt-in [team mail](team-mailbox.md) carries durable structured peer messages, while automatic dispatch and automatic acceptance remain unimplemented. Subsequent consumers must pin exact artifacts and preserve the task/worker state separation.
 
 ## Isolated runner workspaces
 
@@ -86,9 +86,9 @@ Isolated runner execution is a separate, opt-in service layered on the existing 
 - **Caches.** Only `npm`/`pip` download caches are reused. Installed dependencies, build output and temporary directories are fresh per slot, so a run never inherits another run's tree, and nothing installs without approval; combine steps inside one approved command (for example `npm ci && npm test`).
 - **Containment.** Windows uses a Job Object with a suspended assign, no breakaway and an active-zero drain proof; POSIX uses an owned process group plus an inherited marker discovered through readable `/proc` or `ps`. Incomplete or failed scans quarantine instead of guessing, no path kills by bare PID, and runtime identity is validated before recovery. Deliberately scrubbed environment values and changed OS identity are outside this contract: containment is not an OS sandbox.
 - **MCP surface.** `subagent_runner_status` pages leases, queue entries or result summaries for the caller's owner and team with a bounded summary block; `subagent_runner_result` returns one full immutable result plus derived current-revision and staleness fields that are null when the current index is unavailable, never rewriting the evidence; `subagent_runner_cleanup` reconciles the scope with no new command and carries a `destructiveHint` tool annotation so clients can warn before calling it.
-- **Coordinator control.** Governed step-4 startup now executes explicit create-bind-start decisions, no task planner or automatic acceptance exists, opt-in [team mail](team-mailbox.md) carries structured peer messages, and integration requires the explicit step-5 decisions. A stored command result is evidence only: it is not an artifact pin and not a validation verdict, and a command that ran on one input revision never validates a later one.
+- **Coordinator control.** Governed startup executes explicit create-bind-start decisions, no task planner or automatic acceptance exists, opt-in [team mail](team-mailbox.md) carries structured peer messages, and integration requires the explicit coordinator decisions. A stored command result is evidence only: it is not an artifact pin and not a validation verdict, and a command that ran on one input revision never validates a later one.
 
-## Coordinator integration (step 5)
+## Coordinator integration
 
 `subagent_integration` runs one explicit coordinator decision per call: begin,
 status, candidate, validate, accept, apply or release. Beginning pins 1–16 exact
@@ -105,7 +105,7 @@ checks. The journal is per file, an interrupted publication is proof-only, and
 no Git commit or network publish occurs. See
 [coordinator integration](integration.md).
 
-## Team mailbox (step 6)
+## Team mailbox
 
 Opt-in durable messages between one coordinator and the members of one team,
 gated by the User-only `codexSubagent.taskBoard.messaging.enabled` flag on top of
@@ -149,7 +149,7 @@ no board record. A send never mutates scheduling. Only the governed scheduler cl
 
 ## Resource governance and create-bind-start
 
-Step 4 is implemented behind the User-only resources flag. Its
+Resource governance is implemented behind the User-only resources flag. Its
 [configuration and contracts](resource-governance.md) distinguish inference,
 runnable effects, dependency/message waits, physical runner ownership and
 retained storage. Every session is stored in the one current format, schema
@@ -168,6 +168,7 @@ Missing namespace documents fail closed and expired requests cannot become
 fresh mutations. Validation and integration are explicit coordinator stages
 with exact input revision and retention obligations, described in
 [coordinator integration](integration.md). Opt-in [team mail](team-mailbox.md)
-is the step-6 messaging stage. It delivers durable events to a worker that is
+is the messaging stage. It delivers durable events to a worker that is
 already running, waits explicitly with `subagent_mailbox_wait`, and grants no
-wake, dispatch or permission authority on its own.
+wake, dispatch or permission authority on its own. The coordinator and worker
+protocol that combines all of these surfaces is [parallel workflow](parallel-workflow.md).

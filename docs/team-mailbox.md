@@ -248,10 +248,11 @@ refused with `request_expired` instead of being returned as live mail. If its
 durable write already completed, the id and receipt stay stored, so an exact
 retry keeps answering `request_expired` before and after a reload.
 
-## Handoff to step 7
+## Parallel workflow habits
 
-Step 7 lifecycle and benchmark work is not part of this stage. These habits keep
-it possible.
+Mail is one part of the protocol in [parallel workflow](parallel-workflow.md),
+which covers board agreements, sealed checkpoints and task-board reconciliation.
+These habits keep mail correct inside it.
 
 - Copy the exact `{id, version, uri}` of every sealed artifact and the exact
   runner ref of every piece of evidence into the record that uses it, naming the
@@ -259,7 +260,9 @@ it possible.
   preserves identity, so an unretained value must be reported, not repaired.
 - Settle decisions in the board tools. Contract changes are
   `subagent_task_update` with agreed contracts and the expected revision, and
-  state, verdicts, acceptance and apply each stay their own explicit call.
+  state, verdicts, acceptance and apply each stay their own explicit call. A
+  worker proposes an interface or records its blocker; only the coordinator
+  records the agreement, and no mail reply clears a blocker.
 - Keep one question per event so a reply stays routable to one sender, and use
   the event kinds as the whole vocabulary.
 - Expect a backlog after a long turn. The per-turn budget arrives as one bounded
@@ -269,5 +272,7 @@ it possible.
   cursor reuse in one direction, an unrelated team never moving a cursor, an
   older schema-1 document refused without a rewrite, a cap or retention refusal,
   an exact retry and the wait that clears on an authorized reply.
-- Do not let a later lifecycle stage treat a mailbox event as a wake, an
-  approval, a verdict or a lease.
+- Do not treat a mailbox event as a wake, an approval, a verdict or a lease. A
+  send has no direct dispatch effect: it never starts, resumes or wakes a
+  stopped worker, and only the governed scheduler clears the exact wait
+  generation it observes once a correlated authorized reply exists.
